@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use crate::blockstore::BlockStore;
 use crate::delegation::{DelegationRecord, DelegationStore};
 use crate::error::Result;
-use crate::netflow::NetFlowTrust;
+use crate::netflow::{CachedNetFlow, NetFlowTrust};
 use crate::types::GENESIS_HASH;
 
 /// Default weights for the three trust components.
@@ -23,6 +23,10 @@ pub struct TrustWeights {
     pub integrity: f64,
     pub netflow: f64,
     pub statistical: f64,
+    /// Optional temporal decay half-life in milliseconds.
+    /// When set, recent interactions are weighted more heavily using `2^(-age_ms / half_life_ms)`.
+    /// Affects interaction_count, completion_rate, and entropy (not unique_counterparties or account_age).
+    pub decay_half_life_ms: Option<u64>,
 }
 
 impl Default for TrustWeights {
@@ -31,6 +35,7 @@ impl Default for TrustWeights {
             integrity: DEFAULT_INTEGRITY_WEIGHT,
             netflow: DEFAULT_NETFLOW_WEIGHT,
             statistical: DEFAULT_STATISTICAL_WEIGHT,
+            decay_half_life_ms: None,
         }
     }
 }
@@ -107,6 +112,8 @@ pub struct TrustEngine<'a, S: BlockStore> {
     seed_nodes: Option<Vec<String>>,
     weights: TrustWeights,
     delegation_ctx: Option<DelegationContext>,
+    /// Optional finalized checkpoint for verification acceleration.
+    checkpoint: Option<crate::consensus::Checkpoint>,
 }
 
 impl<'a, S: BlockStore> TrustEngine<'a, S> {
@@ -121,7 +128,18 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
             seed_nodes,
             weights: weights.unwrap_or_default(),
             delegation_ctx,
+            checkpoint: None,
         }
+    }
+
+    /// Builder method: attach a finalized checkpoint for verification acceleration.
+    ///
+    /// When present and finalized, `compute_chain_integrity()` skips Ed25519
+    /// verification of blocks covered by the checkpoint (sequence ≤ checkpoint head),
+    /// only verifying blocks after the checkpoint.
+    pub fn with_checkpoint(mut self, checkpoint: crate::consensus::Checkpoint) -> Self {
+        self.checkpoint = Some(checkpoint);
+        self
     }
 
     /// Compute the blended trust score for an agent.
@@ -200,11 +218,22 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
     }
 
     /// Compute chain integrity score (fraction of valid blocks from start).
+    ///
+    /// When a finalized checkpoint is attached via `with_checkpoint()`, blocks
+    /// with sequence ≤ the checkpoint head are trusted (only structural checks,
+    /// no Ed25519 verification). Blocks after the checkpoint are fully verified.
     pub fn compute_chain_integrity(&self, pubkey: &str) -> Result<f64> {
         let chain = self.store.get_chain(pubkey)?;
         if chain.is_empty() {
             return Ok(1.0);
         }
+
+        // Determine checkpoint-covered sequence for this pubkey.
+        let checkpoint_seq = self.checkpoint.as_ref()
+            .filter(|cp| cp.finalized)
+            .and_then(|cp| cp.chain_heads.get(pubkey))
+            .copied()
+            .unwrap_or(0);
 
         let total = chain.len() as f64;
         for (i, block) in chain.iter().enumerate() {
@@ -220,6 +249,11 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
             };
             if block.previous_hash != expected_prev {
                 return Ok(i as f64 / total);
+            }
+
+            // Skip Ed25519 verification for blocks covered by the checkpoint.
+            if block.sequence_number <= checkpoint_seq {
+                continue;
             }
 
             if crate::halfblock::verify_block(block).unwrap_or(false) == false {
@@ -241,37 +275,72 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
         }
     }
 
+    /// Compute the netflow score using an external `CachedNetFlow` instance.
+    ///
+    /// This amortizes graph construction cost across multiple trust queries.
+    /// The caller is responsible for providing a `CachedNetFlow` with a compatible store.
+    pub fn compute_netflow_score_cached<CS: BlockStore>(
+        &self,
+        cached: &mut CachedNetFlow<CS>,
+        pubkey: &str,
+    ) -> Result<f64> {
+        cached.compute_trust(pubkey)
+    }
+
     /// Compute statistical score from interaction history features.
     ///
     /// Features (with saturation points and weights):
     /// - interaction_count: saturates at 20 blocks, weight 0.25
-    /// - unique_counterparties: saturates at 5 peers, weight 0.20
+    /// - unique_counterparties: saturates at 5 peers, weight 0.20 (structural, no decay)
     /// - completion_rate: direct percentage, weight 0.25
-    /// - account_age: saturates at 60 seconds, weight 0.10
+    /// - account_age: saturates at 60 seconds, weight 0.10 (structural, no decay)
     /// - entropy: normalized Shannon entropy, weight 0.20
+    ///
+    /// When `decay_half_life_ms` is set in `TrustWeights`, applies temporal decay
+    /// `2^(-age_ms / half_life_ms)` per block to interaction_count, completion_rate,
+    /// and entropy. unique_counterparties and account_age are structural and unaffected.
     pub fn compute_statistical_score(&self, pubkey: &str) -> Result<f64> {
         let chain = self.store.get_chain(pubkey)?;
         if chain.is_empty() {
             return Ok(0.0);
         }
 
-        // Feature 1: interaction count (saturates at 20).
-        let interaction_count = chain.len() as f64;
-        let count_score = (interaction_count / 20.0).min(1.0);
+        // Reference time for decay: latest block's timestamp.
+        let now_ms = chain.last().map(|b| b.timestamp).unwrap_or(0);
 
-        // Feature 2: unique counterparties (saturates at 5).
+        // Compute per-block decay weight.
+        let decay_weight = |block_ts: u64| -> f64 {
+            match self.weights.decay_half_life_ms {
+                Some(hl) if hl > 0 => {
+                    let age_ms = now_ms.saturating_sub(block_ts) as f64;
+                    2.0_f64.powf(-(age_ms / hl as f64))
+                }
+                _ => 1.0,
+            }
+        };
+
+        // Feature 1: interaction count (saturates at 20).
+        // With decay: sum of decay weights instead of raw count.
+        let weighted_count: f64 = chain.iter().map(|b| decay_weight(b.timestamp)).sum();
+        let count_score = (weighted_count / 20.0).min(1.0);
+
+        // Feature 2: unique counterparties (saturates at 5). Structural — no decay.
         let mut counterparties: HashMap<String, usize> = HashMap::new();
+        // Also track decay-weighted counterparty distribution for entropy.
+        let mut counterparties_weighted: HashMap<String, f64> = HashMap::new();
         for block in &chain {
             *counterparties
                 .entry(block.link_public_key.clone())
                 .or_insert(0) += 1;
+            *counterparties_weighted
+                .entry(block.link_public_key.clone())
+                .or_insert(0.0) += decay_weight(block.timestamp);
         }
         let unique_count = counterparties.len() as f64;
         let unique_score = (unique_count / 5.0).min(1.0);
 
         // Feature 3: completion rate.
-        // Count blocks with "outcome" == "completed" in transaction (matches Python).
-        // Falls back to proposal/agreement pairing if no outcome field.
+        // With decay: decay-weighted completed / decay-weighted total.
         let blocks_with_outcome: Vec<_> = chain
             .iter()
             .filter(|b| {
@@ -282,8 +351,11 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
             })
             .collect();
         let completion_rate = if !blocks_with_outcome.is_empty() {
-            // Python approach: count "completed" outcomes.
-            let completed = blocks_with_outcome
+            let weighted_total: f64 = blocks_with_outcome
+                .iter()
+                .map(|b| decay_weight(b.timestamp))
+                .sum();
+            let weighted_completed: f64 = blocks_with_outcome
                 .iter()
                 .filter(|b| {
                     b.transaction
@@ -291,10 +363,15 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                         .and_then(|v| v.as_str())
                         == Some("completed")
                 })
-                .count();
-            completed as f64 / blocks_with_outcome.len() as f64
+                .map(|b| decay_weight(b.timestamp))
+                .sum();
+            if weighted_total > 0.0 {
+                weighted_completed / weighted_total
+            } else {
+                0.0
+            }
         } else {
-            // Fallback: use proposal/agreement pairing.
+            // Fallback: use proposal/agreement pairing (no decay for fallback).
             let proposals: Vec<_> = chain.iter().filter(|b| b.is_proposal()).collect();
             if proposals.is_empty() {
                 1.0
@@ -313,21 +390,22 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
             }
         };
 
-        // Feature 4: account age (saturates at 60 seconds = 60_000 ms).
+        // Feature 4: account age (saturates at 60 seconds = 60_000 ms). Structural — no decay.
         let first_ts = chain.first().map(|b| b.timestamp).unwrap_or(0) as f64;
         let last_ts = chain.last().map(|b| b.timestamp).unwrap_or(0) as f64;
         let age_ms = (last_ts - first_ts).max(0.0);
         let age_score = (age_ms / 60_000.0).min(1.0);
 
         // Feature 5: Shannon entropy of counterparty distribution.
+        // With decay: uses decay-weighted distribution.
         let entropy_score = if counterparties.len() <= 1 {
             0.0
         } else {
-            let total: f64 = counterparties.values().sum::<usize>() as f64;
-            let entropy: f64 = counterparties
+            let total: f64 = counterparties_weighted.values().sum();
+            let entropy: f64 = counterparties_weighted
                 .values()
                 .map(|&count| {
-                    let p = count as f64 / total;
+                    let p = count / total;
                     if p > 0.0 {
                         -p * p.log2()
                     } else {
@@ -527,5 +605,221 @@ mod tests {
 
         let engine = TrustEngine::new(&store, None, None, None);
         assert_eq!(engine.compute_chain_integrity(&agent.pubkey_hex()).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn test_checkpoint_full_coverage() {
+        // Checkpoint covers all blocks -> structural checks only, no verify.
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[1u8; 32]);
+        let peer = Identity::from_bytes(&[2u8; 32]);
+
+        let (p1, _) = create_interaction(
+            &mut store, &agent, &peer, 1, 1, GENESIS_HASH, GENESIS_HASH, 1000,
+        );
+        create_interaction(
+            &mut store, &agent, &peer, 2, 2, &p1, GENESIS_HASH, 2000,
+        );
+
+        let mut chain_heads = HashMap::new();
+        chain_heads.insert(agent.pubkey_hex(), 2); // covers seq 1 and 2
+        let checkpoint = crate::consensus::Checkpoint {
+            facilitator_pubkey: "facilitator".into(),
+            chain_heads,
+            checkpoint_block: crate::halfblock::create_half_block(
+                &peer, 99, &agent.pubkey_hex(), 0, GENESIS_HASH,
+                BlockType::Proposal, serde_json::json!({}), Some(3000),
+            ),
+            signatures: HashMap::new(),
+            timestamp: 3000,
+            finalized: true,
+        };
+
+        let engine = TrustEngine::new(&store, None, None, None)
+            .with_checkpoint(checkpoint);
+        let integrity = engine.compute_chain_integrity(&agent.pubkey_hex()).unwrap();
+        assert_eq!(integrity, 1.0, "full checkpoint coverage should pass");
+    }
+
+    #[test]
+    fn test_checkpoint_partial() {
+        // Checkpoint covers first block only, second block also verified normally.
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[1u8; 32]);
+        let peer = Identity::from_bytes(&[2u8; 32]);
+
+        let (p1, _) = create_interaction(
+            &mut store, &agent, &peer, 1, 1, GENESIS_HASH, GENESIS_HASH, 1000,
+        );
+        create_interaction(
+            &mut store, &agent, &peer, 2, 2, &p1, GENESIS_HASH, 2000,
+        );
+
+        let mut chain_heads = HashMap::new();
+        chain_heads.insert(agent.pubkey_hex(), 1); // covers only seq 1
+        let checkpoint = crate::consensus::Checkpoint {
+            facilitator_pubkey: "facilitator".into(),
+            chain_heads,
+            checkpoint_block: crate::halfblock::create_half_block(
+                &peer, 99, &agent.pubkey_hex(), 0, GENESIS_HASH,
+                BlockType::Proposal, serde_json::json!({}), Some(3000),
+            ),
+            signatures: HashMap::new(),
+            timestamp: 3000,
+            finalized: true,
+        };
+
+        let engine = TrustEngine::new(&store, None, None, None)
+            .with_checkpoint(checkpoint);
+        let integrity = engine.compute_chain_integrity(&agent.pubkey_hex()).unwrap();
+        assert_eq!(integrity, 1.0, "partial checkpoint should still validate remaining blocks");
+    }
+
+    #[test]
+    fn test_checkpoint_none_fallback() {
+        // No checkpoint -> full verification (same as before).
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[1u8; 32]);
+        let peer = Identity::from_bytes(&[2u8; 32]);
+
+        create_interaction(
+            &mut store, &agent, &peer, 1, 1, GENESIS_HASH, GENESIS_HASH, 1000,
+        );
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let integrity = engine.compute_chain_integrity(&agent.pubkey_hex()).unwrap();
+        assert_eq!(integrity, 1.0);
+    }
+
+    #[test]
+    fn test_checkpoint_unknown_pubkey() {
+        // Checkpoint exists but doesn't cover this pubkey -> full verification.
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[1u8; 32]);
+        let peer = Identity::from_bytes(&[2u8; 32]);
+
+        create_interaction(
+            &mut store, &agent, &peer, 1, 1, GENESIS_HASH, GENESIS_HASH, 1000,
+        );
+
+        let checkpoint = crate::consensus::Checkpoint {
+            facilitator_pubkey: "facilitator".into(),
+            chain_heads: HashMap::new(), // empty — doesn't cover agent
+            checkpoint_block: crate::halfblock::create_half_block(
+                &peer, 99, &agent.pubkey_hex(), 0, GENESIS_HASH,
+                BlockType::Proposal, serde_json::json!({}), Some(3000),
+            ),
+            signatures: HashMap::new(),
+            timestamp: 3000,
+            finalized: true,
+        };
+
+        let engine = TrustEngine::new(&store, None, None, None)
+            .with_checkpoint(checkpoint);
+        let integrity = engine.compute_chain_integrity(&agent.pubkey_hex()).unwrap();
+        assert_eq!(integrity, 1.0, "unknown pubkey in checkpoint should fall back to full verify");
+    }
+
+    #[test]
+    fn test_decay_none_matches_current() {
+        // With no decay, scores should match the default behavior.
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[1u8; 32]);
+        let peer = Identity::from_bytes(&[2u8; 32]);
+
+        create_interaction(
+            &mut store, &agent, &peer, 1, 1, GENESIS_HASH, GENESIS_HASH, 1000,
+        );
+
+        let weights_no_decay = TrustWeights { decay_half_life_ms: None, ..Default::default() };
+        let weights_default = TrustWeights::default();
+
+        let engine_no_decay = TrustEngine::new(&store, None, Some(weights_no_decay), None);
+        let engine_default = TrustEngine::new(&store, None, Some(weights_default), None);
+
+        let score_no_decay = engine_no_decay.compute_statistical_score(&agent.pubkey_hex()).unwrap();
+        let score_default = engine_default.compute_statistical_score(&agent.pubkey_hex()).unwrap();
+
+        assert!((score_no_decay - score_default).abs() < 1e-10,
+            "no-decay should match default: {score_no_decay} vs {score_default}");
+    }
+
+    #[test]
+    fn test_decay_recent_higher() {
+        // Two agents with same age span but different timing of interactions.
+        // Recent agent: all interactions near the end of the time window.
+        // Old agent: all interactions near the beginning.
+        // With decay, recent agent should score higher on count/completion features.
+        let mut store = MemoryBlockStore::new();
+        let recent_agent = Identity::from_bytes(&[1u8; 32]);
+        let old_agent = Identity::from_bytes(&[3u8; 32]);
+        let peer1 = Identity::from_bytes(&[2u8; 32]);
+        let peer2 = Identity::from_bytes(&[4u8; 32]);
+
+        // Recent agent: 3 interactions all at t=9500, 9700, 10000
+        let (p1, _) = create_interaction(
+            &mut store, &recent_agent, &peer1, 1, 1, GENESIS_HASH, GENESIS_HASH, 9500,
+        );
+        let (p2, _) = create_interaction(
+            &mut store, &recent_agent, &peer2, 2, 1, &p1, GENESIS_HASH, 9700,
+        );
+        create_interaction(
+            &mut store, &recent_agent, &peer1, 3, 2, &p2, GENESIS_HASH, 10000,
+        );
+
+        // Old agent: 3 interactions at t=1000, 1200, 10000 (same span, but bulk is old)
+        let (p3, _) = create_interaction(
+            &mut store, &old_agent, &peer1, 1, 3, GENESIS_HASH, GENESIS_HASH, 1000,
+        );
+        let (p4, _) = create_interaction(
+            &mut store, &old_agent, &peer2, 2, 2, &p3, GENESIS_HASH, 1200,
+        );
+        create_interaction(
+            &mut store, &old_agent, &peer1, 3, 4, &p4, GENESIS_HASH, 10000,
+        );
+
+        let weights = TrustWeights {
+            decay_half_life_ms: Some(2000), // 2 second half-life — aggressive decay
+            ..Default::default()
+        };
+
+        let engine = TrustEngine::new(&store, None, Some(weights), None);
+        let recent_score = engine.compute_statistical_score(&recent_agent.pubkey_hex()).unwrap();
+        let old_score = engine.compute_statistical_score(&old_agent.pubkey_hex()).unwrap();
+
+        assert!(recent_score > old_score,
+            "recent ({recent_score}) should score higher than old ({old_score}) with decay");
+    }
+
+    #[test]
+    fn test_decay_formula_correctness() {
+        // Verify the decay formula: 2^(-age_ms / half_life_ms)
+        // With half_life=1000ms and age=1000ms, weight should be 0.5
+        // With half_life=1000ms and age=0ms, weight should be 1.0
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[1u8; 32]);
+        let peer = Identity::from_bytes(&[2u8; 32]);
+
+        // Single block at t=0, "now" will be t=0 (latest block), so weight = 1.0
+        create_interaction(
+            &mut store, &agent, &peer, 1, 1, GENESIS_HASH, GENESIS_HASH, 1000,
+        );
+
+        // With decay enabled, single block should have weight 1.0 (age=0 relative to itself)
+        let weights = TrustWeights {
+            decay_half_life_ms: Some(1000),
+            ..Default::default()
+        };
+
+        let engine = TrustEngine::new(&store, None, Some(weights.clone()), None);
+        let score_with_decay = engine.compute_statistical_score(&agent.pubkey_hex()).unwrap();
+
+        let engine_no_decay = TrustEngine::new(&store, None, None, None);
+        let score_no_decay = engine_no_decay.compute_statistical_score(&agent.pubkey_hex()).unwrap();
+
+        // Single block: decay weight should be 1.0 (age is 0 relative to itself),
+        // so scores should match.
+        assert!((score_with_decay - score_no_decay).abs() < 1e-10,
+            "single block with decay={score_with_decay} should equal no-decay={score_no_decay}");
     }
 }

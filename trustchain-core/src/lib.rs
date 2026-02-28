@@ -35,7 +35,7 @@ pub use delegation::{
 pub use error::{Result, TrustChainError};
 pub use halfblock::{create_half_block, validate_and_record, validate_block, validate_block_invariants, verify_block, HalfBlock};
 pub use identity::Identity;
-pub use netflow::NetFlowTrust;
+pub use netflow::{CachedNetFlow, NetFlowTrust};
 pub use protocol::TrustChainProtocol;
 pub use trust::{DelegationContext, TrustEngine, TrustWeights};
 pub use types::{BlockType, ValidationResult, GENESIS_HASH, GENESIS_SEQ, UNKNOWN_SEQ};
