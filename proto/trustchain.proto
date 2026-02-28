@@ -1,0 +1,95 @@
+syntax = "proto3";
+
+package trustchain;
+
+// A half-block in the TrustChain protocol.
+message HalfBlockProto {
+  string public_key = 1;
+  uint64 sequence_number = 2;
+  string link_public_key = 3;
+  uint64 link_sequence_number = 4;
+  string previous_hash = 5;
+  string signature = 6;
+  string block_type = 7;
+  string transaction = 8;  // JSON-encoded transaction payload
+  string block_hash = 9;
+  uint64 timestamp = 10;
+}
+
+// Peer information for discovery.
+message PeerInfo {
+  string public_key = 1;
+  string address = 2;      // host:port
+  uint64 latest_seq = 3;
+  double last_seen = 4;
+}
+
+// Transport message envelope.
+message TransportMessage {
+  string message_type = 1;
+  string sender_pubkey = 2;
+  bytes payload = 3;
+  string request_id = 4;
+}
+
+// Request to crawl a peer's chain.
+message CrawlRequest {
+  string public_key = 1;
+  uint64 start_seq = 2;
+}
+
+// Response with blocks from a crawl.
+message CrawlResponse {
+  repeated HalfBlockProto blocks = 1;
+}
+
+// Proposal request.
+message ProposalRequest {
+  HalfBlockProto proposal = 1;
+}
+
+// Agreement response.
+message AgreementResponse {
+  HalfBlockProto agreement = 1;
+  bool accepted = 2;
+  string reason = 3;
+}
+
+// Status request.
+message StatusRequest {
+  string public_key = 1;
+}
+
+// Status response.
+message StatusResponse {
+  string public_key = 1;
+  uint64 latest_seq = 2;
+  uint64 block_count = 3;
+  repeated PeerInfo known_peers = 4;
+}
+
+// Peer discovery request.
+message DiscoveryRequest {
+  string sender_pubkey = 1;
+  repeated PeerInfo known_peers = 2;
+}
+
+// Peer discovery response.
+message DiscoveryResponse {
+  repeated PeerInfo peers = 1;
+}
+
+// The TrustChain gRPC service.
+service TrustChainService {
+  // Submit a proposal to a peer.
+  rpc Propose(ProposalRequest) returns (AgreementResponse);
+
+  // Crawl a peer's chain.
+  rpc Crawl(CrawlRequest) returns (CrawlResponse);
+
+  // Get peer status.
+  rpc GetStatus(StatusRequest) returns (StatusResponse);
+
+  // Exchange peer information.
+  rpc DiscoverPeers(DiscoveryRequest) returns (DiscoveryResponse);
+}

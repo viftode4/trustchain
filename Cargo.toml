@@ -1,0 +1,78 @@
+[workspace]
+resolver = "2"
+members = [
+    "trustchain-core",
+    "trustchain-transport",
+    "trustchain-node",
+    "trustchain-wasm",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Vlad Lev"]
+license = "MIT"
+repository = "https://github.com/levvlad/trustchain"
+homepage = "https://github.com/levvlad/trustchain"
+keywords = ["trust", "decentralized", "blockchain", "p2p", "agents"]
+categories = ["cryptography", "network-programming"]
+
+[workspace.dependencies]
+# Crypto
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
+rand = "0.8"
+hex = "0.4"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Graph
+petgraph = "0.6"
+
+# Time
+chrono = "0.4"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Networking
+quinn = "0.11"
+tonic = "0.12"
+prost = "0.13"
+axum = "0.8"
+reqwest = { version = "0.12", features = ["json"] }
+rustls = { version = "0.23", features = ["ring"] }
+rcgen = "0.13"
+tower = "0.5"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+
+# MCP (Model Context Protocol)
+rmcp = { version = "0.17", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+schemars = "1"
+
+# Build
+tonic-build = "0.12"
+prost-build = "0.13"
+
+# Internal crates
+trustchain-core = { path = "trustchain-core" }
+trustchain-transport = { path = "trustchain-transport" }

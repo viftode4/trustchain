@@ -1,0 +1,33 @@
+[Unit]
+Description=TrustChain Node
+Documentation=https://github.com/trustchain-network/trustchain
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trustchain
+Group=trustchain
+ExecStart=/usr/local/bin/trustchain-node run --config /etc/trustchain/node.toml
+Restart=always
+RestartSec=5
+
+# File descriptor limit for QUIC connections.
+LimitNOFILE=65536
+
+# Working directory for identity key and database.
+WorkingDirectory=/var/lib/trustchain
+StateDirectory=trustchain
+ConfigurationDirectory=trustchain
+
+# Security hardening.
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/trustchain
+NoNewPrivileges=true
+PrivateTmp=true
+
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

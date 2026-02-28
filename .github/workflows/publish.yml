@@ -1,0 +1,50 @@
+name: Publish to crates.io
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (no actual publish)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # Publish in dependency order: core -> transport -> node -> wasm
+      - name: Publish trustchain-core
+        run: cargo publish -p trustchain-core ${{ inputs.dry_run == 'true' && '--dry-run' || '' }}
+
+      - name: Publish trustchain-transport
+        if: inputs.dry_run == 'false'
+        run: |
+          sleep 30  # wait for crates.io index to update
+          cargo publish -p trustchain-transport
+
+      - name: Publish trustchain-node
+        if: inputs.dry_run == 'false'
+        run: |
+          sleep 30
+          cargo publish -p trustchain-node
+
+      - name: Publish trustchain-wasm
+        if: inputs.dry_run == 'false'
+        run: |
+          sleep 30
+          cargo publish -p trustchain-wasm

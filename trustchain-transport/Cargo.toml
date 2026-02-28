@@ -1,0 +1,45 @@
+[package]
+name = "trustchain-transport"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "TrustChain networking — QUIC, gRPC, HTTP, peer discovery"
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../README.md"
+
+[features]
+default = []
+mcp = ["dep:rmcp", "dep:schemars"]
+
+[dependencies]
+trustchain-core = { workspace = true }
+quinn = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+tower = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+rand = { workspace = true }
+rmcp = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+prost-build = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,23 @@
+# Default TrustChain node configuration for Docker deployments.
+# Mount /data as a persistent volume for identity key and database.
+#
+# Override any values by mounting your own config:
+#   docker run -v /path/to/node.toml:/etc/trustchain/node.toml ...
+
+key_path = "/data/identity.key"
+db_path = "/data/trustchain.db"
+
+# Bind addresses (inside container — ports are mapped at docker run time).
+quic_addr = "0.0.0.0:8200"
+grpc_addr = "0.0.0.0:8201"
+http_addr = "0.0.0.0:8202"
+proxy_addr = "127.0.0.1:8203"
+
+# IMPORTANT: Set advertise_addr to your public IP so other nodes can reach you.
+# Example: advertise_addr = "http://203.0.113.5:8202"
+# Alternatively, STUN will attempt automatic discovery (requires internet access).
+
+# Bootstrap nodes — leave empty to use built-in seed nodes when available.
+# bootstrap_nodes = ["http://seed1.trustchain.network:8202"]
+
+log_level = "info"
