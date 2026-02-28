@@ -1,9 +1,9 @@
 # Multi-stage build for TrustChain node.
 # Build: docker build -t trustchain-node .
-# Run:   docker run -p 8200:8200/udp -p 8201:8201 -p 8202:8202 trustchain-node
+# Run:   docker run -p 8200:8200/udp -p 8201:8201 -p 8202:8202 -p 8203:8203 trustchain-node
 
 # --- Builder stage ---
-FROM rust:1.82-bookworm AS builder
+FROM rust:1.85-bookworm AS builder
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -32,6 +32,8 @@ COPY deploy/docker-node.toml /etc/trustchain/node.toml
 EXPOSE 8200/udp
 EXPOSE 8201/tcp
 EXPOSE 8202/tcp
+# Transparent HTTP proxy for sidecar mode.
+EXPOSE 8203/tcp
 
 # Persistent volume for identity key and SQLite database.
 # Mount: docker run -v trustchain-data:/data ...

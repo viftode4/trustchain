@@ -1,0 +1,32 @@
+# Example: TrustChain sidecar with a Python agent.
+#
+# Start:  docker compose up -d
+# Logs:   docker compose logs -f sidecar
+# Stop:   docker compose down
+
+services:
+  sidecar:
+    build: .
+    image: trustchain-node
+    ports:
+      - "8200:8200/udp"   # QUIC
+      - "8202:8202/tcp"   # HTTP REST
+      - "8203:8203/tcp"   # Transparent proxy
+    volumes:
+      - trustchain-data:/data
+    environment:
+      RUST_LOG: info
+    restart: unless-stopped
+
+  agent:
+    # Replace with your actual agent image.
+    image: python:3.12-slim
+    command: ["python", "-c", "print('agent ready'); import time; time.sleep(3600)"]
+    environment:
+      HTTP_PROXY: http://sidecar:8203
+      TRUSTCHAIN_HTTP: http://sidecar:8202
+    depends_on:
+      - sidecar
+
+volumes:
+  trustchain-data:
