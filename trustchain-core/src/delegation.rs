@@ -41,7 +41,7 @@ pub struct SuccessionRecord {
 }
 
 /// Trait for delegation storage backends.
-pub trait DelegationStore: Send {
+pub trait DelegationStore: Send + Sync {
     /// Store a delegation record.
     fn add_delegation(&mut self, record: DelegationRecord) -> Result<()>;
 
@@ -68,6 +68,9 @@ pub trait DelegationStore: Send {
 
     /// Resolve identity: follow succession chain to find the current pubkey.
     fn resolve_identity(&self, pubkey: &str) -> Result<String>;
+
+    /// Check if a pubkey has ever been a delegate (active, revoked, or expired).
+    fn is_delegate(&self, pubkey: &str) -> Result<bool>;
 
     /// Get the delegation count.
     fn delegation_count(&self) -> Result<usize>;
@@ -137,7 +140,10 @@ impl DelegationStore for MemoryDelegationStore {
     }
 
     fn is_revoked(&self, delegation_id: &str) -> Result<bool> {
-        Ok(self.delegations.get(delegation_id).map_or(false, |d| d.revoked))
+        match self.delegations.get(delegation_id) {
+            Some(d) => Ok(d.revoked),
+            None => Err(TrustChainError::delegation("", format!("Unknown delegation: {delegation_id}"))),
+        }
     }
 
     fn add_succession(&mut self, record: SuccessionRecord) -> Result<()> {
@@ -159,6 +165,10 @@ impl DelegationStore for MemoryDelegationStore {
             }
         }
         Ok(current)
+    }
+
+    fn is_delegate(&self, pubkey: &str) -> Result<bool> {
+        Ok(self.delegations.values().any(|d| d.delegate_pubkey == pubkey))
     }
 
     fn delegation_count(&self) -> Result<usize> {
@@ -198,7 +208,7 @@ impl SqliteDelegationStore {
     }
 
     fn init_schema(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS delegations (
@@ -217,6 +227,8 @@ impl SqliteDelegationStore {
             );
             CREATE INDEX IF NOT EXISTS idx_deleg_delegator ON delegations(delegator_pubkey);
             CREATE INDEX IF NOT EXISTS idx_deleg_delegate ON delegations(delegate_pubkey);
+            CREATE INDEX IF NOT EXISTS idx_deleg_delegator_revoked ON delegations(delegator_pubkey, revoked);
+            CREATE INDEX IF NOT EXISTS idx_deleg_expires ON delegations(expires_at);
 
             CREATE TABLE IF NOT EXISTS successions (
                 old_pubkey TEXT NOT NULL,
@@ -231,7 +243,7 @@ impl SqliteDelegationStore {
 
 impl DelegationStore for SqliteDelegationStore {
     fn add_delegation(&mut self, record: DelegationRecord) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         let scope_json = serde_json::to_string(&record.scope)?;
         conn.execute(
             "INSERT OR REPLACE INTO delegations
@@ -258,7 +270,7 @@ impl DelegationStore for SqliteDelegationStore {
     }
 
     fn get_delegation(&self, delegation_id: &str) -> Result<Option<DelegationRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         let mut stmt = conn.prepare(
             "SELECT delegation_id, delegator_pubkey, delegate_pubkey, scope, max_depth,
                     issued_at, expires_at, delegation_block_hash, agreement_block_hash,
@@ -273,7 +285,7 @@ impl DelegationStore for SqliteDelegationStore {
     }
 
     fn get_delegation_by_delegate(&self, delegate_pubkey: &str) -> Result<Option<DelegationRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         let mut stmt = conn.prepare(
             "SELECT delegation_id, delegator_pubkey, delegate_pubkey, scope, max_depth,
                     issued_at, expires_at, delegation_block_hash, agreement_block_hash,
@@ -289,7 +301,7 @@ impl DelegationStore for SqliteDelegationStore {
     }
 
     fn get_delegations_by_delegator(&self, delegator_pubkey: &str) -> Result<Vec<DelegationRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         let mut stmt = conn.prepare(
             "SELECT delegation_id, delegator_pubkey, delegate_pubkey, scope, max_depth,
                     issued_at, expires_at, delegation_block_hash, agreement_block_hash,
@@ -305,7 +317,7 @@ impl DelegationStore for SqliteDelegationStore {
     }
 
     fn get_delegations_for_pubkey(&self, pubkey: &str) -> Result<Vec<DelegationRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         let mut stmt = conn.prepare(
             "SELECT delegation_id, delegator_pubkey, delegate_pubkey, scope, max_depth,
                     issued_at, expires_at, delegation_block_hash, agreement_block_hash,
@@ -321,7 +333,7 @@ impl DelegationStore for SqliteDelegationStore {
     }
 
     fn revoke_delegation(&mut self, delegation_id: &str, revocation_block_hash: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         let updated = conn.execute(
             "UPDATE delegations SET revoked = 1, revocation_block_hash = ?2 WHERE delegation_id = ?1",
             rusqlite::params![delegation_id, revocation_block_hash],
@@ -333,19 +345,24 @@ impl DelegationStore for SqliteDelegationStore {
     }
 
     fn is_revoked(&self, delegation_id: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         let revoked: bool = conn
             .query_row(
                 "SELECT revoked FROM delegations WHERE delegation_id = ?1",
                 rusqlite::params![delegation_id],
                 |row| row.get(0),
             )
-            .unwrap_or(false);
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    TrustChainError::delegation("", format!("Unknown delegation: {delegation_id}"))
+                }
+                other => TrustChainError::Storage(other.to_string()),
+            })?;
         Ok(revoked)
     }
 
     fn add_succession(&mut self, record: SuccessionRecord) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         conn.execute(
             "INSERT OR REPLACE INTO successions (old_pubkey, new_pubkey, succession_block_hash)
              VALUES (?1, ?2, ?3)",
@@ -355,7 +372,7 @@ impl DelegationStore for SqliteDelegationStore {
     }
 
     fn resolve_identity(&self, pubkey: &str) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         let mut current = pubkey.to_string();
         let mut seen = std::collections::HashSet::new();
         loop {
@@ -377,8 +394,18 @@ impl DelegationStore for SqliteDelegationStore {
         Ok(current)
     }
 
+    fn is_delegate(&self, pubkey: &str) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("lock poisoned".to_string()))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM delegations WHERE delegate_pubkey = ?1",
+            rusqlite::params![pubkey],
+            |row| row.get(0),
+        ).unwrap_or(0);
+        Ok(count > 0)
+    }
+
     fn delegation_count(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM delegations", [], |row| row.get(0))?;
         Ok(count as usize)
     }

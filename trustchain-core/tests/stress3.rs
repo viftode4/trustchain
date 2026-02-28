@@ -436,7 +436,7 @@ fn stress_out_of_order_gossip_delivery() {
     assert_eq!(fwd.unwrap().block_hash, agreement.block_hash);
 
     // Alice's chain integrity must be 1.0 despite out-of-order receipt.
-    let engine = TrustEngine::new(&store, None, None);
+    let engine = TrustEngine::new(&store, None, None, None);
     let integrity = engine.compute_chain_integrity(&alice.pubkey_hex()).unwrap();
     assert_eq!(
         integrity, 1.0,
@@ -499,7 +499,7 @@ fn stress_statistical_score_ceiling() {
         }
     }
 
-    let engine = TrustEngine::new(&store, None, None);
+    let engine = TrustEngine::new(&store, None, None, None);
     let alice_pk = alice.pubkey_hex();
 
     let integrity   = engine.compute_chain_integrity(&alice_pk).unwrap();

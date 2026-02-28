@@ -249,7 +249,7 @@ impl WasmProtocol {
     /// Compute the trust score for a given public key using this node's block store.
     #[wasm_bindgen(js_name = trustScore)]
     pub fn trust_score(&self, pubkey: &str) -> Result<f64, JsValue> {
-        let engine = TrustEngine::new(self.protocol.store(), None, None);
+        let engine = TrustEngine::new(self.protocol.store(), None, None, None);
         engine
             .compute_trust(pubkey)
             .map_err(|e| JsValue::from_str(&format!("trust computation failed: {e}")))
@@ -265,7 +265,7 @@ impl WasmProtocol {
         let seeds: Vec<String> = serde_json::from_str(seed_pubkeys_json)
             .map_err(|e| JsValue::from_str(&format!("invalid seed_pubkeys JSON: {e}")))?;
 
-        let engine = TrustEngine::new(self.protocol.store(), Some(seeds), None);
+        let engine = TrustEngine::new(self.protocol.store(), Some(seeds), None, None);
         engine
             .compute_trust(pubkey)
             .map_err(|e| JsValue::from_str(&format!("trust computation failed: {e}")))

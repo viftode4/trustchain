@@ -91,7 +91,7 @@ impl NetworkSim {
     fn trust_score(&self, seeds: &[usize], target: usize) -> f64 {
         let master = self.master_store();
         let seed_keys: Vec<String> = seeds.iter().map(|&i| self.pubkey(i)).collect();
-        let engine = TrustEngine::new(&master, Some(seed_keys), None);
+        let engine = TrustEngine::new(&master, Some(seed_keys), None, None);
         engine.compute_trust(&self.pubkey(target)).unwrap_or(0.0)
     }
 }

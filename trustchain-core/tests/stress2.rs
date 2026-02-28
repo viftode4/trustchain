@@ -226,7 +226,7 @@ fn stress_trust_exact_math_no_netflow() {
     // Case A: empty chain → exactly 0.5
     {
         let store = MemoryBlockStore::new();
-        let engine = TrustEngine::new(&store, None, None);
+        let engine = TrustEngine::new(&store, None, None, None);
         let score = engine
             .compute_trust(&Identity::from_bytes(&[1; 32]).pubkey_hex())
             .unwrap();
@@ -257,7 +257,7 @@ fn stress_trust_exact_math_no_netflow() {
             store.add_block(&b).unwrap();
         }
 
-        let engine = TrustEngine::new(&store, None, None);
+        let engine = TrustEngine::new(&store, None, None, None);
         let integrity = engine
             .compute_chain_integrity(&alice.pubkey_hex())
             .unwrap();
@@ -334,7 +334,7 @@ fn stress_chain_integrity_broken_link() {
         store.add_block(b).unwrap();
     }
 
-    let engine = TrustEngine::new(&store, None, None);
+    let engine = TrustEngine::new(&store, None, None, None);
     let integrity = engine
         .compute_chain_integrity(&alice.pubkey_hex())
         .unwrap();
@@ -376,7 +376,7 @@ fn stress_trust_monotonicity() {
             prev = b.block_hash.clone();
             store.add_block(&b).unwrap();
         }
-        TrustEngine::new(&store, None, None)
+        TrustEngine::new(&store, None, None, None)
             .compute_trust(&agent.pubkey_hex())
             .unwrap()
     };

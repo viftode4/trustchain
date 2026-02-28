@@ -2,10 +2,12 @@
 //!
 //! Maps to Python's `trust.py`. Blends multiple trust signals into a single
 //! score for each agent, with configurable weights.
+//! Delegation-aware: delegated identities inherit trust from their root principal.
 
 use std::collections::HashMap;
 
 use crate::blockstore::BlockStore;
+use crate::delegation::{DelegationRecord, DelegationStore};
 use crate::error::Result;
 use crate::netflow::NetFlowTrust;
 use crate::types::GENESIS_HASH;
@@ -33,11 +35,78 @@ impl Default for TrustWeights {
     }
 }
 
+/// Pre-captured delegation context for trust computation.
+///
+/// This avoids holding a `&dyn DelegationStore` reference in `TrustEngine`,
+/// which would make the struct non-`Send` in async contexts with trait objects.
+#[derive(Debug, Clone, Default)]
+pub struct DelegationContext {
+    /// Active delegation where pubkey is the delegate, if any.
+    pub active_delegation: Option<DelegationRecord>,
+    /// Whether the pubkey has ever been a delegate (active, revoked, or expired).
+    pub was_delegate: bool,
+    /// All delegations where this pubkey is the delegator (active and revoked).
+    pub delegations_as_delegator: Vec<DelegationRecord>,
+    /// For walking the chain to root: root delegator pubkey.
+    pub root_pubkey: Option<String>,
+    /// Active delegation count at the root delegator level (for budget split).
+    pub root_active_delegation_count: usize,
+}
+
+impl DelegationContext {
+    /// Build a `DelegationContext` by querying a `DelegationStore`.
+    pub fn from_store(ds: &dyn DelegationStore, pubkey: &str) -> Result<Self> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // Check if pubkey is a delegate
+        let active_delegation = match ds.get_delegation_by_delegate(pubkey) {
+            Ok(Some(d)) if d.is_active(now_ms) => Some(d),
+            _ => None,
+        };
+
+        let was_delegate = ds.is_delegate(pubkey)?;
+
+        // Walk to root delegator if this is an active delegate
+        let (root_pubkey, root_active_delegation_count) = if let Some(ref delegation) = active_delegation {
+            let mut root = delegation.delegator_pubkey.clone();
+            let mut current = delegation.clone();
+            while let Some(ref parent_id) = current.parent_delegation_id {
+                if let Ok(Some(parent)) = ds.get_delegation(parent_id) {
+                    root = parent.delegator_pubkey.clone();
+                    current = parent;
+                } else {
+                    break;
+                }
+            }
+            let all_delegations = ds.get_delegations_by_delegator(&root)?;
+            let active_count = all_delegations.iter().filter(|d| d.is_active(now_ms)).count().max(1);
+            (Some(root), active_count)
+        } else {
+            (None, 0)
+        };
+
+        // Get delegations where this pubkey is delegator (for fraud propagation)
+        let delegations_as_delegator = ds.get_delegations_by_delegator(pubkey)?;
+
+        Ok(Self {
+            active_delegation,
+            was_delegate,
+            delegations_as_delegator,
+            root_pubkey,
+            root_active_delegation_count,
+        })
+    }
+}
+
 /// The unified trust engine.
 pub struct TrustEngine<'a, S: BlockStore> {
     store: &'a S,
     seed_nodes: Option<Vec<String>>,
     weights: TrustWeights,
+    delegation_ctx: Option<DelegationContext>,
 }
 
 impl<'a, S: BlockStore> TrustEngine<'a, S> {
@@ -45,21 +114,62 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
         store: &'a S,
         seed_nodes: Option<Vec<String>>,
         weights: Option<TrustWeights>,
+        delegation_ctx: Option<DelegationContext>,
     ) -> Self {
         Self {
             store,
             seed_nodes,
             weights: weights.unwrap_or_default(),
+            delegation_ctx,
         }
     }
 
     /// Compute the blended trust score for an agent.
     ///
-    /// Score = `w_integrity * integrity + w_netflow * netflow + w_statistical * statistical`
+    /// Delegation-aware:
+    /// - If the pubkey is an active delegate, trust is derived from the root delegator
+    ///   with a budget split across active delegations.
+    /// - If the pubkey was a delegate but the delegation is no longer active, returns 0.0.
+    /// - If any delegate (active or revoked) of this pubkey committed fraud, returns 0.0.
     ///
+    /// Standard (non-delegated):
+    /// Score = `w_integrity * integrity + w_netflow * netflow + w_statistical * statistical`
     /// If netflow is unavailable (no seed nodes), its weight is redistributed.
     /// Returns hard zero for agents with proven double-spend fraud.
     pub fn compute_trust(&self, pubkey: &str) -> Result<f64> {
+        // Check delegation context
+        if let Some(ref ctx) = self.delegation_ctx {
+            // Is this an active delegated identity?
+            if let Some(ref _delegation) = ctx.active_delegation {
+                if let Some(ref root_pubkey) = ctx.root_pubkey {
+                    // Compute root's trust
+                    let root_trust = self.compute_standard_trust(root_pubkey)?;
+                    // Budget split
+                    let active_count = ctx.root_active_delegation_count.max(1);
+                    let effective = root_trust / active_count as f64;
+                    return Ok(effective.clamp(0.0, 1.0));
+                }
+            }
+
+            // Was a delegate whose delegation is no longer active -> 0
+            if ctx.was_delegate && ctx.active_delegation.is_none() {
+                return Ok(0.0);
+            }
+
+            // Check if any delegate (active OR revoked) committed fraud
+            for d in &ctx.delegations_as_delegator {
+                let delegate_frauds = self.store.get_double_spends(&d.delegate_pubkey)?;
+                if !delegate_frauds.is_empty() {
+                    return Ok(0.0); // Hard zero: delegate fraud = delegator fraud
+                }
+            }
+        }
+
+        self.compute_standard_trust(pubkey)
+    }
+
+    /// Standard trust computation (non-delegated path).
+    fn compute_standard_trust(&self, pubkey: &str) -> Result<f64> {
         // Hard zero for proven fraud.
         let frauds = self.store.get_double_spends(pubkey)?;
         if !frauds.is_empty() {
@@ -282,9 +392,9 @@ mod tests {
     #[test]
     fn test_empty_chain_trust() {
         let store = MemoryBlockStore::new();
-        let engine = TrustEngine::new(&store, None, None);
+        let engine = TrustEngine::new(&store, None, None, None);
         let score = engine.compute_trust("unknown").unwrap();
-        // Empty chain: integrity=1.0, statistical=0.0 → redistributed.
+        // Empty chain: integrity=1.0, statistical=0.0 -> redistributed.
         assert!(score >= 0.0 && score <= 1.0);
     }
 
@@ -301,6 +411,7 @@ mod tests {
         let engine = TrustEngine::new(
             &store,
             Some(vec![seed.pubkey_hex()]),
+            None,
             None,
         );
 
@@ -322,6 +433,7 @@ mod tests {
         let engine = TrustEngine::new(
             &store,
             Some(vec![seed.pubkey_hex()]),
+            None,
             None,
         );
 
@@ -347,7 +459,7 @@ mod tests {
             store.add_block(&proposal).unwrap();
         }
 
-        let engine = TrustEngine::new(&store, None, None);
+        let engine = TrustEngine::new(&store, None, None, None);
         let score = engine.compute_statistical_score(&agent.pubkey_hex()).unwrap();
         assert!(score > 0.0, "multiple counterparties should yield positive statistical score");
     }
@@ -362,8 +474,8 @@ mod tests {
             &mut store, &agent, &peer, 1, 1, GENESIS_HASH, GENESIS_HASH, 1000,
         );
 
-        // No seed nodes → netflow weight redistributed.
-        let engine = TrustEngine::new(&store, None, None);
+        // No seed nodes -> netflow weight redistributed.
+        let engine = TrustEngine::new(&store, None, None, None);
         let score = engine.compute_trust(&agent.pubkey_hex()).unwrap();
         assert!(score > 0.0 && score <= 1.0);
     }
@@ -380,7 +492,7 @@ mod tests {
         );
 
         // Without fraud, trust should be positive.
-        let engine = TrustEngine::new(&store, None, None);
+        let engine = TrustEngine::new(&store, None, None, None);
         let score_before = engine.compute_trust(&agent.pubkey_hex()).unwrap();
         assert!(score_before > 0.0, "should have positive trust before fraud");
 
@@ -398,7 +510,7 @@ mod tests {
         store.add_double_spend(&fake_a, &fake_b).unwrap();
 
         // After fraud, trust should be hard zero.
-        let engine = TrustEngine::new(&store, None, None);
+        let engine = TrustEngine::new(&store, None, None, None);
         let score_after = engine.compute_trust(&agent.pubkey_hex()).unwrap();
         assert_eq!(score_after, 0.0, "trust should be 0.0 after fraud");
     }
@@ -413,7 +525,7 @@ mod tests {
             &mut store, &agent, &peer, 1, 1, GENESIS_HASH, GENESIS_HASH, 1000,
         );
 
-        let engine = TrustEngine::new(&store, None, None);
+        let engine = TrustEngine::new(&store, None, None, None);
         assert_eq!(engine.compute_chain_integrity(&agent.pubkey_hex()).unwrap(), 1.0);
     }
 }

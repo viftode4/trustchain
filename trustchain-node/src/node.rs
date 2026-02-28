@@ -176,8 +176,9 @@ impl Node {
             let discovery = self.discovery.clone();
             let tracker = self.broadcast_tracker.clone();
             let quic_for_router = quic.clone();
+            let consensus_for_router = self.consensus.clone();
             tokio::spawn(Self::quic_message_router(
-                quic_rx, protocol, discovery, tracker, quic_for_router,
+                quic_rx, protocol, discovery, tracker, quic_for_router, consensus_for_router,
             ));
             (handle, quic)
         };
@@ -247,6 +248,7 @@ impl Node {
             quic: quic_accept_handle.1.clone(),
             client: reqwest::Client::new(),
             peer_locks: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            delegation_store: Some(self.delegation_store.clone()),
         };
         let proxy_handle = tokio::spawn(async move {
             if let Err(e) = start_proxy_server(proxy_addr, proxy_state).await {
@@ -367,15 +369,17 @@ impl Node {
         discovery: Arc<PeerDiscovery>,
         tracker: Arc<Mutex<BroadcastTracker>>,
         quic: Arc<QuicTransport>,
+        consensus: Arc<Mutex<CHECOConsensus<SqliteBlockStore>>>,
     ) {
         while let Some((data, resp_tx)) = rx.recv().await {
             let protocol = protocol.clone();
             let discovery = discovery.clone();
             let tracker = tracker.clone();
             let quic = quic.clone();
+            let consensus = consensus.clone();
             tokio::spawn(async move {
                 let response = Self::handle_quic_message(
-                    &data, &protocol, &discovery, &tracker, &quic,
+                    &data, &protocol, &discovery, &tracker, &quic, &consensus,
                 ).await;
                 let _ = resp_tx.send(response).await;
             });
@@ -389,6 +393,7 @@ impl Node {
         discovery: &Arc<PeerDiscovery>,
         tracker: &Arc<Mutex<BroadcastTracker>>,
         quic: &Arc<QuicTransport>,
+        consensus: &Arc<Mutex<CHECOConsensus<SqliteBlockStore>>>,
     ) -> Vec<u8> {
         // Try to deserialize as TransportMessage.
         let msg: TransportMessage = match serde_json::from_slice(data) {
@@ -410,7 +415,7 @@ impl Node {
                 };
 
                 let sender_pubkey = proposal.public_key.clone();
-                let response = {
+                let (response, agreement_opt) = {
                     let mut proto = protocol.lock().await;
 
                     // Receive and validate.
@@ -427,13 +432,24 @@ impl Node {
                                 block_to_bytes(&agreement),
                                 msg.request_id,
                             );
-                            serde_json::to_vec(&resp).unwrap_or_default()
+                            (serde_json::to_vec(&resp).unwrap_or_default(), Some(agreement))
                         }
-                        Err(e) => Self::error_response(&format!("agreement failed: {e}")),
+                        Err(e) => (Self::error_response(&format!("agreement failed: {e}")), None),
                     }
                 };
 
-                // After lock released, check for fraud and broadcast if found.
+                // After lock released, broadcast the completed block pair if agreement succeeded.
+                if let Some(ref agreement) = agreement_opt {
+                    let our_pubkey = {
+                        let proto = protocol.lock().await;
+                        proto.pubkey()
+                    };
+                    Self::broadcast_block_pair(
+                        &proposal, agreement, &our_pubkey, discovery, quic, tracker,
+                    ).await;
+                }
+
+                // Check for fraud and broadcast if found.
                 Self::check_and_broadcast_fraud(
                     &sender_pubkey, protocol, discovery, quic, tracker,
                 ).await;
@@ -796,6 +812,28 @@ impl Node {
                     "received finalized checkpoint"
                 );
 
+                // Persist the finalized checkpoint via the consensus engine.
+                {
+                    let mut cons = consensus.lock().await;
+                    match cons.finalize_checkpoint(
+                        payload.checkpoint.checkpoint_block,
+                        payload.checkpoint.signatures,
+                    ) {
+                        Ok(cp) => {
+                            tracing::info!(
+                                facilitator = &cp.facilitator_pubkey[..8],
+                                signers = cp.signatures.len(),
+                                "checkpoint persisted from peer"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "failed to persist finalized checkpoint: {e}"
+                            );
+                        }
+                    }
+                }
+
                 serde_json::to_vec(&serde_json::json!({"status": "checkpoint_accepted"}))
                     .unwrap_or_default()
             }
@@ -933,7 +971,6 @@ impl Node {
     }
 
     /// Broadcast a completed transaction (both halves) to the network.
-    #[allow(dead_code)]
     pub async fn broadcast_block_pair(
         proposal: &HalfBlock,
         agreement: &HalfBlock,

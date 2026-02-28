@@ -116,7 +116,7 @@ impl<S: BlockStore + 'static> TrustChainMcpServer<S> {
     ) -> Result<CallToolResult, McpError> {
         let proto = self.protocol.lock().await;
         let store = proto.store();
-        let engine = TrustEngine::new(store, None, None);
+        let engine = TrustEngine::new(store, None, None, None);
 
         let overall = engine
             .compute_trust(&params.0.peer)
@@ -157,7 +157,7 @@ impl<S: BlockStore + 'static> TrustChainMcpServer<S> {
         let peers = self.discovery.get_peers().await;
         let proto = self.protocol.lock().await;
         let store = proto.store();
-        let engine = TrustEngine::new(store, None, None);
+        let engine = TrustEngine::new(store, None, None, None);
 
         let min_trust = params.0.min_trust.unwrap_or(0.0);
         let max_results = params.0.max_results.unwrap_or(20);

@@ -27,7 +27,7 @@ use axum::{
 use reqwest::Client;
 use tokio::sync::Mutex;
 
-use trustchain_core::{BlockStore, TrustChainProtocol};
+use trustchain_core::{BlockStore, DelegationStore, TrustChainProtocol};
 
 use crate::discovery::{PeerDiscovery, PeerRecord};
 use crate::http::uuid_v4;
@@ -48,7 +48,7 @@ const HOP_BY_HOP: &[&str] = &[
 ];
 
 /// Shared state for the proxy server.
-pub struct ProxyState<S: BlockStore + 'static> {
+pub struct ProxyState<S: BlockStore + 'static, D: DelegationStore + 'static = trustchain_core::MemoryDelegationStore> {
     pub protocol: Arc<Mutex<TrustChainProtocol<S>>>,
     pub discovery: Arc<PeerDiscovery>,
     pub quic: Arc<QuicTransport>,
@@ -58,9 +58,11 @@ pub struct ProxyState<S: BlockStore + 'static> {
     /// one already covers this burst of activity). This matches the TrustChain
     /// paper's model where interactions are sequential per peer pair.
     pub peer_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Optional delegation store for enriching proxy transactions with delegation context.
+    pub delegation_store: Option<Arc<Mutex<D>>>,
 }
 
-impl<S: BlockStore + 'static> Clone for ProxyState<S> {
+impl<S: BlockStore + 'static, D: DelegationStore + 'static> Clone for ProxyState<S, D> {
     fn clone(&self) -> Self {
         Self {
             protocol: self.protocol.clone(),
@@ -68,11 +70,12 @@ impl<S: BlockStore + 'static> Clone for ProxyState<S> {
             quic: self.quic.clone(),
             client: self.client.clone(),
             peer_locks: self.peer_locks.clone(),
+            delegation_store: self.delegation_store.clone(),
         }
     }
 }
 
-impl<S: BlockStore + 'static> ProxyState<S> {
+impl<S: BlockStore + 'static, D: DelegationStore + 'static> ProxyState<S, D> {
     /// Get or create the per-peer handshake lock.
     async fn peer_lock(&self, pubkey: &str) -> Arc<Mutex<()>> {
         let mut locks = self.peer_locks.lock().await;
@@ -84,12 +87,12 @@ impl<S: BlockStore + 'static> ProxyState<S> {
 }
 
 /// Start the transparent proxy server.
-pub async fn start_proxy_server<S: BlockStore + Send + 'static>(
+pub async fn start_proxy_server<S: BlockStore + Send + 'static, D: DelegationStore + Send + 'static>(
     addr: SocketAddr,
-    state: ProxyState<S>,
+    state: ProxyState<S, D>,
 ) -> anyhow::Result<()> {
     let router = Router::new()
-        .fallback(proxy_handler::<S>)
+        .fallback(proxy_handler::<S, D>)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -102,8 +105,8 @@ pub async fn start_proxy_server<S: BlockStore + Send + 'static>(
 // Core handler
 // ---------------------------------------------------------------------------
 
-async fn proxy_handler<S: BlockStore + 'static>(
-    State(state): State<ProxyState<S>>,
+async fn proxy_handler<S: BlockStore + 'static, D: DelegationStore + 'static>(
+    State(state): State<ProxyState<S, D>>,
     req: axum::extract::Request,
 ) -> Response {
     // 1. Resolve target URL from the request.
@@ -129,11 +132,31 @@ async fn proxy_handler<S: BlockStore + 'static>(
         let lock = state.peer_lock(&peer.pubkey).await;
         let acquired = lock.try_lock();
         if acquired.is_ok() {
-            let tx = serde_json::json!({
+            let mut tx = serde_json::json!({
                 "proxy": true,
                 "method": req.method().as_str(),
                 "path": req.uri().path(),
             });
+
+            // Enrich with delegation context if local identity has an active delegation.
+            if let Some(ref ds) = state.delegation_store {
+                let ds_guard = ds.lock().await;
+                let our_pubkey = {
+                    let proto = state.protocol.lock().await;
+                    proto.pubkey()
+                };
+                if let Ok(Some(deleg)) = ds_guard.get_delegation_by_delegate(&our_pubkey) {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    if deleg.is_active(now_ms) {
+                        tx["delegation_id"] = serde_json::json!(deleg.delegation_id);
+                        tx["delegator_pubkey"] = serde_json::json!(deleg.delegator_pubkey);
+                        tx["scope"] = serde_json::json!(deleg.scope);
+                    }
+                }
+            }
 
             match run_handshake(&state, peer, tx).await {
                 Ok(()) => {
@@ -220,8 +243,8 @@ fn extract_authority(url: &str) -> Option<String> {
 /// receive_agreement flow, ensuring atomicity per the TrustChain paper's model.
 /// The per-peer lock in the caller prevents concurrent handshakes to the same peer,
 /// so this only blocks other protocol operations for the duration of one QUIC round-trip.
-async fn run_handshake<S: BlockStore + 'static>(
-    state: &ProxyState<S>,
+async fn run_handshake<S: BlockStore + 'static, D: DelegationStore + 'static>(
+    state: &ProxyState<S, D>,
     peer: &PeerRecord,
     tx: serde_json::Value,
 ) -> anyhow::Result<()> {

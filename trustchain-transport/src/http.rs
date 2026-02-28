@@ -505,15 +505,65 @@ async fn handle_register_peer<S: BlockStore + 'static, D: DelegationStore + Send
     Json(serde_json::json!({"status": "ok"}))
 }
 
+/// Build a DelegationContext from a concrete DelegationStore (no dyn dispatch in caller).
+fn build_delegation_ctx<D: DelegationStore>(ds: &D, pubkey: &str) -> Option<trustchain_core::DelegationContext> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let active_delegation = match ds.get_delegation_by_delegate(pubkey) {
+        Ok(Some(d)) if d.is_active(now_ms) => Some(d),
+        _ => None,
+    };
+
+    let was_delegate = ds.is_delegate(pubkey).unwrap_or(false);
+
+    let (root_pubkey, root_active_delegation_count) = if let Some(ref delegation) = active_delegation {
+        let mut root = delegation.delegator_pubkey.clone();
+        let mut current = delegation.clone();
+        while let Some(ref parent_id) = current.parent_delegation_id {
+            if let Ok(Some(parent)) = ds.get_delegation(parent_id) {
+                root = parent.delegator_pubkey.clone();
+                current = parent;
+            } else {
+                break;
+            }
+        }
+        let all_delegations = ds.get_delegations_by_delegator(&root).unwrap_or_default();
+        let active_count = all_delegations.iter().filter(|d| d.is_active(now_ms)).count().max(1);
+        (Some(root), active_count)
+    } else {
+        (None, 0)
+    };
+
+    let delegations_as_delegator = ds.get_delegations_by_delegator(pubkey).unwrap_or_default();
+
+    Some(trustchain_core::DelegationContext {
+        active_delegation,
+        was_delegate,
+        delegations_as_delegator,
+        root_pubkey,
+        root_active_delegation_count,
+    })
+}
+
 /// Query the trust score for a given public key.
 async fn handle_trust_score<S: BlockStore + 'static, D: DelegationStore + Send + 'static>(
     State(state): State<AppState<S, D>>,
     Path(pubkey): Path<String>,
 ) -> Result<Json<TrustScoreResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Build delegation context first (separate lock scope).
+    let delegation_ctx = {
+        let ds = state.delegation_store.lock().await;
+        build_delegation_ctx(&*ds, &pubkey)
+    };
+
+    // Now lock protocol for trust computation.
     let proto = state.protocol.lock().await;
     let store = proto.store();
 
-    let engine = TrustEngine::new(store, None, None);
+    let engine = TrustEngine::new(store, None, None, delegation_ctx);
     let trust_score = engine.compute_trust(&pubkey).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -619,10 +669,13 @@ async fn handle_discover<S: BlockStore + 'static, D: DelegationStore + Send + 's
     // 3. Compute trust scores (requires protocol lock for store access).
     {
         let proto = state.protocol.lock().await;
-        let engine = TrustEngine::new(proto.store(), None, None);
+        let ds = state.delegation_store.lock().await;
         for agent in agents_map.values_mut() {
+            let ctx = build_delegation_ctx(&*ds, &agent.pubkey);
+            let engine = TrustEngine::new(proto.store(), None, None, ctx);
             agent.trust_score = engine.compute_trust(&agent.pubkey).ok();
         }
+        drop(ds);
     }
 
     // 4. Enrich with addresses from peer discovery.

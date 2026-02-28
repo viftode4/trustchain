@@ -37,5 +37,5 @@ pub use halfblock::{create_half_block, validate_and_record, validate_block, vali
 pub use identity::Identity;
 pub use netflow::NetFlowTrust;
 pub use protocol::TrustChainProtocol;
-pub use trust::{TrustEngine, TrustWeights};
+pub use trust::{DelegationContext, TrustEngine, TrustWeights};
 pub use types::{BlockType, ValidationResult, GENESIS_HASH, GENESIS_SEQ, UNKNOWN_SEQ};
