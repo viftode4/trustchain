@@ -12,8 +12,8 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Vlad Lev"]
 license = "MIT"
-repository = "https://github.com/levvlad/trustchain"
-homepage = "https://github.com/levvlad/trustchain"
+repository = "https://github.com/viftode4/trustchain"
+homepage = "https://github.com/viftode4/trustchain"
 keywords = ["trust", "decentralized", "blockchain", "p2p", "agents"]
 categories = ["cryptography", "network-programming"]
 
@@ -56,10 +56,13 @@ quinn = "0.11"
 tonic = "0.12"
 prost = "0.13"
 axum = "0.8"
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 reqwest = { version = "0.12", features = ["json"] }
 rustls = { version = "0.23", features = ["ring"] }
 rcgen = "0.13"
 tower = "0.5"
+tower-http = { version = "0.6", features = ["limit"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

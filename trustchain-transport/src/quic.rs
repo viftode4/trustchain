@@ -13,6 +13,15 @@ use tokio::sync::mpsc;
 use crate::tls;
 use crate::transport::TransportError;
 
+/// Maximum number of distinct IPs tracked by the rate limiter at any one time.
+///
+/// Without a cap the `counters` HashMap grows unboundedly under a flood of
+/// unique source IPs (e.g. a distributed reflection attack), consuming memory
+/// until the process is OOM-killed.  When the cap is reached we first evict
+/// IPs whose rate-limit window has already expired; if the map is still at
+/// capacity after eviction the new connection is rejected.
+const MAX_TRACKED_IPS: usize = 65_536;
+
 /// Per-IP connection rate limiter.
 #[derive(Debug)]
 struct RateLimiter {
@@ -36,6 +45,22 @@ impl RateLimiter {
         }
         let mut counters = self.counters.lock().unwrap();
         let now = Instant::now();
+
+        // Enforce the size cap: evict entries whose 1-second window has expired.
+        if counters.len() >= MAX_TRACKED_IPS {
+            counters.retain(|_, (_, ts)| now.duration_since(*ts).as_secs() < 2);
+        }
+        // If still at or over the cap after eviction, reject the connection to
+        // prevent unbounded memory growth from a flood of unique source IPs.
+        if counters.len() >= MAX_TRACKED_IPS {
+            log::warn!(
+                "rate limiter at capacity ({} IPs tracked); rejecting connection from {}",
+                MAX_TRACKED_IPS,
+                ip,
+            );
+            return false;
+        }
+
         let entry = counters.entry(ip).or_insert((0, now));
         // Reset window if more than 1 second has passed.
         if now.duration_since(entry.1).as_secs() >= 1 {

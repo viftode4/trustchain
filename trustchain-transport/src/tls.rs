@@ -8,6 +8,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::sync::{Arc, Once};
 
 static INIT_CRYPTO: Once = Once::new();
+/// Guard that emits the AcceptAnyCert startup warning exactly once.
+static WARN_ACCEPT_ANY_CERT: Once = Once::new();
 
 /// Ensure the rustls CryptoProvider is installed (once).
 fn ensure_crypto_provider() {
@@ -57,8 +59,27 @@ pub fn build_server_config(
 }
 
 /// Build a rustls ClientConfig that accepts self-signed certs.
+///
+/// SECURITY WARNING: Certificate verification is disabled (`AcceptAnyCert`).
+/// This is intentional for the current P2P model where nodes present self-signed
+/// certificates derived from their Ed25519 identity, but it means that TLS
+/// provides no protection against on-path attackers.
+///
+/// A full fix requires pubkey pinning: verify that the certificate's embedded
+/// TrustChain public key matches the peer's known identity before proceeding.
+/// This is tracked as a future hardening item.
 pub fn build_client_config() -> Result<Arc<rustls::ClientConfig>, Box<dyn std::error::Error>> {
     ensure_crypto_provider();
+
+    // Emit warning once at startup so operators are aware of the limitation.
+    WARN_ACCEPT_ANY_CERT.call_once(|| {
+        tracing::warn!(
+            "QUIC TLS: certificate verification disabled (AcceptAnyCert) — \
+             not suitable for production without pubkey pinning; \
+             TLS provides confidentiality and integrity but not peer authentication"
+        );
+    });
+
     let config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))

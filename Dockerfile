@@ -22,10 +22,12 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
+RUN useradd -r -s /bin/false -u 1001 trustchain
+
 COPY --from=builder /build/target/release/trustchain-node /usr/local/bin/trustchain-node
 
 # Install default config (paths set to /data for persistent volume).
-RUN mkdir -p /etc/trustchain /data
+RUN mkdir -p /etc/trustchain /data && chown trustchain:trustchain /data
 COPY deploy/docker-node.toml /etc/trustchain/node.toml
 
 # QUIC (UDP), gRPC (TCP), HTTP REST (TCP).
@@ -40,6 +42,11 @@ EXPOSE 8203/tcp
 VOLUME /data
 
 ENV RUST_LOG=info
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD ["/usr/local/bin/trustchain-node", "--help"]
+
+USER trustchain
 
 ENTRYPOINT ["trustchain-node"]
 CMD ["run", "--config", "/etc/trustchain/node.toml"]

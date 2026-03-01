@@ -16,7 +16,7 @@ use crate::identity::Identity;
 use crate::types::BlockType;
 
 /// A finalized checkpoint snapshot.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Checkpoint {
     /// Public key of the facilitator who proposed this checkpoint.
     pub facilitator_pubkey: String,
@@ -272,6 +272,16 @@ impl<S: BlockStore> CHECOConsensus<S> {
 
         self.checkpoints.push(checkpoint.clone());
         Ok(checkpoint)
+    }
+
+    /// Load previously persisted checkpoints (call at startup).
+    pub fn load_checkpoints(&mut self, checkpoints: Vec<Checkpoint>) {
+        self.checkpoints.extend(checkpoints);
+    }
+
+    /// Get the latest finalized checkpoint, if any.
+    pub fn latest_finalized_checkpoint(&self) -> Option<&Checkpoint> {
+        self.checkpoints.iter().rev().find(|c| c.finalized)
     }
 
     /// Check if a specific block is covered by a finalized checkpoint.

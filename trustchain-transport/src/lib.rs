@@ -7,6 +7,15 @@
 //! - **Discovery**: Peer finding via bootstrap + gossip
 //! - **Pool**: Connection pooling for efficient reuse
 
+/// Port offset subtracted from the HTTP port to derive the QUIC port.
+///
+/// Example: HTTP 8202 → QUIC 8200 (8202 - 2 = 8200).
+///
+/// Every call site that converts a peer's HTTP address to a QUIC address MUST
+/// use this constant instead of a hardcoded literal `2`, so that the offset is
+/// defined in exactly one place across the entire workspace.
+pub const QUIC_PORT_OFFSET: u16 = 2;
+
 pub mod discover;
 pub mod discovery;
 pub mod grpc;

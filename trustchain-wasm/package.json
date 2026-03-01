@@ -1,0 +1,23 @@
+{
+  "name": "@trustchain/core",
+  "version": "0.1.0",
+  "description": "TrustChain core library for browsers and Node.js — decentralized trust for AI agents",
+  "main": "pkg/trustchain_wasm.js",
+  "types": "pkg/trustchain_wasm.d.ts",
+  "files": [
+    "pkg/"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/viftode4/trustchain.git",
+    "directory": "trustchain-wasm"
+  },
+  "keywords": [
+    "trustchain",
+    "wasm",
+    "trust",
+    "blockchain",
+    "agents"
+  ],
+  "license": "MIT"
+}

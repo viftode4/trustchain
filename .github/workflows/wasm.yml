@@ -1,0 +1,65 @@
+name: WASM Build
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "trustchain-wasm/**"
+      - "trustchain-core/**"
+  pull_request:
+    paths:
+      - "trustchain-wasm/**"
+      - "trustchain-core/**"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build WASM (bundler target)
+        run: wasm-pack build --target bundler trustchain-wasm
+
+      - name: Build WASM (web target)
+        run: wasm-pack build --target web trustchain-wasm --out-dir pkg-web
+
+      - name: Copy package.json into pkg
+        run: cp trustchain-wasm/package.json trustchain-wasm/pkg/package.json
+
+      - name: Upload WASM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: trustchain-wasm-pkg
+          path: trustchain-wasm/pkg/
+          retention-days: 30
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download WASM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: trustchain-wasm-pkg
+          path: pkg/
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish to npm
+        working-directory: pkg
+        run: npm publish --access public || echo "Version already published, skipping"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

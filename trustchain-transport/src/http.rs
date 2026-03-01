@@ -12,7 +12,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use trustchain_core::{BlockStore, DelegationStore, HalfBlock, TrustChainProtocol, TrustEngine};
+use trustchain_core::{BlockStore, Checkpoint, DelegationStore, HalfBlock, TrustChainProtocol, TrustEngine};
+
+use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::discover::{self, CapabilityQuery, DiscoveredAgent};
 use crate::discovery::PeerDiscovery;
@@ -29,6 +31,12 @@ pub struct AppState<S: BlockStore + 'static, D: DelegationStore + 'static = trus
     pub agent_endpoint: Option<String>,
     /// Delegation store for delegation/revocation/succession tracking.
     pub delegation_store: Arc<Mutex<D>>,
+    /// Latest finalized CHECO checkpoint (updated by consensus loop).
+    pub latest_checkpoint: Arc<Mutex<Option<Checkpoint>>>,
+    /// Seed/bootstrap nodes — passed to TrustEngine to enable NetFlow (Sybil resistance).
+    /// An empty Vec disables NetFlow, which reduces Sybil resistance; production
+    /// deployments MUST populate this from the node configuration.
+    pub seed_nodes: Vec<String>,
 }
 
 // Manual Clone impl — Arc handles the cloning, S/D don't need Clone.
@@ -40,6 +48,8 @@ impl<S: BlockStore + 'static, D: DelegationStore + 'static> Clone for AppState<S
             quic: self.quic.clone(),
             agent_endpoint: self.agent_endpoint.clone(),
             delegation_store: self.delegation_store.clone(),
+            latest_checkpoint: self.latest_checkpoint.clone(),
+            seed_nodes: self.seed_nodes.clone(),
         }
     }
 }
@@ -182,6 +192,9 @@ fn default_ttl_seconds() -> u64 {
     3600
 }
 
+/// Maximum allowed TTL for a delegation: 30 days.
+const MAX_DELEGATION_TTL_SECS: u64 = 30 * 24 * 3600;
+
 /// Request for revocation endpoint.
 #[derive(Deserialize)]
 pub struct RevokeRequest {
@@ -194,6 +207,33 @@ pub struct DelegationResponse {
     pub block: HalfBlock,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delegation_id: Option<String>,
+}
+
+/// Request for accepting a delegation proposal.
+#[derive(Deserialize)]
+pub struct AcceptDelegationRequest {
+    pub proposal_block: HalfBlock,
+}
+
+/// Response for accepting a delegation.
+#[derive(Serialize)]
+pub struct AcceptDelegationResponse {
+    pub agreement: HalfBlock,
+    pub delegation_id: String,
+    pub delegation_record: trustchain_core::DelegationRecord,
+}
+
+/// Request body for accepting a succession proposal.
+#[derive(Deserialize)]
+pub struct AcceptSuccessionRequest {
+    pub proposal_block: HalfBlock,
+}
+
+/// Response for accepting a succession.
+#[derive(Serialize)]
+pub struct AcceptSuccessionResponse {
+    pub agreement: HalfBlock,
+    pub succession_id: String,
 }
 
 /// Response for identity resolution.
@@ -239,10 +279,13 @@ pub fn build_router<S: BlockStore + Send + 'static, D: DelegationStore + Send + 
         .route("/trust/{pubkey}", get(handle_trust_score::<S, D>))
         .route("/discover", get(handle_discover::<S, D>))
         .route("/delegate", post(handle_delegate::<S, D>))
+        .route("/accept_delegation", post(handle_accept_delegation::<S, D>))
         .route("/revoke", post(handle_revoke::<S, D>))
         .route("/delegations/{pubkey}", get(handle_get_delegations::<S, D>))
         .route("/delegation/{id}", get(handle_get_delegation::<S, D>))
         .route("/identity/{pubkey}", get(handle_identity::<S, D>))
+        .route("/accept_succession", post(handle_accept_succession::<S, D>))
+        .layer(RequestBodyLimitLayer::new(1024 * 1024)) // 1 MiB max request body
         .with_state(state)
 }
 
@@ -370,13 +413,13 @@ async fn handle_propose<S: BlockStore + 'static, D: DelegationStore + Send + 'st
 }
 
 /// Derive the QUIC address from a peer's HTTP address.
-/// Peers store HTTP addresses like "127.0.0.1:8202" — QUIC is on port - 2.
+/// Peers store HTTP addresses like "127.0.0.1:8202" — QUIC is on port - QUIC_PORT_OFFSET.
 pub(crate) fn peer_quic_addr(http_addr: &str) -> Result<std::net::SocketAddr, String> {
     let addr = http_addr
         .strip_prefix("http://")
         .unwrap_or(http_addr);
     addr.parse::<std::net::SocketAddr>()
-        .map(|a| std::net::SocketAddr::new(a.ip(), a.port() - 2))
+        .map(|a| std::net::SocketAddr::new(a.ip(), a.port().saturating_sub(crate::QUIC_PORT_OFFSET)))
         .map_err(|e| format!("invalid peer address: {e}"))
 }
 
@@ -491,10 +534,22 @@ async fn handle_get_peers<S: BlockStore + 'static, D: DelegationStore + Send + '
 }
 
 /// Register a peer at runtime (for bidirectional discovery).
+///
+/// SECURITY: This endpoint is unauthenticated. Any client that can reach this port
+/// can inject arbitrary (pubkey, address) pairs into the peer table. Production
+/// deployments MUST either:
+///   1. Restrict this endpoint to loopback / trusted networks via a firewall, OR
+///   2. Add request signature verification before registration.
 async fn handle_register_peer<S: BlockStore + 'static, D: DelegationStore + Send + 'static>(
     State(state): State<AppState<S, D>>,
     Json(req): Json<RegisterPeerRequest>,
 ) -> Json<serde_json::Value> {
+    // Compensating control: log every registration so operators can detect
+    // unexpected peer injections until full signature verification is added.
+    tracing::warn!(
+        pubkey = &req.pubkey[..8.min(req.pubkey.len())],
+        "peer registered without authentication — production deployments should restrict /peers"
+    );
     state
         .discovery
         .add_peer(req.pubkey.clone(), req.address, 0)
@@ -559,11 +614,22 @@ async fn handle_trust_score<S: BlockStore + 'static, D: DelegationStore + Send +
         build_delegation_ctx(&*ds, &pubkey)
     };
 
+    // Get latest checkpoint for verification acceleration.
+    let checkpoint = state.latest_checkpoint.lock().await.clone();
+
     // Now lock protocol for trust computation.
     let proto = state.protocol.lock().await;
     let store = proto.store();
 
-    let engine = TrustEngine::new(store, None, None, delegation_ctx);
+    let seed_nodes = if state.seed_nodes.is_empty() {
+        None
+    } else {
+        Some(state.seed_nodes.clone())
+    };
+    let mut engine = TrustEngine::new(store, seed_nodes, None, delegation_ctx);
+    if let Some(cp) = checkpoint {
+        engine = engine.with_checkpoint(cp);
+    }
     let trust_score = engine.compute_trust(&pubkey).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -668,11 +734,20 @@ async fn handle_discover<S: BlockStore + 'static, D: DelegationStore + Send + 's
 
     // 3. Compute trust scores (requires protocol lock for store access).
     {
+        let checkpoint = state.latest_checkpoint.lock().await.clone();
         let proto = state.protocol.lock().await;
         let ds = state.delegation_store.lock().await;
+        let seed_nodes_opt = if state.seed_nodes.is_empty() {
+            None
+        } else {
+            Some(state.seed_nodes.clone())
+        };
         for agent in agents_map.values_mut() {
             let ctx = build_delegation_ctx(&*ds, &agent.pubkey);
-            let engine = TrustEngine::new(proto.store(), None, None, ctx);
+            let mut engine = TrustEngine::new(proto.store(), seed_nodes_opt.clone(), None, ctx);
+            if let Some(ref cp) = checkpoint {
+                engine = engine.with_checkpoint(cp.clone());
+            }
             agent.trust_score = engine.compute_trust(&agent.pubkey).ok();
         }
         drop(ds);
@@ -763,10 +838,79 @@ async fn handle_metrics<S: BlockStore + 'static, D: DelegationStore + Send + 'st
 // Delegation handlers
 // ---------------------------------------------------------------------------
 
+/// Accept a delegation proposal — validates, creates agreement, stores DelegationRecord.
+async fn handle_accept_delegation<S: BlockStore + 'static, D: DelegationStore + Send + 'static>(
+    State(state): State<AppState<S, D>>,
+    Json(req): Json<AcceptDelegationRequest>,
+) -> Result<Json<AcceptDelegationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let mut proto = state.protocol.lock().await;
+    let mut ds = state.delegation_store.lock().await;
+
+    // Validate and accept the delegation proposal.
+    let agreement = proto
+        .accept_delegation(&req.proposal_block, &mut *ds)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e.to_string() })))?;
+
+    let delegation_id = req.proposal_block.transaction["delegation_id"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    // Fetch the stored delegation record.
+    let record = ds
+        .get_delegation(&delegation_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })))?
+        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+            error: "Delegation record not found after acceptance".to_string(),
+        })))?;
+
+    Ok(Json(AcceptDelegationResponse {
+        agreement,
+        delegation_id,
+        delegation_record: record,
+    }))
+}
+
+async fn handle_accept_succession<S: BlockStore + 'static, D: DelegationStore + Send + 'static>(
+    State(state): State<AppState<S, D>>,
+    Json(req): Json<AcceptSuccessionRequest>,
+) -> Result<Json<AcceptSuccessionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let mut proto = state.protocol.lock().await;
+    let mut ds = state.delegation_store.lock().await;
+
+    let agreement = proto
+        .accept_succession(&req.proposal_block, Some(&mut *ds))
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e.to_string() })))?;
+
+    let succession_id = req.proposal_block.transaction["succession_id"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    Ok(Json(AcceptSuccessionResponse {
+        agreement,
+        succession_id,
+    }))
+}
+
 async fn handle_delegate<S: BlockStore + 'static, D: DelegationStore + Send + 'static>(
     State(state): State<AppState<S, D>>,
     Json(req): Json<DelegateRequest>,
 ) -> Result<Json<DelegationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Reject TTL values that exceed the 30-day upper bound to prevent
+    // effectively-permanent delegations from being created via the API.
+    if req.ttl_seconds > MAX_DELEGATION_TTL_SECS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "ttl_seconds exceeds maximum of {} seconds (30 days)",
+                    MAX_DELEGATION_TTL_SECS
+                ),
+            }),
+        ));
+    }
+
     let mut proto = state.protocol.lock().await;
     let ds = state.delegation_store.clone();
     let ds_guard = ds.lock().await;
@@ -866,6 +1010,8 @@ mod tests {
             quic: None,
             agent_endpoint: None,
             delegation_store: Arc::new(Mutex::new(MemoryDelegationStore::new())),
+            latest_checkpoint: Arc::new(Mutex::new(None)),
+            seed_nodes: vec![],
         }
     }
 
@@ -966,6 +1112,8 @@ mod tests {
             quic: None,
             agent_endpoint: Some("http://localhost:9002".to_string()),
             delegation_store: Arc::new(Mutex::new(MemoryDelegationStore::new())),
+            latest_checkpoint: Arc::new(Mutex::new(None)),
+            seed_nodes: vec![],
         };
         let app = build_router(state);
 

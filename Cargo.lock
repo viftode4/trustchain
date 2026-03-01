@@ -3077,6 +3077,7 @@ dependencies = [
  "futures-util",
  "http",
  "http-body",
+ "http-body-util",
  "iri-string",
  "pin-project-lite",
  "tower 0.5.3",
@@ -3208,6 +3209,8 @@ dependencies = [
  "async-trait",
  "axum 0.8.8",
  "hex",
+ "hyper",
+ "hyper-util",
  "log",
  "prost",
  "prost-build",
@@ -3226,6 +3229,8 @@ dependencies = [
  "tonic",
  "tonic-build",
  "tower 0.5.3",
+ "tower-http",
+ "tracing",
  "trustchain-core",
 ]
 

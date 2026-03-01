@@ -71,11 +71,11 @@ pub async fn discover_public_addr(stun_server: &str) -> Result<SocketAddr, Strin
     }
 
     // Parse attributes.
-    parse_stun_response(&buf[20..n], &buf[4..8])
+    parse_stun_response(&buf[20..n], &buf[4..8], &tx_id)
 }
 
 /// Parse STUN response attributes, looking for XOR-MAPPED-ADDRESS or MAPPED-ADDRESS.
-pub fn parse_stun_response(attrs: &[u8], magic: &[u8]) -> Result<SocketAddr, String> {
+pub fn parse_stun_response(attrs: &[u8], magic: &[u8], tx_id: &[u8; 12]) -> Result<SocketAddr, String> {
     let mut offset = 0;
     while offset + 4 <= attrs.len() {
         let attr_type = u16::from_be_bytes([attrs[offset], attrs[offset + 1]]);
@@ -89,7 +89,7 @@ pub fn parse_stun_response(attrs: &[u8], magic: &[u8]) -> Result<SocketAddr, Str
         let value = &attrs[value_start..value_start + attr_len];
 
         if attr_type == XOR_MAPPED_ADDRESS {
-            return parse_xor_mapped_address(value, magic);
+            return parse_xor_mapped_address(value, magic, tx_id);
         }
         if attr_type == MAPPED_ADDRESS {
             return parse_mapped_address(value);
@@ -102,7 +102,7 @@ pub fn parse_stun_response(attrs: &[u8], magic: &[u8]) -> Result<SocketAddr, Str
     Err("no MAPPED-ADDRESS found in STUN response".to_string())
 }
 
-fn parse_xor_mapped_address(value: &[u8], magic: &[u8]) -> Result<SocketAddr, String> {
+fn parse_xor_mapped_address(value: &[u8], magic: &[u8], tx_id: &[u8; 12]) -> Result<SocketAddr, String> {
     if value.len() < 8 {
         return Err("XOR-MAPPED-ADDRESS too short".to_string());
     }
@@ -127,12 +127,21 @@ fn parse_xor_mapped_address(value: &[u8], magic: &[u8]) -> Result<SocketAddr, St
             ))
         }
         0x02 => {
-            // IPv6
+            // IPv6: XOR with magic cookie (4 bytes) + transaction ID (12 bytes) = 16 bytes
             if value.len() < 20 {
                 return Err("XOR-MAPPED-ADDRESS IPv6 too short".to_string());
             }
-            // For IPv6, XOR with magic cookie + transaction ID (not implemented for simplicity).
-            Err("IPv6 XOR-MAPPED-ADDRESS not yet supported".to_string())
+            let mut xor_key = [0u8; 16];
+            xor_key[..4].copy_from_slice(magic);
+            xor_key[4..16].copy_from_slice(tx_id);
+            let mut ip_bytes = [0u8; 16];
+            for i in 0..16 {
+                ip_bytes[i] = value[4 + i] ^ xor_key[i];
+            }
+            Ok(SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(ip_bytes)),
+                port,
+            ))
         }
         _ => Err(format!("unknown address family: {family}")),
     }
@@ -160,15 +169,12 @@ mod tests {
 
     #[test]
     fn test_stun_parse_xor_mapped_address_ipv4() {
-        // Construct a fake STUN response attribute section:
-        // XOR-MAPPED-ADDRESS with IPv4 203.0.113.42:12345
         let magic = MAGIC_COOKIE.to_be_bytes();
+        let tx_id = [0u8; 12]; // dummy transaction ID (not used for IPv4)
 
-        // Port XOR: 12345 ^ (0x2112A442 >> 16) = 12345 ^ 0x2112 = 12345 ^ 8466 = 4395
         let port: u16 = 12345;
         let xor_port = port ^ (MAGIC_COOKIE >> 16) as u16;
 
-        // IP XOR: [203, 0, 113, 42] ^ [0x21, 0x12, 0xA4, 0x42]
         let ip_bytes: [u8; 4] = [203, 0, 113, 42];
         let xor_ip: [u8; 4] = [
             ip_bytes[0] ^ magic[0],
@@ -178,37 +184,63 @@ mod tests {
         ];
 
         let mut attr = Vec::new();
-        // Type: XOR-MAPPED-ADDRESS (0x0020)
         attr.extend_from_slice(&0x0020u16.to_be_bytes());
-        // Length: 8
         attr.extend_from_slice(&0x0008u16.to_be_bytes());
-        // Value: reserved=0, family=0x01, xor-port, xor-ip
         attr.push(0x00);
         attr.push(0x01);
         attr.extend_from_slice(&xor_port.to_be_bytes());
         attr.extend_from_slice(&xor_ip);
 
-        let result = parse_stun_response(&attr, &magic).unwrap();
+        let result = parse_stun_response(&attr, &magic, &tx_id).unwrap();
         assert_eq!(result.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 42)));
         assert_eq!(result.port(), 12345);
     }
 
     #[test]
-    fn test_stun_parse_mapped_address_ipv4() {
+    fn test_stun_parse_xor_mapped_address_ipv6() {
         let magic = MAGIC_COOKIE.to_be_bytes();
+        let tx_id: [u8; 12] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C];
+
+        // Target IPv6: 2001:db8::1 = [0x20,0x01,0x0d,0xb8, 0,0,0,0, 0,0,0,0, 0,0,0,1]
+        let ip_bytes: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let mut xor_key = [0u8; 16];
+        xor_key[..4].copy_from_slice(&magic);
+        xor_key[4..16].copy_from_slice(&tx_id);
+        let mut xor_ip = [0u8; 16];
+        for i in 0..16 {
+            xor_ip[i] = ip_bytes[i] ^ xor_key[i];
+        }
+
+        let port: u16 = 9000;
+        let xor_port = port ^ (MAGIC_COOKIE >> 16) as u16;
 
         let mut attr = Vec::new();
-        // Type: MAPPED-ADDRESS (0x0001)
+        attr.extend_from_slice(&0x0020u16.to_be_bytes()); // XOR-MAPPED-ADDRESS
+        attr.extend_from_slice(&0x0014u16.to_be_bytes()); // Length: 20
+        attr.push(0x00); // reserved
+        attr.push(0x02); // family: IPv6
+        attr.extend_from_slice(&xor_port.to_be_bytes());
+        attr.extend_from_slice(&xor_ip);
+
+        let result = parse_stun_response(&attr, &magic, &tx_id).unwrap();
+        assert_eq!(result.ip(), std::net::IpAddr::V6("2001:db8::1".parse().unwrap()));
+        assert_eq!(result.port(), 9000);
+    }
+
+    #[test]
+    fn test_stun_parse_mapped_address_ipv4() {
+        let magic = MAGIC_COOKIE.to_be_bytes();
+        let tx_id = [0u8; 12];
+
+        let mut attr = Vec::new();
         attr.extend_from_slice(&0x0001u16.to_be_bytes());
-        // Length: 8
         attr.extend_from_slice(&0x0008u16.to_be_bytes());
-        // Value: reserved=0, family=0x01, port=8080, ip=192.168.1.1
         attr.push(0x00);
         attr.push(0x01);
         attr.extend_from_slice(&8080u16.to_be_bytes());
         attr.extend_from_slice(&[192, 168, 1, 1]);
 
-        let result = parse_stun_response(&attr, &magic).unwrap();
+        let result = parse_stun_response(&attr, &magic, &tx_id).unwrap();
         assert_eq!(result.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)));
         assert_eq!(result.port(), 8080);
     }

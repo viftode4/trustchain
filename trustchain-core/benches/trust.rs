@@ -5,10 +5,13 @@ use std::collections::HashMap;
 use std::time::Duration;
 use trustchain_core::{Identity, MemoryBlockStore, TrustEngine, TrustWeights};
 
+// ---------------------------------------------------------------------------
+// TrustEngine.compute_trust() — no seeds (integrity + statistical only)
+// ---------------------------------------------------------------------------
 fn bench_trust_engine_no_seeds(c: &mut Criterion) {
     let mut group = c.benchmark_group("trust_engine_no_seeds");
 
-    for &n in &[100, 1_000, 10_000] {
+    for &n in &[500, 5_000, 50_000] {
         let mut store = MemoryBlockStore::new();
         helpers::build_chain(&mut store, n);
         let alice_pk = Identity::from_bytes(&[1u8; 32]).pubkey_hex();
@@ -23,11 +26,14 @@ fn bench_trust_engine_no_seeds(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// TrustEngine.compute_trust() — with seeds (full pipeline incl. NetFlow)
+// ---------------------------------------------------------------------------
 fn bench_trust_engine_with_seeds(c: &mut Criterion) {
     let mut group = c.benchmark_group("trust_engine_with_seeds");
-    group.measurement_time(Duration::from_secs(10));
+    group.measurement_time(Duration::from_secs(15));
 
-    for &n_agents in &[10, 100, 500] {
+    for &n_agents in &[50, 500, 2_000] {
         let (store, seed_pk, spoke_pks) = helpers::build_star_network(n_agents, 3);
         let target = &spoke_pks[spoke_pks.len() / 2];
 
@@ -46,9 +52,12 @@ fn bench_trust_engine_with_seeds(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// TrustEngine.compute_trust() — very large chain (100K blocks)
+// ---------------------------------------------------------------------------
 fn bench_trust_engine_large(c: &mut Criterion) {
     let mut group = c.benchmark_group("trust_engine_large");
-    group.measurement_time(Duration::from_secs(15));
+    group.measurement_time(Duration::from_secs(20));
     group.sample_size(10);
 
     let mut store = MemoryBlockStore::new();
@@ -64,10 +73,13 @@ fn bench_trust_engine_large(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Statistical score only
+// ---------------------------------------------------------------------------
 fn bench_statistical_score(c: &mut Criterion) {
     let mut group = c.benchmark_group("statistical_score");
 
-    for &n in &[100, 1_000, 10_000] {
+    for &n in &[500, 5_000, 50_000] {
         let mut store = MemoryBlockStore::new();
         helpers::build_chain(&mut store, n);
         let alice_pk = Identity::from_bytes(&[1u8; 32]).pubkey_hex();
@@ -82,10 +94,14 @@ fn bench_statistical_score(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Chain integrity: no checkpoint vs checkpoint covering 90%
+// ---------------------------------------------------------------------------
 fn bench_chain_integrity_with_checkpoint(c: &mut Criterion) {
     let mut group = c.benchmark_group("chain_integrity_checkpoint");
+    group.measurement_time(Duration::from_secs(15));
 
-    for &n in &[100, 1_000, 10_000] {
+    for &n in &[500, 5_000, 50_000] {
         let mut store = MemoryBlockStore::new();
         helpers::build_chain(&mut store, n);
         let alice_pk = Identity::from_bytes(&[1u8; 32]).pubkey_hex();
@@ -98,10 +114,14 @@ fn bench_chain_integrity_with_checkpoint(c: &mut Criterion) {
             facilitator_pubkey: "facilitator".into(),
             chain_heads,
             checkpoint_block: trustchain_core::halfblock::create_half_block(
-                &Identity::from_bytes(&[99u8; 32]), 1, &alice_pk, 0,
+                &Identity::from_bytes(&[99u8; 32]),
+                1,
+                &alice_pk,
+                0,
                 trustchain_core::types::GENESIS_HASH,
                 trustchain_core::types::BlockType::Proposal,
-                serde_json::json!({}), Some(99999),
+                serde_json::json!({}),
+                Some(99999),
             ),
             signatures: HashMap::new(),
             timestamp: 99999,
@@ -121,7 +141,7 @@ fn bench_chain_integrity_with_checkpoint(c: &mut Criterion) {
 
         let cp = checkpoint.clone();
         group.bench_with_input(
-            BenchmarkId::new("with_checkpoint_90pct", n),
+            BenchmarkId::new("checkpoint_90pct", n),
             &n,
             |b, _| {
                 b.iter(|| {
@@ -131,14 +151,41 @@ fn bench_chain_integrity_with_checkpoint(c: &mut Criterion) {
                 });
             },
         );
+
+        // Also benchmark 99% coverage to see near-total skip.
+        let mut chain_heads_99 = HashMap::new();
+        chain_heads_99.insert(alice_pk.clone(), (n as u64) * 99 / 100);
+        let checkpoint_99 = trustchain_core::Checkpoint {
+            facilitator_pubkey: "facilitator".into(),
+            chain_heads: chain_heads_99,
+            checkpoint_block: checkpoint.checkpoint_block.clone(),
+            signatures: HashMap::new(),
+            timestamp: 99999,
+            finalized: true,
+        };
+
+        group.bench_with_input(
+            BenchmarkId::new("checkpoint_99pct", n),
+            &n,
+            |b, _| {
+                b.iter(|| {
+                    let engine = TrustEngine::new(&store, None, None, None)
+                        .with_checkpoint(checkpoint_99.clone());
+                    engine.compute_chain_integrity(&alice_pk).unwrap()
+                });
+            },
+        );
     }
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Statistical score: no decay vs various half-lives
+// ---------------------------------------------------------------------------
 fn bench_statistical_with_decay(c: &mut Criterion) {
     let mut group = c.benchmark_group("statistical_with_decay");
 
-    for &n in &[100, 1_000, 10_000] {
+    for &n in &[500, 5_000, 50_000] {
         let mut store = MemoryBlockStore::new();
         helpers::build_chain(&mut store, n);
         let alice_pk = Identity::from_bytes(&[1u8; 32]).pubkey_hex();
@@ -154,21 +201,24 @@ fn bench_statistical_with_decay(c: &mut Criterion) {
             },
         );
 
-        let weights = TrustWeights {
-            decay_half_life_ms: Some(30_000),
-            ..Default::default()
-        };
+        for &hl in &[5_000u64, 30_000, 300_000] {
+            let weights = TrustWeights {
+                decay_half_life_ms: Some(hl),
+                ..Default::default()
+            };
 
-        group.bench_with_input(
-            BenchmarkId::new("with_decay_30s", n),
-            &n,
-            |b, _| {
-                b.iter(|| {
-                    let engine = TrustEngine::new(&store, None, Some(weights.clone()), None);
-                    engine.compute_statistical_score(&alice_pk).unwrap()
-                });
-            },
-        );
+            group.bench_with_input(
+                BenchmarkId::new(format!("decay_{hl}ms"), n),
+                &n,
+                |b, _| {
+                    b.iter(|| {
+                        let engine =
+                            TrustEngine::new(&store, None, Some(weights.clone()), None);
+                        engine.compute_statistical_score(&alice_pk).unwrap()
+                    });
+                },
+            );
+        }
     }
     group.finish();
 }

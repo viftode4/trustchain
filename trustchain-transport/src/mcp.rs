@@ -154,30 +154,60 @@ impl<S: BlockStore + 'static> TrustChainMcpServer<S> {
         &self,
         params: Parameters<DiscoverPeersParams>,
     ) -> Result<CallToolResult, McpError> {
-        let peers = self.discovery.get_peers().await;
-        let proto = self.protocol.lock().await;
-        let store = proto.store();
-        let engine = TrustEngine::new(store, None, None, None);
-
         let min_trust = params.0.min_trust.unwrap_or(0.0);
         let max_results = params.0.max_results.unwrap_or(20);
 
-        let mut scored: Vec<serde_json::Value> = peers
-            .iter()
-            .filter_map(|p| {
-                let trust = engine.compute_trust(&p.pubkey).unwrap_or(0.0);
-                if trust >= min_trust {
-                    Some(serde_json::json!({
-                        "pubkey": p.pubkey,
-                        "address": p.address,
-                        "trust_score": trust,
-                        "latest_seq": p.latest_seq,
-                    }))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // If a capability filter is provided, use find_capable_agents to get matching peers.
+        // Otherwise, return all known peers (backward compatible).
+        let capability_filter = params.0.capability
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .map(|s| s.to_string());
+
+        let mut scored: Vec<serde_json::Value> = if let Some(ref capability) = capability_filter {
+            let proto = self.protocol.lock().await;
+            let store = proto.store();
+            let engine = TrustEngine::new(store, None, None, None);
+            let capable = crate::discover::find_capable_agents(store, capability, max_results);
+            capable
+                .iter()
+                .filter_map(|agent| {
+                    let trust = engine.compute_trust(&agent.pubkey).unwrap_or(0.0);
+                    if trust >= min_trust {
+                        Some(serde_json::json!({
+                            "pubkey": agent.pubkey,
+                            "address": agent.address,
+                            "trust_score": trust,
+                            "capability": agent.capability,
+                            "interaction_count": agent.interaction_count,
+                        }))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            let peers = self.discovery.get_peers().await;
+            let proto = self.protocol.lock().await;
+            let store = proto.store();
+            let engine = TrustEngine::new(store, None, None, None);
+            peers
+                .iter()
+                .filter_map(|p| {
+                    let trust = engine.compute_trust(&p.pubkey).unwrap_or(0.0);
+                    if trust >= min_trust {
+                        Some(serde_json::json!({
+                            "pubkey": p.pubkey,
+                            "address": p.address,
+                            "trust_score": trust,
+                            "latest_seq": p.latest_seq,
+                        }))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
 
         scored.sort_by(|a, b| {
             let ta = a["trust_score"].as_f64().unwrap_or(0.0);

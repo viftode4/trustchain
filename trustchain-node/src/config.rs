@@ -40,6 +40,15 @@ pub struct NodeConfig {
     #[serde(default = "default_min_signers")]
     pub min_signers: usize,
 
+    /// Offset from HTTP port to derive QUIC port for peer communication.
+    /// By default, QUIC port = HTTP port - 2 (e.g., HTTP 8202 → QUIC 8200).
+    ///
+    /// NOTE: This field is currently UNUSED by the runtime. All QUIC address
+    /// derivation uses the compile-time constant `QUIC_PORT_OFFSET` instead.
+    /// This field is kept in the config schema for forward compatibility.
+    #[serde(default = "default_quic_port_offset")]
+    pub quic_port_offset: u16,
+
     /// Maximum new QUIC connections per IP per second (rate limiting).
     #[serde(default = "default_max_connections_per_ip_per_sec")]
     pub max_connections_per_ip_per_sec: u32,
@@ -84,6 +93,7 @@ impl Default for NodeConfig {
             db_path: default_db_path(),
             bootstrap_nodes: vec![],
             min_signers: default_min_signers(),
+            quic_port_offset: default_quic_port_offset(),
             max_connections_per_ip_per_sec: default_max_connections_per_ip_per_sec(),
             checkpoint_interval_secs: default_checkpoint_interval_secs(),
             stun_server: default_stun_server(),
@@ -143,7 +153,13 @@ fn default_db_path() -> PathBuf {
 }
 
 fn default_min_signers() -> usize {
+    // In production, set to >= 3 for meaningful consensus.
+    // Default of 1 allows single-node development/testing.
     1
+}
+
+fn default_quic_port_offset() -> u16 {
+    2
 }
 
 fn default_max_connections_per_ip_per_sec() -> u32 {

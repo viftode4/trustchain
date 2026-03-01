@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::{Result, TrustChainError};
 use crate::halfblock::HalfBlock;
@@ -247,8 +247,22 @@ impl SqliteBlockStore {
         Ok(store)
     }
 
+    /// Acquire the connection lock, recovering from mutex poisoning if needed.
+    ///
+    /// Mutex poisoning occurs when a thread panics while holding the lock.
+    /// Rather than propagating the poison to all future callers (which would
+    /// make the store permanently unusable), we recover the inner connection
+    /// and log a warning.  The connection itself is still valid — rusqlite
+    /// connections are not corrupted by a panic in Rust code.
+    fn lock_conn(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        self.conn.lock().unwrap_or_else(|poisoned| {
+            log::warn!("SqliteBlockStore mutex was poisoned — recovering");
+            poisoned.into_inner()
+        })
+    }
+
     fn init_schema(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         // Enable WAL mode for concurrent readers (needed for dual-store in consensus).
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch(
@@ -287,6 +301,16 @@ impl SqliteBlockStore {
                 latest_seq INTEGER NOT NULL DEFAULT 0,
                 last_seen_unix_ms INTEGER NOT NULL,
                 is_bootstrap INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                facilitator_pubkey TEXT NOT NULL,
+                chain_heads_json TEXT NOT NULL,
+                checkpoint_block_json TEXT NOT NULL,
+                signatures_json TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                finalized INTEGER NOT NULL DEFAULT 1
             );",
         )?;
         Ok(())
@@ -317,12 +341,118 @@ impl SqliteBlockStore {
             .unwrap()
             .as_secs_f64()
     }
+
+    /// Save a finalized checkpoint to persistent storage.
+    pub fn save_checkpoint(&self, checkpoint: &crate::consensus::Checkpoint) -> Result<()> {
+        let chain_heads_json = serde_json::to_string(&checkpoint.chain_heads)
+            .map_err(|e| TrustChainError::Serialization(e.to_string()))?;
+        let block_json = serde_json::to_string(&checkpoint.checkpoint_block)
+            .map_err(|e| TrustChainError::Serialization(e.to_string()))?;
+        let sigs_json = serde_json::to_string(&checkpoint.signatures)
+            .map_err(|e| TrustChainError::Serialization(e.to_string()))?;
+
+        let conn = self.lock_conn();
+        conn.execute(
+            "INSERT INTO checkpoints (facilitator_pubkey, chain_heads_json,
+             checkpoint_block_json, signatures_json, timestamp, finalized)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                checkpoint.facilitator_pubkey,
+                chain_heads_json,
+                block_json,
+                sigs_json,
+                checkpoint.timestamp,
+                checkpoint.finalized as i32,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load all finalized checkpoints from persistent storage.
+    pub fn load_checkpoints(&self) -> Result<Vec<crate::consensus::Checkpoint>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT facilitator_pubkey, chain_heads_json, checkpoint_block_json,
+             signatures_json, timestamp, finalized
+             FROM checkpoints WHERE finalized = 1 ORDER BY id ASC",
+        )?;
+        let checkpoints = stmt
+            .query_map([], |row| {
+                let facilitator_pubkey: String = row.get(0)?;
+                let chain_heads_json: String = row.get(1)?;
+                let block_json: String = row.get(2)?;
+                let sigs_json: String = row.get(3)?;
+                let timestamp: u64 = row.get(4)?;
+                let finalized: i32 = row.get(5)?;
+                Ok((facilitator_pubkey, chain_heads_json, block_json, sigs_json, timestamp, finalized))
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|(facilitator, heads_json, block_json, sigs_json, ts, fin)| {
+                let chain_heads: HashMap<String, u64> =
+                    serde_json::from_str(&heads_json).ok()?;
+                let checkpoint_block: crate::halfblock::HalfBlock =
+                    serde_json::from_str(&block_json).ok()?;
+                let signatures: HashMap<String, String> =
+                    serde_json::from_str(&sigs_json).ok()?;
+                Some(crate::consensus::Checkpoint {
+                    facilitator_pubkey: facilitator,
+                    chain_heads,
+                    checkpoint_block,
+                    signatures,
+                    timestamp: ts,
+                    finalized: fin != 0,
+                })
+            })
+            .collect();
+        Ok(checkpoints)
+    }
+
+    /// Get the latest finalized checkpoint, if any.
+    pub fn latest_finalized_checkpoint(&self) -> Result<Option<crate::consensus::Checkpoint>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT facilitator_pubkey, chain_heads_json, checkpoint_block_json,
+             signatures_json, timestamp, finalized
+             FROM checkpoints WHERE finalized = 1 ORDER BY id DESC LIMIT 1",
+        )?;
+        let result = stmt
+            .query_row([], |row| {
+                let facilitator_pubkey: String = row.get(0)?;
+                let chain_heads_json: String = row.get(1)?;
+                let block_json: String = row.get(2)?;
+                let sigs_json: String = row.get(3)?;
+                let timestamp: u64 = row.get(4)?;
+                let finalized: i32 = row.get(5)?;
+                Ok((facilitator_pubkey, chain_heads_json, block_json, sigs_json, timestamp, finalized))
+            })
+            .optional()?;
+
+        match result {
+            None => Ok(None),
+            Some((facilitator, heads_json, block_json, sigs_json, ts, fin)) => {
+                let chain_heads: HashMap<String, u64> = serde_json::from_str(&heads_json)
+                    .map_err(|e| TrustChainError::Serialization(e.to_string()))?;
+                let checkpoint_block: crate::halfblock::HalfBlock = serde_json::from_str(&block_json)
+                    .map_err(|e| TrustChainError::Serialization(e.to_string()))?;
+                let signatures: HashMap<String, String> = serde_json::from_str(&sigs_json)
+                    .map_err(|e| TrustChainError::Serialization(e.to_string()))?;
+                Ok(Some(crate::consensus::Checkpoint {
+                    facilitator_pubkey: facilitator,
+                    chain_heads,
+                    checkpoint_block,
+                    signatures,
+                    timestamp: ts,
+                    finalized: fin != 0,
+                }))
+            }
+        }
+    }
 }
 
 impl BlockStore for SqliteBlockStore {
     fn add_block(&mut self, block: &HalfBlock) -> Result<()> {
         let tx_data = serde_json::to_string(&block.transaction)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "INSERT INTO blocks (public_key, sequence_number, link_public_key,
              link_sequence_number, previous_hash, signature, block_type, tx_data,
@@ -357,7 +487,7 @@ impl BlockStore for SqliteBlockStore {
     }
 
     fn get_block(&self, pubkey: &str, seq: u64) -> Result<Option<HalfBlock>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT public_key, sequence_number, link_public_key, link_sequence_number,
              previous_hash, signature, block_type, tx_data, block_hash, timestamp
@@ -372,7 +502,7 @@ impl BlockStore for SqliteBlockStore {
     }
 
     fn get_chain(&self, pubkey: &str) -> Result<Vec<HalfBlock>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT public_key, sequence_number, link_public_key, link_sequence_number,
              previous_hash, signature, block_type, tx_data, block_hash, timestamp
@@ -391,7 +521,7 @@ impl BlockStore for SqliteBlockStore {
             return self.get_block(&block.link_public_key, block.link_sequence_number);
         }
         // Proposal: find the agreement that links back.
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT public_key, sequence_number, link_public_key, link_sequence_number,
              previous_hash, signature, block_type, tx_data, block_hash, timestamp
@@ -411,7 +541,7 @@ impl BlockStore for SqliteBlockStore {
     }
 
     fn get_latest_seq(&self, pubkey: &str) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let seq: u64 = conn
             .query_row(
                 "SELECT COALESCE(MAX(sequence_number), 0) FROM blocks WHERE public_key = ?1",
@@ -423,7 +553,7 @@ impl BlockStore for SqliteBlockStore {
     }
 
     fn get_head_hash(&self, pubkey: &str) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let result: rusqlite::Result<String> = conn.query_row(
             "SELECT block_hash FROM blocks WHERE public_key = ?1
              ORDER BY sequence_number DESC LIMIT 1",
@@ -438,7 +568,7 @@ impl BlockStore for SqliteBlockStore {
     }
 
     fn crawl(&self, pubkey: &str, start_seq: u64) -> Result<Vec<HalfBlock>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT public_key, sequence_number, link_public_key, link_sequence_number,
              previous_hash, signature, block_type, tx_data, block_hash, timestamp
@@ -454,7 +584,7 @@ impl BlockStore for SqliteBlockStore {
     }
 
     fn get_all_pubkeys(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn
             .prepare("SELECT DISTINCT public_key FROM blocks ORDER BY public_key")?;
         let rows = stmt.query_map([], |row| row.get(0))?;
@@ -466,7 +596,7 @@ impl BlockStore for SqliteBlockStore {
     }
 
     fn get_block_count(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let count: u64 = conn
             .query_row("SELECT COUNT(*) FROM blocks", [], |row| row.get(0))
             .map_err(|e| TrustChainError::Storage(e.to_string()))?;
@@ -476,7 +606,7 @@ impl BlockStore for SqliteBlockStore {
     fn add_double_spend(&mut self, block_a: &HalfBlock, block_b: &HalfBlock) -> Result<()> {
         let data_a = serde_json::to_string(block_a)?;
         let data_b = serde_json::to_string(block_b)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "INSERT INTO double_spends (public_key, sequence_number, block_hash_a, block_hash_b,
              block_data_a, block_data_b, detected_at)
@@ -495,7 +625,7 @@ impl BlockStore for SqliteBlockStore {
     }
 
     fn get_double_spends(&self, pubkey: &str) -> Result<Vec<DoubleSpend>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT block_data_a, block_data_b FROM double_spends WHERE public_key = ?1",
         )?;
@@ -515,7 +645,7 @@ impl BlockStore for SqliteBlockStore {
     }
 
     fn save_peer(&mut self, peer: &PersistentPeer) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "INSERT OR REPLACE INTO peers (pubkey, address, latest_seq, last_seen_unix_ms, is_bootstrap)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -531,7 +661,7 @@ impl BlockStore for SqliteBlockStore {
     }
 
     fn load_peers(&self) -> Result<Vec<PersistentPeer>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT pubkey, address, latest_seq, last_seen_unix_ms, is_bootstrap FROM peers",
         )?;
@@ -552,7 +682,7 @@ impl BlockStore for SqliteBlockStore {
     }
 
     fn remove_stale_peer(&mut self, pubkey: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute("DELETE FROM peers WHERE pubkey = ?1", params![pubkey])?;
         Ok(())
     }
@@ -785,6 +915,52 @@ mod tests {
         store.remove_stale_peer("aaa").unwrap();
         let peers = store.load_peers().unwrap();
         assert_eq!(peers.len(), 0);
+    }
+
+    #[test]
+    fn test_checkpoint_persistence() {
+        let store = SqliteBlockStore::in_memory().unwrap();
+
+        // Initially no checkpoints.
+        let loaded = store.load_checkpoints().unwrap();
+        assert!(loaded.is_empty());
+        assert!(store.latest_finalized_checkpoint().unwrap().is_none());
+
+        // Create a fake checkpoint.
+        let identity = crate::identity::Identity::from_bytes(&[1u8; 32]);
+        let block = crate::halfblock::create_half_block(
+            &identity, 1, &identity.pubkey_hex(), 0,
+            GENESIS_HASH, crate::types::BlockType::Checkpoint,
+            serde_json::json!({"interaction_type": "checkpoint"}),
+            Some(1000),
+        );
+        let mut chain_heads = HashMap::new();
+        chain_heads.insert("aaa".to_string(), 5u64);
+        chain_heads.insert("bbb".to_string(), 10u64);
+        let mut signatures = HashMap::new();
+        signatures.insert(identity.pubkey_hex(), "deadbeef".to_string());
+
+        let cp = crate::consensus::Checkpoint {
+            facilitator_pubkey: identity.pubkey_hex(),
+            chain_heads: chain_heads.clone(),
+            checkpoint_block: block,
+            signatures,
+            timestamp: 1000,
+            finalized: true,
+        };
+
+        store.save_checkpoint(&cp).unwrap();
+
+        // Load and verify.
+        let loaded = store.load_checkpoints().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].facilitator_pubkey, identity.pubkey_hex());
+        assert_eq!(loaded[0].chain_heads, chain_heads);
+        assert!(loaded[0].finalized);
+
+        // Latest checkpoint.
+        let latest = store.latest_finalized_checkpoint().unwrap().unwrap();
+        assert_eq!(latest.timestamp, 1000);
     }
 
     #[test]

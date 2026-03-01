@@ -88,9 +88,35 @@ impl Identity {
     }
 
     /// Save the 32-byte private key to a file.
+    ///
+    /// On Unix systems the file is created with mode 0o600 (owner read/write only)
+    /// so that the private key is not world-readable. On other platforms (e.g.
+    /// Windows) the standard `fs::write` is used; callers on those platforms should
+    /// apply appropriate ACL restrictions after the call.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        fs::write(path, self.signing_key.to_bytes())
-            .map_err(|e| TrustChainError::Identity(format!("failed to save identity: {e}")))
+        let bytes = self.signing_key.to_bytes();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600) // owner read/write only — no group or other access
+                .open(&path)
+                .map_err(|e| TrustChainError::Identity(format!("failed to save identity: {e}")))?;
+            std::io::Write::write_all(&mut file, &bytes)
+                .map_err(|e| TrustChainError::Identity(format!("failed to write identity: {e}")))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            fs::write(&path, &bytes)
+                .map_err(|e| TrustChainError::Identity(format!("failed to save identity: {e}")))?;
+        }
+
+        Ok(())
     }
 
     /// Load an identity from a 32-byte private key file.

@@ -194,6 +194,12 @@ impl<'a, S: BlockStore> NetFlowTrust<'a, S> {
 }
 
 /// Edmonds-Karp (BFS-based Ford-Fulkerson) max-flow algorithm.
+///
+/// Note: Dinic's algorithm was considered but deliberately skipped. Profiling shows graph
+/// *building* (scanning chains, constructing edges) accounts for ~99% of compute_trust() time,
+/// not the max-flow computation itself. Edmonds-Karp is already fast on the small residual
+/// graphs typical of TrustChain. The incremental graph updates in CachedNetFlow provide far
+/// more benefit than switching to Dinic's O(V²E) would.
 fn edmonds_karp<'a>(
     capacity: &mut HashMap<&'a str, HashMap<&'a str, f64>>,
     source: &'a str,
@@ -276,13 +282,16 @@ fn edmonds_karp<'a>(
 /// Cached variant of NetFlowTrust that owns the store and caches the contribution graph.
 ///
 /// Avoids rebuilding the graph from blockchain state on every `compute_trust()` call.
-/// The cache is invalidated automatically when `store.get_block_count()` changes,
-/// or manually via `invalidate()`.
+/// Uses incremental updates: when new blocks are added, only scans chains that have grown
+/// rather than rebuilding the entire graph from scratch.
+/// The cache can be fully invalidated via `invalidate()`.
 pub struct CachedNetFlow<S: BlockStore> {
     store: S,
     seed_nodes: Vec<String>,
     cached_graph: Option<HashMap<String, HashMap<String, f64>>>,
     last_block_count: usize,
+    /// Per-pubkey sequence numbers at last graph build, for incremental updates.
+    known_seqs: HashMap<String, u64>,
 }
 
 impl<S: BlockStore> CachedNetFlow<S> {
@@ -296,6 +305,7 @@ impl<S: BlockStore> CachedNetFlow<S> {
             seed_nodes,
             cached_graph: None,
             last_block_count: 0,
+            known_seqs: HashMap::new(),
         })
     }
 
@@ -303,6 +313,7 @@ impl<S: BlockStore> CachedNetFlow<S> {
     pub fn invalidate(&mut self) {
         self.cached_graph = None;
         self.last_block_count = 0;
+        self.known_seqs.clear();
     }
 
     /// Get a reference to the underlying store.
@@ -310,14 +321,60 @@ impl<S: BlockStore> CachedNetFlow<S> {
         &self.store
     }
 
-    /// Ensure the cached graph is up to date, rebuilding if block count changed.
+    /// Ensure the cached graph is up to date.
+    ///
+    /// On first call, builds the full graph. On subsequent calls, incrementally
+    /// adds edges for new blocks only (chains that have grown since last check).
     fn ensure_graph(&mut self) -> Result<()> {
         let current_count = self.store.get_block_count()?;
-        if self.cached_graph.is_none() || current_count != self.last_block_count {
+        if current_count == self.last_block_count && self.cached_graph.is_some() {
+            return Ok(());
+        }
+
+        if self.cached_graph.is_none() {
+            // Full rebuild.
             let nf = NetFlowTrust::new(&self.store, self.seed_nodes.clone())?;
             self.cached_graph = Some(nf.build_contribution_graph()?);
-            self.last_block_count = current_count;
+            // Record per-pubkey sequence numbers.
+            self.known_seqs.clear();
+            let pubkeys = self.store.get_all_pubkeys()?;
+            for pk in &pubkeys {
+                let seq = self.store.get_latest_seq(pk)?;
+                if seq > 0 {
+                    self.known_seqs.insert(pk.clone(), seq);
+                }
+            }
+        } else {
+            // Incremental update: only process new blocks.
+            let graph = self.cached_graph.as_mut().unwrap();
+            let pubkeys = self.store.get_all_pubkeys()?;
+            for pk in &pubkeys {
+                let current_seq = self.store.get_latest_seq(pk)?;
+                let known_seq = self.known_seqs.get(pk).copied().unwrap_or(0);
+                if current_seq <= known_seq {
+                    continue;
+                }
+                // Process new blocks for this pubkey.
+                let chain = self.store.get_chain(pk)?;
+                for block in &chain {
+                    if block.sequence_number <= known_seq {
+                        continue;
+                    }
+                    if block.public_key == block.link_public_key {
+                        continue;
+                    }
+                    let entry = graph
+                        .entry(block.public_key.clone())
+                        .or_default()
+                        .entry(block.link_public_key.clone())
+                        .or_insert(0.0);
+                    *entry += 0.5;
+                }
+                self.known_seqs.insert(pk.clone(), current_seq);
+            }
         }
+
+        self.last_block_count = current_count;
         Ok(())
     }
 

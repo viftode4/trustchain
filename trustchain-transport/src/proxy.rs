@@ -14,17 +14,20 @@
 //! Non-TC destinations are forwarded transparently with zero overhead.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
     Router,
     extract::State,
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use hyper::upgrade::OnUpgrade;
 use reqwest::Client;
+use tokio::io::copy_bidirectional;
+use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use trustchain_core::{BlockStore, DelegationStore, TrustChainProtocol};
@@ -109,6 +112,11 @@ async fn proxy_handler<S: BlockStore + 'static, D: DelegationStore + 'static>(
     State(state): State<ProxyState<S, D>>,
     req: axum::extract::Request,
 ) -> Response {
+    // Handle HTTPS CONNECT tunneling.
+    if req.method() == Method::CONNECT {
+        return handle_connect(state, req).await;
+    }
+
     // 1. Resolve target URL from the request.
     let target_url = match resolve_target(&req) {
         Some(u) => u,
@@ -190,6 +198,185 @@ async fn proxy_handler<S: BlockStore + 'static, D: DelegationStore + 'static>(
 }
 
 // ---------------------------------------------------------------------------
+// HTTPS CONNECT tunnel
+// ---------------------------------------------------------------------------
+
+/// Return `true` when the resolved IP address is safe to CONNECT to.
+///
+/// Blocks destinations that could be used for Server-Side Request Forgery (SSRF):
+/// - Loopback      (127.0.0.0/8, ::1)
+/// - Private       (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+/// - Link-local    (169.254.0.0/16, fe80::/10)
+/// - Unspecified   (0.0.0.0, ::)
+///
+/// If the authority is a hostname rather than an IP literal, this function
+/// returns `true` (allow) — the DNS lookup happens at connect time and we
+/// cannot pre-check it without an extra resolution round-trip.
+fn is_safe_connect_target(authority: &str) -> bool {
+    // Strip an optional "[...]" IPv6 bracket wrapper and port suffix.
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        // IPv6 literal: [::1]:443
+        bracketed.split(']').next().unwrap_or(bracketed)
+    } else {
+        // IPv4 literal or hostname: 1.2.3.4:443 or example.com:443
+        authority.split(':').next().unwrap_or(authority)
+    };
+
+    let ip: IpAddr = match host.parse() {
+        Ok(ip) => ip,
+        // Not an IP literal (hostname) — allow and let DNS + connect decide.
+        Err(_) => return true,
+    };
+
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.is_loopback() {
+                return false; // 127.0.0.0/8
+            }
+            let octets = v4.octets();
+            // 10.0.0.0/8
+            if octets[0] == 10 {
+                return false;
+            }
+            // 172.16.0.0/12 (172.16.x.x – 172.31.x.x)
+            if octets[0] == 172 && (octets[1] >= 16 && octets[1] <= 31) {
+                return false;
+            }
+            // 192.168.0.0/16
+            if octets[0] == 192 && octets[1] == 168 {
+                return false;
+            }
+            // 169.254.0.0/16 (link-local)
+            if octets[0] == 169 && octets[1] == 254 {
+                return false;
+            }
+            // 0.0.0.0
+            if v4.is_unspecified() {
+                return false;
+            }
+            true
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return false; // ::1
+            }
+            if v6.is_unspecified() {
+                return false; // ::
+            }
+            // fe80::/10 (link-local)
+            let segments = v6.segments();
+            if (segments[0] & 0xffc0) == 0xfe80 {
+                return false;
+            }
+            true
+        }
+    }
+}
+
+/// Handle HTTP CONNECT method for HTTPS tunneling.
+///
+/// Flow:
+/// 1. Extract the target authority (host:port) from the request URI.
+/// 2. Validate the target is not an internal/loopback/private address (SSRF prevention).
+/// 3. Run the TrustChain handshake if the target is a known TC peer.
+/// 4. Establish a TCP connection to the target.
+/// 5. Respond with 200 Connection Established.
+/// 6. Upgrade the connection and relay bytes bidirectionally.
+async fn handle_connect<S: BlockStore + 'static, D: DelegationStore + 'static>(
+    state: ProxyState<S, D>,
+    req: axum::extract::Request,
+) -> Response {
+    let authority = match req.uri().authority().map(|a| a.to_string()) {
+        Some(a) => a,
+        None => {
+            return (StatusCode::BAD_REQUEST, "CONNECT: missing authority").into_response();
+        }
+    };
+
+    // SSRF prevention: block CONNECT requests targeting loopback, private, or
+    // link-local addresses. Hostnames are allowed (DNS resolves at connect time).
+    if !is_safe_connect_target(&authority) {
+        log::warn!("CONNECT blocked: target '{authority}' resolves to a disallowed address range");
+        return (
+            StatusCode::FORBIDDEN,
+            "CONNECT to private/loopback addresses is not permitted",
+        )
+            .into_response();
+    }
+
+    // Run TrustChain handshake for known TC peers (best-effort).
+    let peer = state.discovery.get_peer_by_address(&authority).await;
+    if let Some(ref peer) = peer {
+        let lock = state.peer_lock(&peer.pubkey).await;
+        let guard = lock.try_lock();
+        if guard.is_ok() {
+            let tx = serde_json::json!({
+                "proxy": true,
+                "method": "CONNECT",
+                "authority": &authority,
+            });
+            if let Err(e) = run_handshake(&state, peer, tx).await {
+                log::warn!(
+                    "TC handshake for CONNECT to {} failed: {e} — tunneling anyway",
+                    &peer.pubkey[..8.min(peer.pubkey.len())],
+                );
+            }
+        }
+        drop(guard);
+    }
+
+    // Connect to the target host.
+    let target_addr = if authority.contains(':') {
+        authority.clone()
+    } else {
+        format!("{authority}:443")
+    };
+
+    let target_stream = match TcpStream::connect(&target_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, format!("CONNECT: cannot reach {target_addr}: {e}"))
+                .into_response();
+        }
+    };
+
+    // Upgrade the client connection and relay bytes.
+    let on_upgrade = hyper::upgrade::on(req);
+
+    tokio::spawn(async move {
+        tunnel(on_upgrade, target_stream).await;
+    });
+
+    // Return 200 Connection Established to the client.
+    Response::builder()
+        .status(StatusCode::OK)
+        .body(axum::body::Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Bidirectional byte relay for CONNECT tunnels.
+async fn tunnel(on_upgrade: OnUpgrade, mut target: TcpStream) {
+    match on_upgrade.await {
+        Ok(upgraded) => {
+            let mut client = hyper_util::rt::TokioIo::new(upgraded);
+            match copy_bidirectional(&mut client, &mut target).await {
+                Ok((from_client, from_target)) => {
+                    log::debug!(
+                        "CONNECT tunnel closed: {from_client} bytes up, {from_target} bytes down"
+                    );
+                }
+                Err(e) => {
+                    log::debug!("CONNECT tunnel error: {e}");
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("CONNECT upgrade failed: {e}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers: URL resolution
 // ---------------------------------------------------------------------------
 
@@ -248,13 +435,13 @@ async fn run_handshake<S: BlockStore + 'static, D: DelegationStore + 'static>(
     peer: &PeerRecord,
     tx: serde_json::Value,
 ) -> anyhow::Result<()> {
-    // Derive QUIC address from peer's HTTP address (QUIC is HTTP port - 2 by convention).
+    // Derive QUIC address from peer's HTTP address (QUIC is HTTP port - QUIC_PORT_OFFSET).
     let quic_addr: SocketAddr = {
         let addr = peer.address.strip_prefix("http://").unwrap_or(&peer.address);
         let sa: SocketAddr = addr
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid peer address '{addr}': {e}"))?;
-        SocketAddr::new(sa.ip(), sa.port().saturating_sub(2))
+        SocketAddr::new(sa.ip(), sa.port().saturating_sub(crate::QUIC_PORT_OFFSET))
     };
 
     // Hold the protocol lock for the entire handshake to prevent
@@ -423,6 +610,40 @@ mod tests {
 
         let target = resolve_target(&req);
         assert_eq!(target, Some("http://agent-b:8080/compute".to_string()));
+    }
+
+    #[test]
+    fn test_is_safe_connect_target_blocks_private() {
+        // Loopback IPv4
+        assert!(!is_safe_connect_target("127.0.0.1:443"));
+        assert!(!is_safe_connect_target("127.0.0.1:80"));
+        // Loopback IPv6
+        assert!(!is_safe_connect_target("[::1]:443"));
+        // RFC1918 private ranges
+        assert!(!is_safe_connect_target("10.0.0.1:443"));
+        assert!(!is_safe_connect_target("10.255.255.255:8080"));
+        assert!(!is_safe_connect_target("172.16.0.1:443"));
+        assert!(!is_safe_connect_target("172.31.255.1:443"));
+        assert!(!is_safe_connect_target("192.168.1.100:443"));
+        // Link-local
+        assert!(!is_safe_connect_target("169.254.0.1:443"));
+        assert!(!is_safe_connect_target("[fe80::1]:443"));
+        // Unspecified
+        assert!(!is_safe_connect_target("0.0.0.0:443"));
+    }
+
+    #[test]
+    fn test_is_safe_connect_target_allows_public() {
+        // Public IPv4
+        assert!(is_safe_connect_target("8.8.8.8:443"));
+        assert!(is_safe_connect_target("203.0.113.1:443"));
+        // Public hostname — cannot pre-check, allowed
+        assert!(is_safe_connect_target("example.com:443"));
+        assert!(is_safe_connect_target("agent-b:8080"));
+        // 172.15.x.x is NOT in the 172.16-31 private range
+        assert!(is_safe_connect_target("172.15.255.255:443"));
+        // 172.32.x.x is also outside the private range
+        assert!(is_safe_connect_target("172.32.0.1:443"));
     }
 
     #[test]

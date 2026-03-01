@@ -124,6 +124,19 @@ impl<S: BlockStore> TrustChainProtocol<S> {
             Err(TrustChainError::DuplicateSequence { .. }) => {} // Already stored.
             Err(e) => return Err(e),
         }
+
+        // Warn on sequence gaps (don't reject — blocks may arrive out of order
+        // during crawl/sync, and rejecting would break resync for lagging peers).
+        let latest = self.store.get_latest_seq(&proposal.public_key).unwrap_or(0);
+        if proposal.sequence_number > latest + 1 {
+            log::warn!(
+                "sequence gap detected for {}: expected seq {}, got {}",
+                &proposal.public_key[..8.min(proposal.public_key.len())],
+                latest + 1,
+                proposal.sequence_number,
+            );
+        }
+
         Ok(true)
     }
 

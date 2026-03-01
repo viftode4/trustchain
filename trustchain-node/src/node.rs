@@ -14,6 +14,7 @@ use trustchain_core::{
 };
 use trustchain_transport::{
     AppState, ConnectionPool, PeerDiscovery, ProxyState, QuicTransport,
+    QUIC_PORT_OFFSET,
     discover,
     build_router, start_grpc_server, start_proxy_server,
     message::{
@@ -76,6 +77,8 @@ pub struct Node {
     pub broadcast_tracker: Arc<Mutex<BroadcastTracker>>,
     pub consensus: Arc<Mutex<CHECOConsensus<SqliteBlockStore>>>,
     pub delegation_store: Arc<Mutex<SqliteDelegationStore>>,
+    /// Latest finalized checkpoint, shared with HTTP handlers for trust queries.
+    pub latest_checkpoint: Arc<Mutex<Option<trustchain_core::Checkpoint>>>,
 }
 
 impl Node {
@@ -89,12 +92,24 @@ impl Node {
         // Second store handle to the same DB file (WAL mode enables concurrent readers).
         let consensus_store = SqliteBlockStore::open(db_path)
             .expect("failed to open SQLite database for consensus");
-        let consensus = CHECOConsensus::new(
+
+        // Load persisted checkpoints from previous runs.
+        let persisted_checkpoints = consensus_store.load_checkpoints()
+            .unwrap_or_default();
+        let checkpoint_count = persisted_checkpoints.len();
+
+        let mut consensus = CHECOConsensus::new(
             identity.clone(),
             consensus_store,
             None,
             config.min_signers,
         );
+        // Extract latest checkpoint before loading into consensus.
+        let latest_cp = persisted_checkpoints.last().cloned();
+        if !persisted_checkpoints.is_empty() {
+            consensus.load_checkpoints(persisted_checkpoints);
+            tracing::info!(count = checkpoint_count, "loaded persisted checkpoints");
+        }
 
         let discovery = PeerDiscovery::new(
             identity.pubkey_hex(),
@@ -116,6 +131,7 @@ impl Node {
             broadcast_tracker: Arc::new(Mutex::new(BroadcastTracker::new())),
             consensus: Arc::new(Mutex::new(consensus)),
             delegation_store: Arc::new(Mutex::new(delegation_store)),
+            latest_checkpoint: Arc::new(Mutex::new(latest_cp)),
         }
     }
 
@@ -177,8 +193,10 @@ impl Node {
             let tracker = self.broadcast_tracker.clone();
             let quic_for_router = quic.clone();
             let consensus_for_router = self.consensus.clone();
+            let checkpoint_for_router = self.latest_checkpoint.clone();
+            let delegation_for_router = self.delegation_store.clone();
             tokio::spawn(Self::quic_message_router(
-                quic_rx, protocol, discovery, tracker, quic_for_router, consensus_for_router,
+                quic_rx, protocol, discovery, tracker, quic_for_router, consensus_for_router, checkpoint_for_router, delegation_for_router,
             ));
             (handle, quic)
         };
@@ -203,6 +221,8 @@ impl Node {
             quic: Some(quic_accept_handle.1.clone()),
             agent_endpoint: self.config.agent_endpoint.clone(),
             delegation_store: self.delegation_store.clone(),
+            latest_checkpoint: self.latest_checkpoint.clone(),
+            seed_nodes: self.config.effective_bootstrap_nodes(),
         };
 
         #[cfg(feature = "mcp")]
@@ -261,8 +281,9 @@ impl Node {
         let disc = self.discovery.clone();
         let disc_protocol = self.protocol.clone();
         let bootstrap_nodes = self.config.effective_bootstrap_nodes();
+        let disc_delegation_store = self.delegation_store.clone();
         let discovery_handle = tokio::spawn(async move {
-            Self::discovery_loop(disc, disc_protocol, bootstrap_nodes).await;
+            Self::discovery_loop(disc, disc_protocol, bootstrap_nodes, disc_delegation_store).await;
         });
         tracing::info!("peer discovery started");
 
@@ -271,12 +292,14 @@ impl Node {
         let checkpoint_discovery = self.discovery.clone();
         let checkpoint_quic = quic_accept_handle.1.clone();
         let checkpoint_interval = self.config.checkpoint_interval_secs;
+        let checkpoint_shared = self.latest_checkpoint.clone();
         let checkpoint_handle = tokio::spawn(async move {
             Self::checkpoint_loop(
                 checkpoint_consensus,
                 checkpoint_discovery,
                 checkpoint_quic,
                 checkpoint_interval,
+                checkpoint_shared,
             ).await;
         });
         tracing::info!(interval_secs = checkpoint_interval, "CHECO checkpoint loop started");
@@ -370,6 +393,8 @@ impl Node {
         tracker: Arc<Mutex<BroadcastTracker>>,
         quic: Arc<QuicTransport>,
         consensus: Arc<Mutex<CHECOConsensus<SqliteBlockStore>>>,
+        latest_checkpoint: Arc<Mutex<Option<trustchain_core::Checkpoint>>>,
+        delegation_store: Arc<Mutex<SqliteDelegationStore>>,
     ) {
         while let Some((data, resp_tx)) = rx.recv().await {
             let protocol = protocol.clone();
@@ -377,9 +402,11 @@ impl Node {
             let tracker = tracker.clone();
             let quic = quic.clone();
             let consensus = consensus.clone();
+            let latest_checkpoint = latest_checkpoint.clone();
+            let delegation_store = delegation_store.clone();
             tokio::spawn(async move {
                 let response = Self::handle_quic_message(
-                    &data, &protocol, &discovery, &tracker, &quic, &consensus,
+                    &data, &protocol, &discovery, &tracker, &quic, &consensus, &latest_checkpoint, &delegation_store,
                 ).await;
                 let _ = resp_tx.send(response).await;
             });
@@ -394,6 +421,8 @@ impl Node {
         tracker: &Arc<Mutex<BroadcastTracker>>,
         quic: &Arc<QuicTransport>,
         consensus: &Arc<Mutex<CHECOConsensus<SqliteBlockStore>>>,
+        latest_checkpoint: &Arc<Mutex<Option<trustchain_core::Checkpoint>>>,
+        delegation_store: &Arc<Mutex<SqliteDelegationStore>>,
     ) -> Vec<u8> {
         // Try to deserialize as TransportMessage.
         let msg: TransportMessage = match serde_json::from_slice(data) {
@@ -415,7 +444,49 @@ impl Node {
                 };
 
                 let sender_pubkey = proposal.public_key.clone();
-                let (response, agreement_opt) = {
+                let is_delegation = proposal.block_type == trustchain_core::BlockType::Delegation.to_string();
+                let is_succession = proposal.block_type == trustchain_core::BlockType::Succession.to_string();
+
+                let (response, agreement_opt) = if is_delegation {
+                    // Delegation proposal — use accept_delegation to also store DelegationRecord.
+                    let mut proto = protocol.lock().await;
+
+                    // Validate the proposal first.
+                    if let Err(e) = proto.receive_proposal(&proposal) {
+                        return Self::error_response(&format!("delegation proposal rejected: {e}"));
+                    }
+
+                    let mut ds = delegation_store.lock().await;
+                    match proto.accept_delegation(&proposal, &mut *ds) {
+                        Ok(agreement) => {
+                            let resp = TransportMessage::new(
+                                MessageType::Agreement,
+                                proto.pubkey(),
+                                block_to_bytes(&agreement),
+                                msg.request_id,
+                            );
+                            tracing::info!(
+                                delegator = &proposal.public_key[..8.min(proposal.public_key.len())],
+                                "accepted delegation via QUIC"
+                            );
+                            (serde_json::to_vec(&resp).unwrap_or_default(), Some(agreement))
+                        }
+                        Err(e) => (Self::error_response(&format!("delegation acceptance failed: {e}")), None),
+                    }
+                } else if is_succession {
+                    // Succession proposals require explicit operator approval.
+                    // Auto-accepting would allow any peer to rotate our key — that
+                    // is equivalent to remote identity theft. The operator MUST
+                    // explicitly call POST /accept_succession to rotate keys.
+                    tracing::warn!(
+                        from = &proposal.public_key[..8.min(proposal.public_key.len())],
+                        "rejected auto-succession proposal via QUIC — use POST /accept_succession for explicit approval"
+                    );
+                    return Self::error_response(
+                        "succession proposals require explicit approval via HTTP API",
+                    );
+                } else {
+                    // Regular proposal — create generic agreement.
                     let mut proto = protocol.lock().await;
 
                     // Receive and validate.
@@ -586,11 +657,28 @@ impl Node {
                     return Self::error_response("broadcast block2 invalid");
                 }
 
+                // Verify blocks form a valid matched pair before persisting.
+                if payload.block1.link_public_key != payload.block2.public_key
+                    || payload.block2.link_public_key != payload.block1.public_key
+                    || payload.block2.link_sequence_number != payload.block1.sequence_number
+                {
+                    tracing::warn!("rejected gossip: blocks are not a matched pair");
+                    return Self::error_response("blocks are not a matched pair");
+                }
+
                 // Persist both blocks (idempotent).
                 {
                     let mut proto = protocol.lock().await;
-                    let _ = proto.store_mut().add_block(&payload.block1);
-                    let _ = proto.store_mut().add_block(&payload.block2);
+                    if let Err(e) = proto.store_mut().add_block(&payload.block1) {
+                        if !e.to_string().to_lowercase().contains("duplicate") {
+                            tracing::warn!(error = %e, "failed to store gossipped block1");
+                        }
+                    }
+                    if let Err(e) = proto.store_mut().add_block(&payload.block2) {
+                        if !e.to_string().to_lowercase().contains("duplicate") {
+                            tracing::warn!(error = %e, "failed to store gossipped block2");
+                        }
+                    }
                 }
 
                 tracing::debug!(
@@ -750,7 +838,12 @@ impl Node {
 
                 {
                     let mut proto = protocol.lock().await;
-                    let _ = proto.store_mut().add_block(&payload.block);
+                    if let Err(e) = proto.store_mut().add_block(&payload.block) {
+                        // DuplicateSequence is expected during gossip — not an error.
+                        if !e.to_string().to_lowercase().contains("duplicate") {
+                            tracing::warn!(error = %e, "failed to store gossipped half-block");
+                        }
+                    }
                 }
 
                 serde_json::to_vec(&serde_json::json!({"status": "ok"}))
@@ -820,6 +913,15 @@ impl Node {
                         payload.checkpoint.signatures,
                     ) {
                         Ok(cp) => {
+                            // Save to SQLite for restart persistence.
+                            if let Err(e) = cons.store().save_checkpoint(&cp) {
+                                tracing::warn!("failed to persist checkpoint to SQLite: {e}");
+                            }
+                            // Update shared latest checkpoint for trust queries.
+                            {
+                                let mut lc = latest_checkpoint.lock().await;
+                                *lc = Some(cp.clone());
+                            }
                             tracing::info!(
                                 facilitator = &cp.facilitator_pubkey[..8],
                                 signers = cp.signatures.len(),
@@ -866,13 +968,13 @@ impl Node {
         let msg_bytes = serde_json::to_vec(&msg).unwrap_or_default();
 
         for peer in peers {
-            // Derive QUIC address from HTTP address (port - 2).
+            // Derive QUIC address from HTTP address (port - QUIC_PORT_OFFSET).
             let quic_addr = match peer.address
                 .strip_prefix("http://")
                 .unwrap_or(&peer.address)
                 .parse::<SocketAddr>()
             {
-                Ok(a) => SocketAddr::new(a.ip(), a.port().saturating_sub(2)),
+                Ok(a) => SocketAddr::new(a.ip(), a.port().saturating_sub(QUIC_PORT_OFFSET)),
                 Err(_) => continue,
             };
 
@@ -951,7 +1053,7 @@ impl Node {
                 .unwrap_or(&peer.address)
                 .parse::<SocketAddr>()
             {
-                Ok(a) => SocketAddr::new(a.ip(), a.port().saturating_sub(2)),
+                Ok(a) => SocketAddr::new(a.ip(), a.port().saturating_sub(QUIC_PORT_OFFSET)),
                 Err(_) => continue,
             };
 
@@ -1010,6 +1112,9 @@ impl Node {
         discovery: Arc<PeerDiscovery>,
         protocol: Arc<Mutex<TrustChainProtocol<SqliteBlockStore>>>,
         bootstrap_nodes: Vec<String>,
+        // Kept in signature for future delegation-aware sync; not used while
+        // auto-accept is disabled (see C7 fix).
+        _delegation_store: Arc<Mutex<SqliteDelegationStore>>,
     ) {
         // Phase 1: Bootstrap — connect to known nodes and fetch their peers.
         for addr in &bootstrap_nodes {
@@ -1081,8 +1186,14 @@ impl Node {
                     // Fetch missing blocks.
                     if let Ok(blocks) = Self::fetch_crawl_http(&peer.address, &peer.pubkey, our_seq + 1).await {
                         let mut proto = protocol.lock().await;
+                        let our_pubkey = proto.pubkey();
                         for block in &blocks {
-                            let _ = proto.store_mut().add_block(block);
+                            if let Err(e) = proto.store_mut().add_block(block) {
+                                // DuplicateSequence is expected during sync — not an error.
+                                if !e.to_string().to_lowercase().contains("duplicate") {
+                                    tracing::warn!(error = %e, "failed to store synced block");
+                                }
+                            }
                         }
                         if !blocks.is_empty() {
                             tracing::info!(
@@ -1090,6 +1201,27 @@ impl Node {
                                 synced = blocks.len(),
                                 "synced blocks from peer"
                             );
+                        }
+
+                        // Notify the operator about pending delegation proposals targeting us.
+                        // Do NOT auto-accept: silently accepting delegations during crawl
+                        // allows any peer to grant themselves authority over our node without
+                        // operator consent. The operator MUST explicitly call
+                        // POST /accept_delegation to accept each delegation.
+                        for block in &blocks {
+                            if block.block_type == trustchain_core::BlockType::Delegation.to_string()
+                                && block.link_public_key == our_pubkey
+                                && block.link_sequence_number == 0  // proposal (not yet accepted)
+                            {
+                                let delegation_id = block.transaction.get("delegation_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("<unknown>");
+                                tracing::info!(
+                                    from = &block.public_key[..8.min(block.public_key.len())],
+                                    delegation_id = delegation_id,
+                                    "found pending delegation proposal during sync — use POST /accept_delegation to accept"
+                                );
+                            }
                         }
                     }
                 }
@@ -1208,6 +1340,7 @@ impl Node {
         discovery: Arc<PeerDiscovery>,
         quic: Arc<QuicTransport>,
         interval_secs: u64,
+        latest_checkpoint: Arc<Mutex<Option<trustchain_core::Checkpoint>>>,
     ) {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         let mut round: u64 = 0;
@@ -1283,7 +1416,7 @@ impl Node {
                     .unwrap_or(&peer.address)
                     .parse::<SocketAddr>()
                 {
-                    Ok(a) => SocketAddr::new(a.ip(), a.port().saturating_sub(2)),
+                    Ok(a) => SocketAddr::new(a.ip(), a.port().saturating_sub(QUIC_PORT_OFFSET)),
                     Err(_) => continue,
                 };
 
@@ -1318,6 +1451,20 @@ impl Node {
 
             match finalized {
                 Ok(cp) => {
+                    // Persist to SQLite for survival across restarts.
+                    {
+                        let cons = consensus.lock().await;
+                        if let Err(e) = cons.store().save_checkpoint(&cp) {
+                            tracing::warn!(round, err = %e, "failed to persist checkpoint");
+                        }
+                    }
+
+                    // Update shared latest checkpoint for trust queries.
+                    {
+                        let mut lc = latest_checkpoint.lock().await;
+                        *lc = Some(cp.clone());
+                    }
+
                     tracing::info!(
                         round,
                         signers = cp.signatures.len(),
@@ -1350,7 +1497,7 @@ impl Node {
                             .unwrap_or(&peer.address)
                             .parse::<SocketAddr>()
                         {
-                            Ok(a) => SocketAddr::new(a.ip(), a.port().saturating_sub(2)),
+                            Ok(a) => SocketAddr::new(a.ip(), a.port().saturating_sub(QUIC_PORT_OFFSET)),
                             Err(_) => continue,
                         };
                         let quic = quic.clone();
