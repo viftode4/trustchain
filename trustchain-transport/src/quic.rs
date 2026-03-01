@@ -1,6 +1,18 @@
 //! QUIC transport implementation using Quinn.
 //!
 //! Provides low-latency, encrypted node-to-node communication.
+//!
+//! # Pubkey pinning
+//!
+//! Connections opened with [`QuicTransport::send_message_pinned`] create a
+//! fresh QUIC connection using a [`quinn::ClientConfig`] that pins the peer's
+//! TrustChain Ed25519 pubkey via [`crate::tls::PubkeyVerifier`].  The
+//! handshake fails immediately if the server's certificate does not carry the
+//! expected pubkey in its custom X.509 extension, preventing impersonation.
+//!
+//! Connections opened with [`QuicTransport::send_message`] (no pinning) use
+//! `AcceptAnyCert` — suitable for bootstrap/discovery scenarios where the
+//! peer's pubkey is not yet known.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -77,6 +89,7 @@ pub struct QuicTransport {
     our_pubkey: String,
     rate_limiter: Arc<RateLimiter>,
     /// Cache of active QUIC connections keyed by remote address string.
+    /// These connections use AcceptAnyCert (bootstrap mode).
     active_connections: Arc<Mutex<HashMap<String, quinn::Connection>>>,
 }
 
@@ -96,7 +109,8 @@ impl QuicTransport {
         max_connections_per_ip_per_sec: u32,
     ) -> Result<Self, TransportError> {
         let server_config = make_server_config(trustchain_pubkey)?;
-        let client_config = make_client_config()?;
+        // Default client config uses AcceptAnyCert (bootstrap / unknown peers).
+        let client_config = make_client_config(None)?;
 
         let mut endpoint = Endpoint::server(server_config, listen_addr)
             .map_err(|e| TransportError::Connection(format!("failed to bind QUIC: {e}")))?;
@@ -122,15 +136,66 @@ impl QuicTransport {
             .map_err(|e| TransportError::Connection(e.to_string()))
     }
 
-    /// Send a raw message to a peer, reusing cached connections when available.
+    /// Send a raw message to a peer without pubkey pinning (bootstrap mode).
+    ///
+    /// Uses cached connections where available. Suitable for peers whose
+    /// Ed25519 pubkey is not yet known (e.g. initial discovery).
     pub async fn send_message(
         &self,
         addr: SocketAddr,
         data: &[u8],
     ) -> Result<Vec<u8>, TransportError> {
+        self.send_message_impl(addr, data, None).await
+    }
+
+    /// Send a raw message to a known peer with TLS pubkey pinning.
+    ///
+    /// A fresh QUIC connection is established (bypassing the connection cache)
+    /// using a per-connection [`crate::tls::PubkeyVerifier`] that checks the
+    /// server's TLS certificate carries `expected_pubkey_hex`.  The TLS
+    /// handshake fails immediately if there is a mismatch, preventing
+    /// man-in-the-middle attacks from peers presenting forged certificates.
+    ///
+    /// Returns `Err(TransportError::Tls(...))` when the pubkey does not match.
+    pub async fn send_message_pinned(
+        &self,
+        addr: SocketAddr,
+        data: &[u8],
+        expected_pubkey_hex: &str,
+    ) -> Result<Vec<u8>, TransportError> {
+        // Pinned connections are never cached: each call creates a fresh
+        // connection with its own client config so that the pin is enforced
+        // for every new connection (cached connections could have originated
+        // before the pin was known).
+        self.send_message_impl(addr, data, Some(expected_pubkey_hex))
+            .await
+    }
+
+    /// Internal send implementation.
+    ///
+    /// When `expected_pubkey` is `Some`, a fresh pinned connection is opened
+    /// and NOT cached (see security note above).  When it is `None`, cached
+    /// bootstrap connections are reused.
+    async fn send_message_impl(
+        &self,
+        addr: SocketAddr,
+        data: &[u8],
+        expected_pubkey: Option<&str>,
+    ) -> Result<Vec<u8>, TransportError> {
+        if let Some(pubkey_hex) = expected_pubkey {
+            // Pinned path: always open a fresh connection with a dedicated
+            // TLS config that enforces the expected pubkey.
+            let connection = self.new_pinned_connection(addr, pubkey_hex).await?;
+            let streams = connection
+                .open_bi()
+                .await
+                .map_err(|e| TransportError::Send(format!("QUIC stream open error: {e}")))?;
+            return self.send_on_streams(streams, data).await;
+        }
+
+        // Unpinned bootstrap path — try to reuse a cached connection.
         let addr_key = addr.to_string();
 
-        // Try to reuse a cached connection.
         let cached = {
             let conns = self.active_connections.lock().unwrap();
             conns.get(&addr_key).cloned()
@@ -149,11 +214,13 @@ impl QuicTransport {
             }
         }
 
-        // Open a new connection.
+        // Open a new bootstrap connection.
         let connection = self.new_connection(addr).await?;
 
-        // Cache it.
-        self.active_connections.lock().unwrap()
+        // Cache it for future use.
+        self.active_connections
+            .lock()
+            .unwrap()
             .insert(addr_key, connection.clone());
 
         let streams = connection
@@ -164,13 +231,40 @@ impl QuicTransport {
         self.send_on_streams(streams, data).await
     }
 
-    /// Open a new QUIC connection to a peer.
+    /// Open a new QUIC connection to a peer (bootstrap/AcceptAnyCert mode).
     async fn new_connection(&self, addr: SocketAddr) -> Result<quinn::Connection, TransportError> {
         self.endpoint
             .connect(addr, "localhost")
             .map_err(|e| TransportError::Connection(format!("QUIC connect error: {e}")))?
             .await
             .map_err(|e| TransportError::Connection(format!("QUIC handshake error: {e}")))
+    }
+
+    /// Open a new QUIC connection with pubkey pinning.
+    ///
+    /// Creates a transient `quinn::ClientConfig` that pins `expected_pubkey_hex`
+    /// using [`tls::PubkeyVerifier`]. The TLS handshake is aborted if the
+    /// peer's certificate does not carry a matching TrustChain pubkey extension.
+    async fn new_pinned_connection(
+        &self,
+        addr: SocketAddr,
+        expected_pubkey_hex: &str,
+    ) -> Result<quinn::Connection, TransportError> {
+        let client_config = make_client_config(Some(expected_pubkey_hex))?;
+
+        self.endpoint
+            .connect_with(client_config, addr, "localhost")
+            .map_err(|e| TransportError::Connection(format!("QUIC pinned connect error: {e}")))?
+            .await
+            .map_err(|e| {
+                // Surface TLS-level failures with a distinct error variant so
+                // callers can distinguish a pubkey mismatch from a network error.
+                if e.to_string().contains("mismatch") || e.to_string().contains("TrustChain") {
+                    TransportError::Tls(format!("pubkey pinning failed: {e}"))
+                } else {
+                    TransportError::Connection(format!("QUIC pinned handshake error: {e}"))
+                }
+            })
     }
 
     /// Send data on an already-opened bidirectional stream pair.
@@ -291,8 +385,15 @@ fn make_server_config(pubkey: &str) -> Result<quinn::ServerConfig, TransportErro
     Ok(config)
 }
 
-fn make_client_config() -> Result<quinn::ClientConfig, TransportError> {
-    let tls_config = tls::build_client_config()
+/// Build a quinn ClientConfig.
+///
+/// `expected_pubkey_hex` is forwarded directly to [`tls::build_client_config`]:
+/// - `Some(hex)` → pinned connection using [`tls::PubkeyVerifier`]
+/// - `None`       → bootstrap connection using `AcceptAnyCert`
+fn make_client_config(
+    expected_pubkey_hex: Option<&str>,
+) -> Result<quinn::ClientConfig, TransportError> {
+    let tls_config = tls::build_client_config(expected_pubkey_hex)
         .map_err(|e| TransportError::Tls(e.to_string()))?;
 
     let quic_client_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
@@ -306,10 +407,32 @@ fn make_client_config() -> Result<quinn::ClientConfig, TransportError> {
 mod tests {
     use super::*;
 
+    // Helper: spin up a server transport, return (transport, addr).
+    async fn make_server(pubkey: &str) -> (QuicTransport, SocketAddr) {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let t = QuicTransport::bind(addr, pubkey).await.unwrap();
+        let local = t.local_addr().unwrap();
+        (t, local)
+    }
+
+    // Helper: start the accept loop as an echo server.
+    fn start_echo_server(server: QuicTransport) -> tokio::task::JoinHandle<()> {
+        let (tx, mut rx) = mpsc::channel::<(Vec<u8>, mpsc::Sender<Vec<u8>>)>(16);
+        tokio::spawn(async move {
+            // Echo handler.
+            tokio::spawn(async move {
+                while let Some((data, resp_tx)) = rx.recv().await {
+                    let _ = resp_tx.send(data).await;
+                }
+            });
+            let _ = server.accept_loop(tx).await;
+        })
+    }
+
     #[tokio::test]
     async fn test_quic_bind() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let pubkey = "a".repeat(64);
+        let pubkey = hex::encode([0xaa; 32]);
         let transport = QuicTransport::bind(addr, &pubkey).await.unwrap();
         let local = transport.local_addr().unwrap();
         assert_ne!(local.port(), 0);
@@ -318,38 +441,115 @@ mod tests {
 
     #[tokio::test]
     async fn test_quic_roundtrip() {
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let pubkey = "a".repeat(64);
-        let server = QuicTransport::bind(addr, &pubkey).await.unwrap();
-        let server_addr = server.local_addr().unwrap();
+        let server_pubkey = hex::encode([0xab; 32]);
+        let (server, server_addr) = make_server(&server_pubkey).await;
+        let _handle = start_echo_server(server);
 
-        let (tx, mut rx) = mpsc::channel(10);
-
-        // Start server in background.
-        let server_handle = tokio::spawn(async move {
-            let _ = server.accept_loop(tx).await;
-        });
-
-        // Give server time to start.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Handle incoming messages in background.
-        tokio::spawn(async move {
-            while let Some((data, resp_tx)) = rx.recv().await {
-                // Echo back.
-                let _ = resp_tx.send(data).await;
-            }
-        });
-
-        // Client sends a message.
-        let client_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let client = QuicTransport::bind(client_addr, &pubkey).await.unwrap();
+        let client_pubkey = hex::encode([0xcd; 32]);
+        let client = QuicTransport::bind("127.0.0.1:0".parse().unwrap(), &client_pubkey)
+            .await
+            .unwrap();
 
         let msg = b"hello trustchain";
         let response = client.send_message(server_addr, msg).await.unwrap();
         assert_eq!(response, msg);
 
         client.shutdown();
-        server_handle.abort();
+    }
+
+    /// Pubkey pinning: client knows the server's pubkey and verifies it.
+    /// The handshake must succeed when the certs match.
+    #[tokio::test]
+    async fn test_pinned_connection_succeeds_when_pubkeys_match() {
+        let server_pubkey = hex::encode(
+            trustchain_core::identity::Identity::generate().pubkey_bytes(),
+        );
+        let (server, server_addr) = make_server(&server_pubkey).await;
+        let _handle = start_echo_server(server);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client_pubkey = hex::encode(
+            trustchain_core::identity::Identity::generate().pubkey_bytes(),
+        );
+        let client = QuicTransport::bind("127.0.0.1:0".parse().unwrap(), &client_pubkey)
+            .await
+            .unwrap();
+
+        let msg = b"pinned hello";
+        let response = client
+            .send_message_pinned(server_addr, msg, &server_pubkey)
+            .await
+            .unwrap();
+        assert_eq!(response, msg, "pinned echo must round-trip correctly");
+
+        client.shutdown();
+    }
+
+    /// Pubkey pinning: client expects a wrong pubkey — the handshake MUST fail.
+    #[tokio::test]
+    async fn test_pinned_connection_fails_when_pubkeys_differ() {
+        let server_pubkey = hex::encode(
+            trustchain_core::identity::Identity::generate().pubkey_bytes(),
+        );
+        let (server, server_addr) = make_server(&server_pubkey).await;
+        let _handle = start_echo_server(server);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client_pubkey = hex::encode(
+            trustchain_core::identity::Identity::generate().pubkey_bytes(),
+        );
+        let client = QuicTransport::bind("127.0.0.1:0".parse().unwrap(), &client_pubkey)
+            .await
+            .unwrap();
+
+        // Use a completely different (wrong) expected pubkey.
+        let wrong_pubkey = hex::encode(
+            trustchain_core::identity::Identity::generate().pubkey_bytes(),
+        );
+
+        let result = client
+            .send_message_pinned(server_addr, b"should fail", &wrong_pubkey)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "pinned connection must fail when pubkeys differ"
+        );
+        let err_str = format!("{:?}", result.unwrap_err());
+        // Error must indicate a TLS/connection-level failure.
+        assert!(
+            err_str.contains("Tls") || err_str.contains("Connection"),
+            "error must be a Tls or Connection variant: {err_str}"
+        );
+    }
+
+    /// Bootstrap mode (None pubkey): must still work — connects to any server.
+    #[tokio::test]
+    async fn test_bootstrap_mode_accepts_any_cert() {
+        let server_pubkey = hex::encode(
+            trustchain_core::identity::Identity::generate().pubkey_bytes(),
+        );
+        let (server, server_addr) = make_server(&server_pubkey).await;
+        let _handle = start_echo_server(server);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client_pubkey = hex::encode(
+            trustchain_core::identity::Identity::generate().pubkey_bytes(),
+        );
+        let client = QuicTransport::bind("127.0.0.1:0".parse().unwrap(), &client_pubkey)
+            .await
+            .unwrap();
+
+        // send_message uses AcceptAnyCert — must succeed without knowing the server's pubkey.
+        let msg = b"bootstrap hello";
+        let response = client.send_message(server_addr, msg).await.unwrap();
+        assert_eq!(response, msg);
+
+        client.shutdown();
     }
 }

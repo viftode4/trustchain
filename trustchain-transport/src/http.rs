@@ -152,12 +152,32 @@ pub struct BlocksResponse {
 }
 
 /// Request for registering a peer at runtime.
+///
+/// `timestamp` (Unix milliseconds) and `signature` (hex-encoded Ed25519 over the
+/// canonical registration payload) are both optional for backward compatibility, but
+/// callers SHOULD supply them.  A future release will make them mandatory.
+///
+/// Canonical payload (for signing):
+/// ```json
+/// {"address":"<addr>","pubkey":"<hex>","timestamp":<u64>}
+/// ```
+/// Keys are sorted alphabetically (BTreeMap order), compact separators, no whitespace.
+/// The registering peer signs this UTF-8 byte string with its own private key.
 #[derive(Deserialize)]
 pub struct RegisterPeerRequest {
     pub pubkey: String,
     pub address: String,
     #[serde(default)]
     pub agent_endpoint: Option<String>,
+    /// Unix timestamp in milliseconds — included in the signed payload to prevent replay attacks.
+    /// Required when `signature` is present; ignored (but accepted) when signature is absent.
+    #[serde(default)]
+    pub timestamp: Option<u64>,
+    /// Hex-encoded Ed25519 signature (128 hex chars) over the canonical registration payload.
+    /// If present the signature must be valid; if absent the request is accepted with a
+    /// deprecation warning (backward-compat mode).
+    #[serde(default)]
+    pub signature: Option<String>,
 }
 
 /// Generic error response.
@@ -533,23 +553,119 @@ async fn handle_get_peers<S: BlockStore + 'static, D: DelegationStore + Send + '
     Json(response)
 }
 
+/// Maximum age (in milliseconds) accepted for a signed peer-registration request.
+/// Registrations with a timestamp older than this are rejected to prevent replay attacks.
+const MAX_PEER_REG_AGE_MS: u64 = 5 * 60 * 1000; // 5 minutes
+
+/// Build the canonical byte payload that a peer must sign when registering.
+///
+/// The payload is a compact JSON object with **sorted keys** (BTreeMap order):
+/// ```json
+/// {"address":"<addr>","pubkey":"<hex>","timestamp":<u64>}
+/// ```
+/// Separators are compact (`,` and `:`), no trailing whitespace.
+fn canonical_peer_registration_payload(pubkey: &str, address: &str, timestamp: u64) -> Vec<u8> {
+    // BTreeMap gives us sorted keys for free.
+    let mut map = std::collections::BTreeMap::new();
+    map.insert("address", serde_json::Value::String(address.to_string()));
+    map.insert("pubkey", serde_json::Value::String(pubkey.to_string()));
+    map.insert("timestamp", serde_json::json!(timestamp));
+    serde_json::to_vec(&map).expect("BTreeMap serialization cannot fail")
+}
+
 /// Register a peer at runtime (for bidirectional discovery).
 ///
-/// SECURITY: This endpoint is unauthenticated. Any client that can reach this port
-/// can inject arbitrary (pubkey, address) pairs into the peer table. Production
-/// deployments MUST either:
-///   1. Restrict this endpoint to loopback / trusted networks via a firewall, OR
-///   2. Add request signature verification before registration.
+/// When a `signature` field is present in the request body the handler performs
+/// full Ed25519 verification:
+///
+/// 1. `timestamp` must be present and within [`MAX_PEER_REG_AGE_MS`] of the current
+///    wall-clock time — stale timestamps are rejected with `422 Unprocessable Entity`
+///    to prevent replay attacks.
+/// 2. The signature must verify against the canonical payload
+///    `{"address":…,"pubkey":…,"timestamp":…}` (keys sorted, compact JSON) using the
+///    public key supplied in the `pubkey` field itself — an invalid signature is rejected
+///    with `401 Unauthorized`.
+///
+/// When `signature` is absent the request is **accepted** but a deprecation warning is
+/// logged.  This preserves backward compatibility with older clients.
 async fn handle_register_peer<S: BlockStore + 'static, D: DelegationStore + Send + 'static>(
     State(state): State<AppState<S, D>>,
     Json(req): Json<RegisterPeerRequest>,
-) -> Json<serde_json::Value> {
-    // Compensating control: log every registration so operators can detect
-    // unexpected peer injections until full signature verification is added.
-    tracing::warn!(
-        pubkey = &req.pubkey[..8.min(req.pubkey.len())],
-        "peer registered without authentication — production deployments should restrict /peers"
-    );
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    match &req.signature {
+        None => {
+            // Backward-compat mode: accept but warn operators.
+            tracing::warn!(
+                pubkey = &req.pubkey[..8.min(req.pubkey.len())],
+                "peer registered without a signature — callers should sign their registration \
+                 payload; unauthenticated registrations will be rejected in a future release"
+            );
+        }
+        Some(sig_hex) => {
+            // --- 1. Timestamp presence and freshness check ---
+            let ts = req.timestamp.ok_or_else(|| {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(ErrorResponse {
+                        error: "timestamp is required when signature is present".to_string(),
+                    }),
+                )
+            })?;
+
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            // Guard against both stale and far-future timestamps.
+            let age_ms = now_ms.saturating_sub(ts);
+            let skew_ms = ts.saturating_sub(now_ms);
+            if age_ms > MAX_PEER_REG_AGE_MS || skew_ms > MAX_PEER_REG_AGE_MS {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(ErrorResponse {
+                        error: format!(
+                            "registration timestamp is too far from current time \
+                             (age={age_ms}ms, skew={skew_ms}ms, max={}ms)",
+                            MAX_PEER_REG_AGE_MS
+                        ),
+                    }),
+                ));
+            }
+
+            // --- 2. Signature verification ---
+            let payload = canonical_peer_registration_payload(&req.pubkey, &req.address, ts);
+
+            let valid = trustchain_core::Identity::verify_hex(&payload, sig_hex, &req.pubkey)
+                .map_err(|e| {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(ErrorResponse {
+                            error: format!("signature verification error: {e}"),
+                        }),
+                    )
+                })?;
+
+            if !valid {
+                tracing::warn!(
+                    pubkey = &req.pubkey[..8.min(req.pubkey.len())],
+                    "peer registration rejected: invalid Ed25519 signature"
+                );
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse {
+                        error: "invalid signature".to_string(),
+                    }),
+                ));
+            }
+
+            tracing::debug!(
+                pubkey = &req.pubkey[..8.min(req.pubkey.len())],
+                "peer registration signature verified"
+            );
+        }
+    }
+
     state
         .discovery
         .add_peer(req.pubkey.clone(), req.address, 0)
@@ -557,7 +673,7 @@ async fn handle_register_peer<S: BlockStore + 'static, D: DelegationStore + Send
     if let Some(ep) = req.agent_endpoint {
         state.discovery.add_alias(ep, req.pubkey).await;
     }
-    Json(serde_json::json!({"status": "ok"}))
+    Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
 /// Build a DelegationContext from a concrete DelegationStore (no dyn dispatch in caller).
@@ -1159,6 +1275,209 @@ mod tests {
         let by_alias = state.discovery.get_peer_by_address("localhost:9002").await;
         assert!(by_alias.is_some());
         assert_eq!(by_alias.unwrap().pubkey, "deadbeef");
+    }
+
+    // -----------------------------------------------------------------------
+    // Peer registration signature verification tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build the canonical registration payload and sign it with the given Identity.
+    fn signed_peer_reg_body(
+        identity: &Identity,
+        address: &str,
+        timestamp: u64,
+    ) -> serde_json::Value {
+        let payload = canonical_peer_registration_payload(&identity.pubkey_hex(), address, timestamp);
+        let sig_hex = identity.sign_hex(&payload);
+        serde_json::json!({
+            "pubkey": identity.pubkey_hex(),
+            "address": address,
+            "timestamp": timestamp,
+            "signature": sig_hex,
+        })
+    }
+
+    /// Current time in milliseconds (used inside tests).
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    /// A valid signature with a fresh timestamp must be accepted with HTTP 200.
+    #[tokio::test]
+    async fn test_register_peer_valid_signature_accepted() {
+        let state = make_test_state();
+        let app = build_router(state.clone());
+
+        let peer_identity = Identity::from_bytes(&[0xAA; 32]);
+        let address = "http://127.0.0.1:9100";
+        let ts = now_ms();
+
+        let body = signed_peer_reg_body(&peer_identity, address, ts);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/peers")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "valid signature must be accepted"
+        );
+
+        // Peer must appear in the discovery table.
+        let peer = state.discovery.get_peer(&peer_identity.pubkey_hex()).await;
+        assert!(peer.is_some(), "peer must be registered after successful verification");
+    }
+
+    /// An incorrect signature (signed by a different key) must be rejected with HTTP 401.
+    #[tokio::test]
+    async fn test_register_peer_invalid_signature_rejected() {
+        let state = make_test_state();
+        let app = build_router(state.clone());
+
+        let peer_identity = Identity::from_bytes(&[0xBB; 32]);
+        let attacker_identity = Identity::from_bytes(&[0xCC; 32]);
+        let address = "http://127.0.0.1:9101";
+        let ts = now_ms();
+
+        // Build the payload for peer_identity but sign it with the attacker's key.
+        let payload = canonical_peer_registration_payload(&peer_identity.pubkey_hex(), address, ts);
+        let bad_sig = attacker_identity.sign_hex(&payload);
+
+        let body = serde_json::json!({
+            "pubkey": peer_identity.pubkey_hex(),
+            "address": address,
+            "timestamp": ts,
+            "signature": bad_sig,
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/peers")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "invalid signature must be rejected with 401"
+        );
+
+        // Peer must NOT appear in the discovery table.
+        let peer = state.discovery.get_peer(&peer_identity.pubkey_hex()).await;
+        assert!(peer.is_none(), "peer must not be registered when signature is invalid");
+    }
+
+    /// A request with no signature field must still be accepted (backward compatibility)
+    /// and the peer must be registered.
+    #[tokio::test]
+    async fn test_register_peer_missing_signature_accepted_with_warning() {
+        let state = make_test_state();
+        let app = build_router(state.clone());
+
+        let peer_identity = Identity::from_bytes(&[0xDD; 32]);
+        let address = "http://127.0.0.1:9102";
+
+        // Deliberately omit both `signature` and `timestamp`.
+        let body = serde_json::json!({
+            "pubkey": peer_identity.pubkey_hex(),
+            "address": address,
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/peers")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "missing signature must still be accepted for backward compatibility"
+        );
+
+        // Peer must appear in the discovery table.
+        let peer = state.discovery.get_peer(&peer_identity.pubkey_hex()).await;
+        assert!(peer.is_some(), "peer must be registered even without a signature");
+    }
+
+    /// A signed request with a timestamp older than MAX_PEER_REG_AGE_MS must be rejected
+    /// with HTTP 422 to prevent replay attacks.
+    #[tokio::test]
+    async fn test_register_peer_stale_timestamp_rejected() {
+        let state = make_test_state();
+        let app = build_router(state.clone());
+
+        let peer_identity = Identity::from_bytes(&[0xEE; 32]);
+        let address = "http://127.0.0.1:9103";
+        // 6 minutes in the past — exceeds the 5-minute window.
+        let stale_ts = now_ms().saturating_sub(6 * 60 * 1000);
+
+        let body = signed_peer_reg_body(&peer_identity, address, stale_ts);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/peers")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "stale timestamp must be rejected with 422"
+        );
+
+        // Peer must NOT be registered.
+        let peer = state.discovery.get_peer(&peer_identity.pubkey_hex()).await;
+        assert!(peer.is_none(), "peer must not be registered when timestamp is stale");
+    }
+
+    /// A signed request that omits `timestamp` must be rejected with HTTP 422.
+    #[tokio::test]
+    async fn test_register_peer_signature_without_timestamp_rejected() {
+        let state = make_test_state();
+        let app = build_router(state.clone());
+
+        let peer_identity = Identity::from_bytes(&[0xFF; 32]);
+        let address = "http://127.0.0.1:9104";
+
+        // Provide a signature but deliberately omit the timestamp field.
+        let payload = canonical_peer_registration_payload(&peer_identity.pubkey_hex(), address, 0);
+        let sig_hex = peer_identity.sign_hex(&payload);
+
+        let body = serde_json::json!({
+            "pubkey": peer_identity.pubkey_hex(),
+            "address": address,
+            "signature": sig_hex,
+            // no "timestamp" key
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/peers")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "signature without timestamp must be rejected with 422"
+        );
     }
 
     #[tokio::test]
