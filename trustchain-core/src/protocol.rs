@@ -990,18 +990,12 @@ mod tests {
 
         for i in 1..=3 {
             let proposal = alice
-                .create_proposal(
-                    &bob.pubkey(),
-                    serde_json::json!({"i": i}),
-                    Some(1000 + i),
-                )
+                .create_proposal(&bob.pubkey(), serde_json::json!({"i": i}), Some(1000 + i))
                 .unwrap();
             assert_eq!(proposal.sequence_number, i);
 
             bob.receive_proposal(&proposal).unwrap();
-            let agreement = bob
-                .create_agreement(&proposal, Some(1001 + i))
-                .unwrap();
+            let agreement = bob.create_agreement(&proposal, Some(1001 + i)).unwrap();
             assert_eq!(agreement.sequence_number, i);
 
             alice.receive_agreement(&agreement).unwrap();
