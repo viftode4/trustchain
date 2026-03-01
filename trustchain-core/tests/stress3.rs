@@ -325,7 +325,7 @@ fn stress_sybil_one_seed_connection_bounded() {
             serde_json::json!({}),
             Some(701),
         );
-        seed_prev = p.block_hash.clone();
+        let _seed_prev = p.block_hash.clone();
         store.add_block(&p).unwrap();
         store.add_block(&a).unwrap();
     }

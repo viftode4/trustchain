@@ -22,7 +22,7 @@ use trustchain_core::{
 /// Perform `n` bilateral interactions between two elements of the SAME Vec.
 /// Uses split_at_mut to satisfy the borrow checker.
 fn do_interactions_in_vec(
-    agents: &mut Vec<TrustChainProtocol<MemoryBlockStore>>,
+    agents: &mut [TrustChainProtocol<MemoryBlockStore>],
     i: usize,
     j: usize,
     n: usize,
@@ -95,8 +95,8 @@ fn stress_sybil_inflation_invariant() {
     do_interactions(&mut seed, &mut sybil_gw, 2);
 
     // Phase 1: small internal cluster (2 rounds per pair).
-    for i in 0..9 {
-        do_interactions(&mut sybil_gw, &mut sybil_cluster[i], 2);
+    for member in sybil_cluster.iter_mut().take(9) {
+        do_interactions(&mut sybil_gw, member, 2);
     }
 
     // Build Phase 1 master store.
@@ -115,9 +115,9 @@ fn stress_sybil_inflation_invariant() {
         .map(|s| netflow(&master1, &seed_pks, &s.pubkey()))
         .collect();
 
-    // Phase 2: add massive inflation (50 more rounds per pair — 25× more).
-    for i in 0..9 {
-        do_interactions(&mut sybil_gw, &mut sybil_cluster[i], 50);
+    // Phase 2: add massive inflation (50 more rounds per pair -- 25x more).
+    for member in sybil_cluster.iter_mut().take(9) {
+        do_interactions(&mut sybil_gw, member, 50);
     }
     // Also inflate within the cluster (intra-Sybil rings — no seed connection at all).
     for i in 0..9 {
@@ -200,8 +200,8 @@ fn stress_sybil_cluster_gateway_bounded() {
     let mut cluster: Vec<_> = (51..61u8).map(make_proto).collect();
 
     // All cluster members interact heavily with gateway.
-    for i in 0..10 {
-        do_interactions(&mut gateway, &mut cluster[i], 10);
+    for member in &mut cluster {
+        do_interactions(&mut gateway, member, 10);
     }
     // Also full intra-cluster mesh (3 rounds each pair).
     for i in 0..10 {
@@ -298,8 +298,8 @@ fn stress_sybil_world_sim_connected() {
         merge_into(s.store(), &mut master);
     }
 
-    for i in 0..10 {
-        let score = netflow(&master, &seed_pks, &sybil[i].pubkey());
+    for (i, s) in sybil.iter().enumerate() {
+        let score = netflow(&master, &seed_pks, &s.pubkey());
         assert_eq!(
             score, 0.0,
             "isolated Sybil agent {} must score 0.0, got {}",
@@ -326,9 +326,9 @@ fn stress_sybil_world_sim_connected() {
         "gateway Sybil must score positively after 1 seed connection"
     );
 
-    // All non-gateway Sybils score ≤ gateway (bottleneck).
-    for i in 1..10 {
-        let score = netflow(&master2, &seed_pks, &sybil[i].pubkey());
+    // All non-gateway Sybils score <= gateway (bottleneck).
+    for (i, s) in sybil.iter().enumerate().skip(1) {
+        let score = netflow(&master2, &seed_pks, &s.pubkey());
         assert!(
             score <= gw_score_1conn + 1e-9,
             "sybil[{}] score {:.6} exceeds gateway {:.6}",
@@ -446,10 +446,10 @@ fn stress_sybil_multi_gateway_no_advantage() {
     for gw in &mut gateways {
         do_interactions(&mut seed, gw, 1);
     }
-    // Each cluster member connects to all 5 gateways — optimal Sybil strategy.
-    for i in 0..5 {
+    // Each cluster member connects to all 5 gateways -- optimal Sybil strategy.
+    for gw in &mut gateways {
         for s in sybil_cluster.iter_mut() {
-            do_interactions(&mut gateways[i], s, 3);
+            do_interactions(gw, s, 3);
         }
     }
 

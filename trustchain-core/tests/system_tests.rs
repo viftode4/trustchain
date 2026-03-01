@@ -180,9 +180,9 @@ fn sysnet_full_network_lifecycle() {
         fac_pk.clone(),
         consensuses[fac_idx].sign_checkpoint(&cp_block).unwrap(),
     );
-    for i in 0..5 {
+    for (i, cons) in consensuses.iter().enumerate().take(5) {
         if i != fac_idx && sigs.len() < 3 {
-            let sig = consensuses[i].sign_checkpoint(&cp_block).unwrap();
+            let sig = cons.sign_checkpoint(&cp_block).unwrap();
             sigs.insert(sim.pubkey(i), sig);
         }
     }
@@ -605,9 +605,9 @@ fn sysnet_checo_facilitator_election_correctness() {
     let fac_idx = facilitators[0];
 
     // Non-facilitators fail propose_checkpoint.
-    for i in 0..7 {
+    for (i, cons) in consensuses.iter_mut().enumerate().take(7) {
         if i != fac_idx {
-            let result = consensuses[i].propose_checkpoint();
+            let result = cons.propose_checkpoint();
             assert!(
                 result.is_err(),
                 "non-facilitator {} must not propose checkpoint",

@@ -1295,7 +1295,7 @@ mod tests {
 
         let bob = Identity::from_bytes(&[2u8; 32]);
         let request = Request::builder()
-            .uri(&format!("/trust/{}", bob.pubkey_hex()))
+            .uri(format!("/trust/{}", bob.pubkey_hex()))
             .body(Body::empty())
             .unwrap();
 

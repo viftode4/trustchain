@@ -85,7 +85,7 @@ fn bench_block_verify(c: &mut Criterion) {
 }
 
 fn bench_identity_generate(c: &mut Criterion) {
-    c.bench_function("identity_generate", |b| b.iter(|| Identity::generate()));
+    c.bench_function("identity_generate", |b| b.iter(Identity::generate));
 }
 
 criterion_group!(

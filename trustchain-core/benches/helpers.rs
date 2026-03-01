@@ -21,6 +21,12 @@ pub struct ChainState {
     pub head_hash: HashMap<String, String>,
 }
 
+impl Default for ChainState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ChainState {
     pub fn new() -> Self {
         Self {

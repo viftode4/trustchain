@@ -300,6 +300,7 @@ mod tests {
     use crate::types::BlockType;
     use std::collections::HashMap;
 
+    #[allow(clippy::too_many_arguments)]
     fn create_interaction(
         store: &mut MemoryBlockStore,
         alice: &Identity,
@@ -343,7 +344,7 @@ mod tests {
         let engine = TrustEngine::new(&store, None, None, None);
         let score = engine.compute_trust("unknown").unwrap();
         // Empty chain: integrity=1.0 (no seeds → integrity only).
-        assert!(score >= 0.0 && score <= 1.0);
+        assert!((0.0..=1.0).contains(&score));
     }
 
     #[test]
@@ -906,7 +907,7 @@ mod tests {
         let trust = engine.compute_trust(&agent.pubkey_hex()).unwrap();
         // No seeds configured → integrity only, but weights don't matter
         // since integrity is returned directly when no seeds are set.
-        assert!(trust >= 0.0 && trust <= 1.0);
+        assert!((0.0..=1.0).contains(&trust));
     }
 
     #[test]

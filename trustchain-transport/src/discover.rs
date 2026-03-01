@@ -114,6 +114,7 @@ mod tests {
         halfblock::create_half_block, BlockType, Identity, MemoryBlockStore, GENESIS_HASH,
     };
 
+    #[allow(clippy::too_many_arguments)]
     fn add_interaction(
         store: &mut MemoryBlockStore,
         alice: &Identity,

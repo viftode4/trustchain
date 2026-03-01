@@ -993,14 +993,14 @@ mod tests {
                 .create_proposal(
                     &bob.pubkey(),
                     serde_json::json!({"i": i}),
-                    Some(1000 + i as u64),
+                    Some(1000 + i),
                 )
                 .unwrap();
             assert_eq!(proposal.sequence_number, i);
 
             bob.receive_proposal(&proposal).unwrap();
             let agreement = bob
-                .create_agreement(&proposal, Some(1001 + i as u64))
+                .create_agreement(&proposal, Some(1001 + i))
                 .unwrap();
             assert_eq!(agreement.sequence_number, i);
 

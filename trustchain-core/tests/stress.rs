@@ -360,7 +360,7 @@ fn stress_hash_stability_1000_roundtrips() {
         0,
         GENESIS_HASH,
         BlockType::Proposal,
-        serde_json::json!({"nested": {"key": "val", "num": 3.14, "arr": [1,2,3]}}),
+        serde_json::json!({"nested": {"key": "val", "num": 3.15, "arr": [1,2,3]}}),
         None,
     );
 
