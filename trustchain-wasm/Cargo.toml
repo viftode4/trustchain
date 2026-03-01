@@ -15,7 +15,7 @@ readme = "../README.md"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-trustchain-core = { workspace = true }
+trustchain-core = { workspace = true, default-features = false }
 wasm-bindgen = "0.2"
 js-sys = "0.3"
 serde = { workspace = true }

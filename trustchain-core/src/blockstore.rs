@@ -5,9 +5,12 @@
 //! - `SqliteBlockStore` — SQLite-backed persistent storage
 
 use std::collections::HashMap;
+#[cfg(feature = "sqlite")]
 use std::path::Path;
+#[cfg(feature = "sqlite")]
 use std::sync::Mutex;
 
+#[cfg(feature = "sqlite")]
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::{Result, TrustChainError};
@@ -219,6 +222,7 @@ impl BlockStore for MemoryBlockStore {
 // SqliteBlockStore
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "sqlite")]
 /// SQLite-backed persistent block store.
 ///
 /// Wraps `Connection` in a `Mutex` for thread-safe access.
@@ -226,6 +230,7 @@ pub struct SqliteBlockStore {
     conn: Mutex<Connection>,
 }
 
+#[cfg(feature = "sqlite")]
 impl SqliteBlockStore {
     /// Open or create a SQLite database at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -466,6 +471,7 @@ impl SqliteBlockStore {
     }
 }
 
+#[cfg(feature = "sqlite")]
 impl BlockStore for SqliteBlockStore {
     fn add_block(&mut self, block: &HalfBlock) -> Result<()> {
         let tx_data = serde_json::to_string(&block.transaction)?;
@@ -839,18 +845,21 @@ mod tests {
         test_linked_blocks(&mut store);
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn test_sqlite_store() {
         let mut store = SqliteBlockStore::in_memory().unwrap();
         test_store(&mut store);
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn test_sqlite_store_linked() {
         let mut store = SqliteBlockStore::in_memory().unwrap();
         test_linked_blocks(&mut store);
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn test_sqlite_persistent() {
         let dir = tempfile::tempdir().unwrap();
@@ -875,6 +884,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn test_peer_persistence_sqlite() {
         let dir = tempfile::tempdir().unwrap();
@@ -936,6 +946,7 @@ mod tests {
         assert_eq!(peers.len(), 0);
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn test_checkpoint_persistence() {
         let store = SqliteBlockStore::in_memory().unwrap();
@@ -986,6 +997,7 @@ mod tests {
         assert_eq!(latest.timestamp, 1000);
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn test_peer_remove_sqlite() {
         let mut store = SqliteBlockStore::in_memory().unwrap();

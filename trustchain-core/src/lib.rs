@@ -25,14 +25,15 @@ pub mod trust;
 pub mod types;
 
 // Re-export key types at crate root for convenience.
-pub use blockstore::{BlockStore, DoubleSpend, MemoryBlockStore, PersistentPeer, SqliteBlockStore};
+pub use blockstore::{BlockStore, DoubleSpend, MemoryBlockStore, PersistentPeer};
+#[cfg(feature = "sqlite")]
+pub use blockstore::SqliteBlockStore;
 pub use chain::PersonalChain;
 pub use consensus::{CHECOConsensus, Checkpoint};
 pub use crawler::{BlockStoreCrawler, CrossChainLink, DAGView, TamperingReport};
-pub use delegation::{
-    DelegationRecord, DelegationStore, MemoryDelegationStore, SqliteDelegationStore,
-    SuccessionRecord,
-};
+pub use delegation::{DelegationRecord, DelegationStore, MemoryDelegationStore, SuccessionRecord};
+#[cfg(feature = "sqlite")]
+pub use delegation::SqliteDelegationStore;
 pub use error::{Result, TrustChainError};
 pub use halfblock::{
     create_half_block, validate_and_record, validate_block, validate_block_invariants,

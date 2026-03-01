@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(feature = "sqlite")]
 use std::sync::Mutex;
 
 use crate::error::{Result, TrustChainError};
@@ -203,12 +204,14 @@ impl DelegationStore for MemoryDelegationStore {
 // SqliteDelegationStore
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "sqlite")]
 /// SQLite-backed delegation store. Shares a connection with SqliteBlockStore
 /// (or uses its own).
 pub struct SqliteDelegationStore {
     conn: Mutex<rusqlite::Connection>,
 }
 
+#[cfg(feature = "sqlite")]
 impl SqliteDelegationStore {
     /// Open or create a SQLite delegation store at the given path.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
@@ -267,6 +270,7 @@ impl SqliteDelegationStore {
     }
 }
 
+#[cfg(feature = "sqlite")]
 impl DelegationStore for SqliteDelegationStore {
     fn add_delegation(&mut self, record: DelegationRecord) -> Result<()> {
         let conn = self
@@ -490,6 +494,7 @@ impl DelegationStore for SqliteDelegationStore {
     }
 }
 
+#[cfg(feature = "sqlite")]
 fn row_to_delegation(row: &rusqlite::Row<'_>) -> rusqlite::Result<DelegationRecord> {
     let scope_json: String = row.get(3)?;
     let scope: Vec<String> = serde_json::from_str(&scope_json).map_err(|e| {
@@ -576,6 +581,7 @@ mod tests {
         assert_eq!(store.resolve_identity("key3").unwrap(), "key3");
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn test_sqlite_delegation_store_roundtrip() {
         let mut store = SqliteDelegationStore::in_memory().unwrap();
@@ -608,6 +614,7 @@ mod tests {
         assert!(store.is_revoked("deleg-1").unwrap());
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn test_sqlite_succession_resolve() {
         let mut store = SqliteDelegationStore::in_memory().unwrap();

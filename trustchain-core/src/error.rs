@@ -180,6 +180,7 @@ impl TrustChainError {
     }
 }
 
+#[cfg(feature = "sqlite")]
 impl From<rusqlite::Error> for TrustChainError {
     fn from(e: rusqlite::Error) -> Self {
         Self::Storage(e.to_string())

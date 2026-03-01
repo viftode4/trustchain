@@ -16,7 +16,7 @@ default = []
 mcp = ["dep:rmcp", "dep:schemars"]
 
 [dependencies]
-trustchain-core = { workspace = true }
+trustchain-core = { workspace = true, features = ["sqlite"] }
 quinn = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
