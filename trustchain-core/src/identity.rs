@@ -112,7 +112,7 @@ impl Identity {
 
         #[cfg(not(unix))]
         {
-            fs::write(&path, &bytes)
+            fs::write(&path, bytes)
                 .map_err(|e| TrustChainError::Identity(format!("failed to save identity: {e}")))?;
         }
 

@@ -81,15 +81,11 @@ fn bench_block_verify(c: &mut Criterion) {
         Some(1000),
     );
 
-    c.bench_function("block_verify", |b| {
-        b.iter(|| black_box(&block).verify())
-    });
+    c.bench_function("block_verify", |b| b.iter(|| black_box(&block).verify()));
 }
 
 fn bench_identity_generate(c: &mut Criterion) {
-    c.bench_function("identity_generate", |b| {
-        b.iter(|| Identity::generate())
-    });
+    c.bench_function("identity_generate", |b| b.iter(|| Identity::generate()));
 }
 
 criterion_group!(

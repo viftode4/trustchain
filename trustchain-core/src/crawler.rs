@@ -164,7 +164,11 @@ impl<'a, S: BlockStore> BlockStoreCrawler<'a, S> {
 
         for pubkey in &pubkeys {
             let chain = self.store.get_chain(pubkey)?;
-            let short = &pubkey[..8];
+            let short = if pubkey.len() >= 8 {
+                &pubkey[..8]
+            } else {
+                pubkey.as_str()
+            };
 
             let mut expected_seq = 1u64;
             let mut expected_prev = GENESIS_HASH.to_string();
@@ -214,10 +218,9 @@ impl<'a, S: BlockStore> BlockStoreCrawler<'a, S> {
                         }
                     }
                     None => {
-                        report.orphan_proposals.push(format!(
-                            "{short}:{}",
-                            block.sequence_number
-                        ));
+                        report
+                            .orphan_proposals
+                            .push(format!("{short}:{}", block.sequence_number));
                     }
                 }
             }
@@ -245,16 +248,26 @@ mod tests {
         bob_prev: &str,
     ) -> (String, String) {
         let proposal = create_half_block(
-            alice, alice_seq, &bob.pubkey_hex(), 0,
-            alice_prev, BlockType::Proposal,
-            serde_json::json!({"service": "test"}), Some(1000),
+            alice,
+            alice_seq,
+            &bob.pubkey_hex(),
+            0,
+            alice_prev,
+            BlockType::Proposal,
+            serde_json::json!({"service": "test"}),
+            Some(1000),
         );
         store.add_block(&proposal).unwrap();
 
         let agreement = create_half_block(
-            bob, bob_seq, &alice.pubkey_hex(), alice_seq,
-            bob_prev, BlockType::Agreement,
-            serde_json::json!({"service": "test"}), Some(1001),
+            bob,
+            bob_seq,
+            &alice.pubkey_hex(),
+            alice_seq,
+            bob_prev,
+            BlockType::Agreement,
+            serde_json::json!({"service": "test"}),
+            Some(1001),
         );
         store.add_block(&agreement).unwrap();
 
@@ -301,8 +314,14 @@ mod tests {
 
         // Only add the proposal, no agreement.
         let proposal = create_half_block(
-            &alice, 1, &bob.pubkey_hex(), 0, GENESIS_HASH,
-            BlockType::Proposal, serde_json::json!({}), Some(1000),
+            &alice,
+            1,
+            &bob.pubkey_hex(),
+            0,
+            GENESIS_HASH,
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(1000),
         );
         store.add_block(&proposal).unwrap();
 
@@ -335,8 +354,14 @@ mod tests {
         let bob = Identity::from_bytes(&[2u8; 32]);
 
         let proposal = create_half_block(
-            &alice, 1, &bob.pubkey_hex(), 0, GENESIS_HASH,
-            BlockType::Proposal, serde_json::json!({}), Some(1000),
+            &alice,
+            1,
+            &bob.pubkey_hex(),
+            0,
+            GENESIS_HASH,
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(1000),
         );
         store.add_block(&proposal).unwrap();
 
@@ -354,12 +379,9 @@ mod tests {
         let bob = Identity::from_bytes(&[2u8; 32]);
         let charlie = Identity::from_bytes(&[3u8; 32]);
 
-        let (a_hash, _b_hash) = create_full_interaction(
-            &mut store, &alice, &bob, 1, 1, GENESIS_HASH, GENESIS_HASH,
-        );
-        create_full_interaction(
-            &mut store, &alice, &charlie, 2, 1, &a_hash, GENESIS_HASH,
-        );
+        let (a_hash, _b_hash) =
+            create_full_interaction(&mut store, &alice, &bob, 1, 1, GENESIS_HASH, GENESIS_HASH);
+        create_full_interaction(&mut store, &alice, &charlie, 2, 1, &a_hash, GENESIS_HASH);
 
         let crawler = BlockStoreCrawler::new(&store);
         let dag = crawler.build_dag().unwrap();
@@ -378,14 +400,19 @@ mod tests {
         let charlie = Identity::from_bytes(&[3u8; 32]);
 
         // One complete interaction.
-        let (a_hash, _) = create_full_interaction(
-            &mut store, &alice, &bob, 1, 1, GENESIS_HASH, GENESIS_HASH,
-        );
+        let (a_hash, _) =
+            create_full_interaction(&mut store, &alice, &bob, 1, 1, GENESIS_HASH, GENESIS_HASH);
 
         // One orphan proposal.
         let proposal = create_half_block(
-            &alice, 2, &charlie.pubkey_hex(), 0, &a_hash,
-            BlockType::Proposal, serde_json::json!({}), Some(1002),
+            &alice,
+            2,
+            &charlie.pubkey_hex(),
+            0,
+            &a_hash,
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(1002),
         );
         store.add_block(&proposal).unwrap();
 
@@ -395,5 +422,142 @@ mod tests {
         assert_eq!(dag.cross_links.len(), 1);
         assert_eq!(dag.orphan_proposals.len(), 1);
         assert_eq!(dag.entanglement_ratio(), 1.0); // 1 verified out of 1
+    }
+
+    #[test]
+    fn test_detect_tampering_bad_sig() {
+        let mut store = MemoryBlockStore::new();
+        let alice = Identity::from_bytes(&[1u8; 32]);
+        let bob = Identity::from_bytes(&[2u8; 32]);
+
+        // Create a valid first block.
+        let b1 = create_half_block(
+            &alice,
+            1,
+            &bob.pubkey_hex(),
+            0,
+            GENESIS_HASH,
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(1000),
+        );
+        store.add_block(&b1).unwrap();
+
+        // Create a block with a corrupted signature at seq 3.
+        let b2 = create_half_block(
+            &alice,
+            2,
+            &bob.pubkey_hex(),
+            0,
+            &b1.block_hash,
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(1001),
+        );
+        store.add_block(&b2).unwrap();
+
+        let mut b3 = create_half_block(
+            &alice,
+            3,
+            &bob.pubkey_hex(),
+            0,
+            &b2.block_hash,
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(1002),
+        );
+        // Corrupt the signature.
+        b3.signature = "ff".repeat(64);
+        store.add_block(&b3).unwrap();
+
+        let crawler = BlockStoreCrawler::new(&store);
+        let report = crawler.detect_tampering().unwrap();
+        assert!(
+            !report.signature_failures.is_empty(),
+            "should detect bad signature"
+        );
+        assert!(report
+            .signature_failures
+            .iter()
+            .any(|s| s.contains("seq 3")));
+    }
+
+    #[test]
+    fn test_detect_tampering_broken_hash() {
+        let mut store = MemoryBlockStore::new();
+        let alice = Identity::from_bytes(&[1u8; 32]);
+        let bob = Identity::from_bytes(&[2u8; 32]);
+
+        let b1 = create_half_block(
+            &alice,
+            1,
+            &bob.pubkey_hex(),
+            0,
+            GENESIS_HASH,
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(1000),
+        );
+        store.add_block(&b1).unwrap();
+
+        // Block at seq 2 with wrong previous_hash.
+        let b2 = create_half_block(
+            &alice,
+            2,
+            &bob.pubkey_hex(),
+            0,
+            &"aa".repeat(32),
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(1001),
+        );
+        store.add_block(&b2).unwrap();
+
+        let crawler = BlockStoreCrawler::new(&store);
+        let report = crawler.detect_tampering().unwrap();
+        assert!(!report.hash_breaks.is_empty(), "should detect hash break");
+        assert!(report.hash_breaks.iter().any(|s| s.contains("seq 2")));
+    }
+
+    #[test]
+    fn test_detect_tampering_short_pubkey() {
+        // A block with a very short pubkey should not panic in detect_tampering.
+        let mut store = MemoryBlockStore::new();
+        let alice = Identity::from_bytes(&[1u8; 32]);
+        let bob = Identity::from_bytes(&[2u8; 32]);
+
+        // Add a valid block first so the crawler has something.
+        let b1 = create_half_block(
+            &alice,
+            1,
+            &bob.pubkey_hex(),
+            0,
+            GENESIS_HASH,
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(1000),
+        );
+        store.add_block(&b1).unwrap();
+
+        // Manually insert a block with a 4-char pubkey via a raw HalfBlock.
+        let short_block = crate::halfblock::HalfBlock {
+            public_key: "abcd".to_string(),
+            sequence_number: 1,
+            link_public_key: bob.pubkey_hex(),
+            link_sequence_number: 0,
+            previous_hash: GENESIS_HASH.to_string(),
+            signature: "ff".repeat(64),
+            block_type: "proposal".to_string(),
+            transaction: serde_json::json!({}),
+            block_hash: "dd".repeat(32),
+            timestamp: 1000,
+        };
+        store.add_block(&short_block).unwrap();
+
+        let crawler = BlockStoreCrawler::new(&store);
+        // Should not panic — the short pubkey display guard handles it.
+        let report = crawler.detect_tampering().unwrap();
+        // The short pubkey chain will have issues but should not crash.
+        assert!(report.issue_count() > 0);
     }
 }

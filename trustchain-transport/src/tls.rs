@@ -65,10 +65,8 @@ pub fn generate_self_signed_cert(
     let mut pubkey_bytes = [0u8; 32];
     pubkey_bytes.copy_from_slice(&pubkey_bytes_vec);
 
-    let mut params = CertificateParams::new(vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-    ])?;
+    let mut params =
+        CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
     params.distinguished_name.push(
         rcgen::DnType::CommonName,
         format!("TrustChain Node {}", &trustchain_pubkey_hex[..16]),
@@ -162,11 +160,9 @@ impl PubkeyVerifier {
     pub fn new(expected_pubkey_hex: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let bytes = hex::decode(expected_pubkey_hex)?;
         if bytes.len() != 32 {
-            return Err(format!(
-                "expected 32-byte Ed25519 pubkey, got {} bytes",
-                bytes.len()
-            )
-            .into());
+            return Err(
+                format!("expected 32-byte Ed25519 pubkey, got {} bytes", bytes.len()).into(),
+            );
         }
         let mut expected_pubkey = [0u8; 32];
         expected_pubkey.copy_from_slice(&bytes);
@@ -410,9 +406,7 @@ fn encode_der_length(buf: &mut Vec<u8>, len: usize) {
 
 /// Find the first occurrence of `needle` within `haystack`, returning the start index.
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// If the byte slice starts with a DER BOOLEAN (`01 01 xx`), return the slice
@@ -523,7 +517,10 @@ mod tests {
     #[test]
     fn test_generate_cert_rejects_wrong_length_pubkey() {
         let result = generate_self_signed_cert("aabb");
-        assert!(result.is_err(), "should reject a pubkey that is not 32 bytes");
+        assert!(
+            result.is_err(),
+            "should reject a pubkey that is not 32 bytes"
+        );
     }
 
     // --- PubkeyVerifier construction ---
@@ -599,10 +596,7 @@ mod tests {
         let now = rustls::pki_types::UnixTime::now();
 
         let result = verifier.verify_server_cert(&certs[0], &[], &server_name, &[], now);
-        assert!(
-            result.is_err(),
-            "pinning must fail when pubkeys differ"
-        );
+        assert!(result.is_err(), "pinning must fail when pubkeys differ");
         // The error message must mention mismatch for clear diagnostics.
         let err_str = format!("{:?}", result.unwrap_err());
         assert!(

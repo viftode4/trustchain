@@ -40,6 +40,12 @@ pub struct WasmIdentity {
     inner: CoreIdentity,
 }
 
+impl Default for WasmIdentity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[wasm_bindgen]
 impl WasmIdentity {
     /// Generate a new random identity.
@@ -53,8 +59,8 @@ impl WasmIdentity {
     /// Create from raw 32-byte private key (as hex string).
     #[wasm_bindgen(js_name = fromHex)]
     pub fn from_hex(secret_hex: &str) -> Result<WasmIdentity, JsValue> {
-        let bytes = hex::decode(secret_hex)
-            .map_err(|e| JsValue::from_str(&format!("invalid hex: {e}")))?;
+        let bytes =
+            hex::decode(secret_hex).map_err(|e| JsValue::from_str(&format!("invalid hex: {e}")))?;
         if bytes.len() != 32 {
             return Err(JsValue::from_str("secret key must be 32 bytes"));
         }
@@ -106,6 +112,7 @@ pub struct WasmBlock;
 impl WasmBlock {
     /// Create a half-block and return it as JSON.
     #[wasm_bindgen(js_name = createBlock)]
+    #[allow(clippy::too_many_arguments)]
     pub fn create_block(
         identity_hex: &str,
         seq: u64,
@@ -123,7 +130,13 @@ impl WasmBlock {
             .map_err(|e| JsValue::from_str(&format!("invalid transaction JSON: {e}")))?;
 
         let block = create_half_block(
-            &identity, seq, link_pubkey, link_seq, prev_hash, bt, tx,
+            &identity,
+            seq,
+            link_pubkey,
+            link_seq,
+            prev_hash,
+            bt,
+            tx,
             Some(timestamp),
         );
 
@@ -154,16 +167,19 @@ pub struct WasmProtocol {
     protocol: TrustChainProtocol<MemoryBlockStore>,
 }
 
+impl Default for WasmProtocol {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[wasm_bindgen]
 impl WasmProtocol {
     /// Create a new protocol instance with a random identity.
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
         Self {
-            protocol: TrustChainProtocol::new(
-                CoreIdentity::generate(),
-                MemoryBlockStore::new(),
-            ),
+            protocol: TrustChainProtocol::new(CoreIdentity::generate(), MemoryBlockStore::new()),
         }
     }
 

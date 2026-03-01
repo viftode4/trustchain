@@ -8,19 +8,16 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use trustchain_core::{
-    BlockStore, Identity, MemoryBlockStore, TrustChainProtocol,
     halfblock::{create_half_block, validate_and_record},
-    types::{BlockType, GENESIS_HASH, ValidationResult},
     netflow::NetFlowTrust,
+    types::{BlockType, ValidationResult, GENESIS_HASH},
+    BlockStore, Identity, MemoryBlockStore, TrustChainProtocol,
 };
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 fn make_protocol(seed: u8) -> TrustChainProtocol<MemoryBlockStore> {
-    TrustChainProtocol::new(
-        Identity::from_bytes(&[seed; 32]),
-        MemoryBlockStore::new(),
-    )
+    TrustChainProtocol::new(Identity::from_bytes(&[seed; 32]), MemoryBlockStore::new())
 }
 
 // ─── Test 1: sequential high-volume bilateral interactions ───────────────────
@@ -28,13 +25,13 @@ fn make_protocol(seed: u8) -> TrustChainProtocol<MemoryBlockStore> {
 #[tokio::test]
 async fn stress_sequential_100_interactions() {
     let mut alice = make_protocol(1);
-    let mut bob   = make_protocol(2);
+    let mut bob = make_protocol(2);
     let bob_pk = bob.pubkey();
     let alice_pk = alice.pubkey();
 
     for i in 1..=100u64 {
         let tx = serde_json::json!({"round": i, "service": "compute"});
-        let proposal  = alice.create_proposal(&bob_pk, tx, None).unwrap();
+        let proposal = alice.create_proposal(&bob_pk, tx, None).unwrap();
         bob.receive_proposal(&proposal).unwrap();
         let agreement = bob.create_agreement(&proposal, None).unwrap();
         alice.receive_agreement(&agreement).unwrap();
@@ -42,7 +39,7 @@ async fn stress_sequential_100_interactions() {
 
     // Every interaction should produce 2 blocks in each chain.
     assert_eq!(alice.store().get_latest_seq(&alice_pk).unwrap(), 100);
-    assert_eq!(bob.store().get_latest_seq(&bob_pk).unwrap(),     100);
+    assert_eq!(bob.store().get_latest_seq(&bob_pk).unwrap(), 100);
 
     // Verify chain hash links are all intact.
     let alice_chain = alice.store().get_chain(&alice_pk).unwrap();
@@ -84,20 +81,28 @@ async fn stress_concurrent_proposals_shared_lock() {
     }
 
     let mut successes = 0;
-    let mut failures  = 0;
+    let mut failures = 0;
     for handle in handles {
         match handle.await.unwrap() {
-            Ok(_)  => successes += 1,
-            Err(e) => { eprintln!("proposal failed: {e}"); failures += 1; }
+            Ok(_) => successes += 1,
+            Err(e) => {
+                eprintln!("proposal failed: {e}");
+                failures += 1;
+            }
         }
     }
 
     // All 50 should succeed — the mutex serializes them, no duplicate seqs.
     assert_eq!(successes, 50, "expected 50 successful proposals");
-    assert_eq!(failures,   0, "expected 0 failures");
+    assert_eq!(failures, 0, "expected 0 failures");
 
     let alice_pk = Identity::from_bytes(&[10; 32]).pubkey_hex();
-    let seq = alice.lock().await.store().get_latest_seq(&alice_pk).unwrap();
+    let seq = alice
+        .lock()
+        .await
+        .store()
+        .get_latest_seq(&alice_pk)
+        .unwrap();
     assert_eq!(seq, 50, "chain should have exactly 50 blocks");
 }
 
@@ -106,18 +111,23 @@ async fn stress_concurrent_proposals_shared_lock() {
 #[tokio::test]
 async fn stress_duplicate_proposal_idempotent() {
     let mut alice = make_protocol(1);
-    let mut bob   = make_protocol(2);
+    let mut bob = make_protocol(2);
     let bob_pk = bob.pubkey();
 
-    let proposal = alice.create_proposal(&bob_pk, serde_json::json!({"x": 1}), None).unwrap();
+    let proposal = alice
+        .create_proposal(&bob_pk, serde_json::json!({"x": 1}), None)
+        .unwrap();
 
     // Deliver the same proposal 10 times — should be idempotent.
     for _ in 0..10 {
         bob.receive_proposal(&proposal).unwrap();
     }
 
-    assert_eq!(bob.store().get_latest_seq(&proposal.public_key).unwrap(), 1,
-        "proposal stored once despite 10 deliveries");
+    assert_eq!(
+        bob.store().get_latest_seq(&proposal.public_key).unwrap(),
+        1,
+        "proposal stored once despite 10 deliveries"
+    );
 }
 
 // ─── Test 4: fraud detection under concurrent load ───────────────────────────
@@ -125,7 +135,7 @@ async fn stress_duplicate_proposal_idempotent() {
 #[tokio::test]
 async fn stress_double_sign_detected_under_load() {
     let alice_id = Identity::from_bytes(&[1; 32]);
-    let bob_pk   = Identity::from_bytes(&[2; 32]).pubkey_hex();
+    let bob_pk = Identity::from_bytes(&[2; 32]).pubkey_hex();
 
     let mut store = MemoryBlockStore::new();
 
@@ -133,29 +143,52 @@ async fn stress_double_sign_detected_under_load() {
     let mut prev = GENESIS_HASH.to_string();
     for i in 1u64..=50 {
         let b = create_half_block(
-            &alice_id, i, &bob_pk, 0, &prev,
-            BlockType::Proposal, serde_json::json!({"i": i}), Some(i * 1000),
+            &alice_id,
+            i,
+            &bob_pk,
+            0,
+            &prev,
+            BlockType::Proposal,
+            serde_json::json!({"i": i}),
+            Some(i * 1000),
         );
         let result = validate_and_record(&b, &mut store);
-        assert!(!matches!(result, ValidationResult::Invalid(_)),
-            "legitimate block {i} failed validation");
+        assert!(
+            !matches!(result, ValidationResult::Invalid(_)),
+            "legitimate block {i} failed validation"
+        );
         prev = b.block_hash.clone();
         store.add_block(&b).unwrap();
     }
 
     // Now inject a double-sign at seq 25 (different transaction).
-    let prev_of_25 = store.get_block(&alice_id.pubkey_hex(), 24).unwrap().unwrap().block_hash;
+    let prev_of_25 = store
+        .get_block(&alice_id.pubkey_hex(), 24)
+        .unwrap()
+        .unwrap()
+        .block_hash;
     let fraud_block = create_half_block(
-        &alice_id, 25, &bob_pk, 0, &prev_of_25,
-        BlockType::Proposal, serde_json::json!({"fraud": true}), Some(25_000),
+        &alice_id,
+        25,
+        &bob_pk,
+        0,
+        &prev_of_25,
+        BlockType::Proposal,
+        serde_json::json!({"fraud": true}),
+        Some(25_000),
     );
     let result = validate_and_record(&fraud_block, &mut store);
 
-    assert!(matches!(result, ValidationResult::Invalid(_)),
-        "fraud block should be detected as invalid");
+    assert!(
+        matches!(result, ValidationResult::Invalid(_)),
+        "fraud block should be detected as invalid"
+    );
     if let ValidationResult::Invalid(ref errors) = result {
-        assert!(errors.iter().any(|e| e.contains("Double sign")),
-            "expected double sign error, got: {:?}", errors);
+        assert!(
+            errors.iter().any(|e| e.contains("Double sign")),
+            "expected double sign error, got: {:?}",
+            errors
+        );
     }
 
     let frauds = store.get_double_spends(&alice_id.pubkey_hex()).unwrap();
@@ -196,7 +229,10 @@ async fn stress_multi_party_chain_integrity() {
     for (idx, proto) in protos.iter().enumerate() {
         let pk = Identity::from_bytes(&[idx as u8; 32]).pubkey_hex();
         let seq = proto.store().get_latest_seq(&pk).unwrap();
-        assert_eq!(seq, 10, "agent {idx} should have seq=10 (5 rounds × 2 blocks), got {seq}");
+        assert_eq!(
+            seq, 10,
+            "agent {idx} should have seq=10 (5 rounds × 2 blocks), got {seq}"
+        );
 
         let chain = proto.store().get_chain(&pk).unwrap();
         for window in chain.windows(2) {
@@ -214,20 +250,32 @@ async fn stress_multi_party_chain_integrity() {
 #[test]
 fn stress_netflow_sybil_resistance_at_scale() {
     let mut store = MemoryBlockStore::new();
-    let seed   = Identity::from_bytes(&[1; 32]);
+    let seed = Identity::from_bytes(&[1; 32]);
     let honest = Identity::from_bytes(&[2; 32]);
 
     // Seed and honest agent do 10 real interactions.
-    let mut s_prev  = GENESIS_HASH.to_string();
-    let mut h_prev  = GENESIS_HASH.to_string();
+    let mut s_prev = GENESIS_HASH.to_string();
+    let mut h_prev = GENESIS_HASH.to_string();
     for i in 1u64..=10 {
         let p = create_half_block(
-            &seed, i, &honest.pubkey_hex(), 0, &s_prev,
-            BlockType::Proposal, serde_json::json!({}), Some(i * 1000),
+            &seed,
+            i,
+            &honest.pubkey_hex(),
+            0,
+            &s_prev,
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(i * 1000),
         );
         let a = create_half_block(
-            &honest, i, &seed.pubkey_hex(), i, &h_prev,
-            BlockType::Agreement, serde_json::json!({}), Some(i * 1001),
+            &honest,
+            i,
+            &seed.pubkey_hex(),
+            i,
+            &h_prev,
+            BlockType::Agreement,
+            serde_json::json!({}),
+            Some(i * 1001),
         );
         s_prev = p.block_hash.clone();
         h_prev = a.block_hash.clone();
@@ -237,7 +285,9 @@ fn stress_netflow_sybil_resistance_at_scale() {
 
     // Create a Sybil cluster of 20 agents with many mutual interactions but
     // zero connection to the seed.
-    let sybils: Vec<Identity> = (100u8..120).map(|s| Identity::from_bytes(&[s; 32])).collect();
+    let sybils: Vec<Identity> = (100u8..120)
+        .map(|s| Identity::from_bytes(&[s; 32]))
+        .collect();
     let mut sybil_prevs: Vec<String> = vec![GENESIS_HASH.to_string(); 20];
     // Track per-agent sequence numbers (each agent accumulates blocks as both proposer and responder).
     let mut sybil_seqs: Vec<u64> = vec![0u64; 20];
@@ -248,16 +298,28 @@ fn stress_netflow_sybil_resistance_at_scale() {
             sybil_seqs[i] += 1;
             let p_seq = sybil_seqs[i];
             let p = create_half_block(
-                &sybils[i], p_seq, &sybils[j].pubkey_hex(), 0, &sybil_prevs[i],
-                BlockType::Proposal, serde_json::json!({"round": round}), Some(round * 1000 + i as u64),
+                &sybils[i],
+                p_seq,
+                &sybils[j].pubkey_hex(),
+                0,
+                &sybil_prevs[i],
+                BlockType::Proposal,
+                serde_json::json!({"round": round}),
+                Some(round * 1000 + i as u64),
             );
             let p_hash = p.block_hash.clone();
 
             sybil_seqs[j] += 1;
             let a_seq = sybil_seqs[j];
             let a = create_half_block(
-                &sybils[j], a_seq, &sybils[i].pubkey_hex(), p_seq, &sybil_prevs[j],
-                BlockType::Agreement, serde_json::json!({"round": round}), Some(round * 1000 + i as u64 + 1),
+                &sybils[j],
+                a_seq,
+                &sybils[i].pubkey_hex(),
+                p_seq,
+                &sybil_prevs[j],
+                BlockType::Agreement,
+                serde_json::json!({"round": round}),
+                Some(round * 1000 + i as u64 + 1),
             );
             sybil_prevs[i] = p_hash;
             sybil_prevs[j] = a.block_hash.clone();
@@ -268,7 +330,7 @@ fn stress_netflow_sybil_resistance_at_scale() {
 
     let engine = NetFlowTrust::new(&store, vec![seed.pubkey_hex()]).unwrap();
     let honest_score = engine.compute_trust(&honest.pubkey_hex()).unwrap();
-    let sybil_score  = engine.compute_trust(&sybils[0].pubkey_hex()).unwrap();
+    let sybil_score = engine.compute_trust(&sybils[0].pubkey_hex()).unwrap();
 
     println!("honest score: {honest_score:.4}  sybil score: {sybil_score:.4}");
 
@@ -292,7 +354,11 @@ fn stress_netflow_sybil_resistance_at_scale() {
 fn stress_hash_stability_1000_roundtrips() {
     let id = Identity::from_bytes(&[42; 32]);
     let block = create_half_block(
-        &id, 1, &"b".repeat(64), 0, GENESIS_HASH,
+        &id,
+        1,
+        &"b".repeat(64),
+        0,
+        GENESIS_HASH,
         BlockType::Proposal,
         serde_json::json!({"nested": {"key": "val", "num": 3.14, "arr": [1,2,3]}}),
         None,
@@ -305,7 +371,8 @@ fn stress_hash_stability_1000_roundtrips() {
         let json = serde_json::to_string(&current).unwrap();
         let parsed: trustchain_core::HalfBlock = serde_json::from_str(&json).unwrap();
         assert_eq!(
-            original_hash, parsed.compute_hash(),
+            original_hash,
+            parsed.compute_hash(),
             "hash drifted on round-trip {i}"
         );
         current = parsed;
@@ -318,24 +385,36 @@ fn stress_hash_stability_1000_roundtrips() {
 fn stress_cross_link_pubkey_mismatch_rejected() {
     use trustchain_core::halfblock::validate_block;
 
-    let alice_id   = Identity::from_bytes(&[1; 32]);
-    let bob_id     = Identity::from_bytes(&[2; 32]);
+    let alice_id = Identity::from_bytes(&[1; 32]);
+    let bob_id = Identity::from_bytes(&[2; 32]);
     let mallory_id = Identity::from_bytes(&[3; 32]);
 
     let mut store = MemoryBlockStore::new();
 
     // Alice creates a proposal directed at Bob.
     let alice_proposal = create_half_block(
-        &alice_id, 1, &bob_id.pubkey_hex(), 0, GENESIS_HASH,
-        BlockType::Proposal, serde_json::json!({"service": "x"}), Some(1000),
+        &alice_id,
+        1,
+        &bob_id.pubkey_hex(),
+        0,
+        GENESIS_HASH,
+        BlockType::Proposal,
+        serde_json::json!({"service": "x"}),
+        Some(1000),
     );
     store.add_block(&alice_proposal).unwrap();
 
     // Mallory creates a FAKE agreement claiming to be linked to Alice's proposal.
     // Mallory signs it (valid signature) but wrongly claims Alice's proposal links to Mallory.
     let mallory_agreement = create_half_block(
-        &mallory_id, 1, &alice_id.pubkey_hex(), alice_proposal.sequence_number, GENESIS_HASH,
-        BlockType::Agreement, serde_json::json!({"service": "x"}), Some(1001),
+        &mallory_id,
+        1,
+        &alice_id.pubkey_hex(),
+        alice_proposal.sequence_number,
+        GENESIS_HASH,
+        BlockType::Agreement,
+        serde_json::json!({"service": "x"}),
+        Some(1001),
     );
 
     // This must be caught: Alice's proposal points to Bob, not Mallory.
@@ -347,7 +426,8 @@ fn stress_cross_link_pubkey_mismatch_rejected() {
     if let ValidationResult::Invalid(ref errors) = result {
         assert!(
             errors.iter().any(|e| e.contains("Public key mismatch")),
-            "expected pubkey mismatch error, got: {:?}", errors
+            "expected pubkey mismatch error, got: {:?}",
+            errors
         );
     }
 }

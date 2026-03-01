@@ -3,10 +3,10 @@ mod helpers;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::collections::HashMap;
 use std::time::Duration;
-use trustchain_core::{Identity, MemoryBlockStore, TrustEngine, TrustWeights};
+use trustchain_core::{Identity, MemoryBlockStore, TrustEngine};
 
 // ---------------------------------------------------------------------------
-// TrustEngine.compute_trust() — no seeds (integrity + statistical only)
+// TrustEngine.compute_trust() — no seeds (integrity only)
 // ---------------------------------------------------------------------------
 fn bench_trust_engine_no_seeds(c: &mut Criterion) {
     let mut group = c.benchmark_group("trust_engine_no_seeds");
@@ -37,17 +37,12 @@ fn bench_trust_engine_with_seeds(c: &mut Criterion) {
         let (store, seed_pk, spoke_pks) = helpers::build_star_network(n_agents, 3);
         let target = &spoke_pks[spoke_pks.len() / 2];
 
-        group.bench_with_input(
-            BenchmarkId::from_parameter(n_agents),
-            &n_agents,
-            |b, _| {
-                b.iter(|| {
-                    let engine =
-                        TrustEngine::new(&store, Some(vec![seed_pk.clone()]), None, None);
-                    engine.compute_trust(target).unwrap()
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(n_agents), &n_agents, |b, _| {
+            b.iter(|| {
+                let engine = TrustEngine::new(&store, Some(vec![seed_pk.clone()]), None, None);
+                engine.compute_trust(target).unwrap()
+            });
+        });
     }
     group.finish();
 }
@@ -70,27 +65,6 @@ fn bench_trust_engine_large(c: &mut Criterion) {
             engine.compute_trust(&alice_pk).unwrap()
         });
     });
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
-// Statistical score only
-// ---------------------------------------------------------------------------
-fn bench_statistical_score(c: &mut Criterion) {
-    let mut group = c.benchmark_group("statistical_score");
-
-    for &n in &[500, 5_000, 50_000] {
-        let mut store = MemoryBlockStore::new();
-        helpers::build_chain(&mut store, n);
-        let alice_pk = Identity::from_bytes(&[1u8; 32]).pubkey_hex();
-
-        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter(|| {
-                let engine = TrustEngine::new(&store, None, None, None);
-                engine.compute_statistical_score(&alice_pk).unwrap()
-            });
-        });
-    }
     group.finish();
 }
 
@@ -128,29 +102,20 @@ fn bench_chain_integrity_with_checkpoint(c: &mut Criterion) {
             finalized: true,
         };
 
-        group.bench_with_input(
-            BenchmarkId::new("no_checkpoint", n),
-            &n,
-            |b, _| {
-                b.iter(|| {
-                    let engine = TrustEngine::new(&store, None, None, None);
-                    engine.compute_chain_integrity(&alice_pk).unwrap()
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("no_checkpoint", n), &n, |b, _| {
+            b.iter(|| {
+                let engine = TrustEngine::new(&store, None, None, None);
+                engine.compute_chain_integrity(&alice_pk).unwrap()
+            });
+        });
 
         let cp = checkpoint.clone();
-        group.bench_with_input(
-            BenchmarkId::new("checkpoint_90pct", n),
-            &n,
-            |b, _| {
-                b.iter(|| {
-                    let engine = TrustEngine::new(&store, None, None, None)
-                        .with_checkpoint(cp.clone());
-                    engine.compute_chain_integrity(&alice_pk).unwrap()
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("checkpoint_90pct", n), &n, |b, _| {
+            b.iter(|| {
+                let engine = TrustEngine::new(&store, None, None, None).with_checkpoint(cp.clone());
+                engine.compute_chain_integrity(&alice_pk).unwrap()
+            });
+        });
 
         // Also benchmark 99% coverage to see near-total skip.
         let mut chain_heads_99 = HashMap::new();
@@ -164,61 +129,13 @@ fn bench_chain_integrity_with_checkpoint(c: &mut Criterion) {
             finalized: true,
         };
 
-        group.bench_with_input(
-            BenchmarkId::new("checkpoint_99pct", n),
-            &n,
-            |b, _| {
-                b.iter(|| {
-                    let engine = TrustEngine::new(&store, None, None, None)
-                        .with_checkpoint(checkpoint_99.clone());
-                    engine.compute_chain_integrity(&alice_pk).unwrap()
-                });
-            },
-        );
-    }
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
-// Statistical score: no decay vs various half-lives
-// ---------------------------------------------------------------------------
-fn bench_statistical_with_decay(c: &mut Criterion) {
-    let mut group = c.benchmark_group("statistical_with_decay");
-
-    for &n in &[500, 5_000, 50_000] {
-        let mut store = MemoryBlockStore::new();
-        helpers::build_chain(&mut store, n);
-        let alice_pk = Identity::from_bytes(&[1u8; 32]).pubkey_hex();
-
-        group.bench_with_input(
-            BenchmarkId::new("no_decay", n),
-            &n,
-            |b, _| {
-                b.iter(|| {
-                    let engine = TrustEngine::new(&store, None, None, None);
-                    engine.compute_statistical_score(&alice_pk).unwrap()
-                });
-            },
-        );
-
-        for &hl in &[5_000u64, 30_000, 300_000] {
-            let weights = TrustWeights {
-                decay_half_life_ms: Some(hl),
-                ..Default::default()
-            };
-
-            group.bench_with_input(
-                BenchmarkId::new(format!("decay_{hl}ms"), n),
-                &n,
-                |b, _| {
-                    b.iter(|| {
-                        let engine =
-                            TrustEngine::new(&store, None, Some(weights.clone()), None);
-                        engine.compute_statistical_score(&alice_pk).unwrap()
-                    });
-                },
-            );
-        }
+        group.bench_with_input(BenchmarkId::new("checkpoint_99pct", n), &n, |b, _| {
+            b.iter(|| {
+                let engine = TrustEngine::new(&store, None, None, None)
+                    .with_checkpoint(checkpoint_99.clone());
+                engine.compute_chain_integrity(&alice_pk).unwrap()
+            });
+        });
     }
     group.finish();
 }
@@ -228,8 +145,6 @@ criterion_group!(
     bench_trust_engine_no_seeds,
     bench_trust_engine_with_seeds,
     bench_trust_engine_large,
-    bench_statistical_score,
     bench_chain_integrity_with_checkpoint,
-    bench_statistical_with_decay,
 );
 criterion_main!(benches);

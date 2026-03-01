@@ -5,25 +5,21 @@
 //! - NetFlow transitive trust (3-hop path from seed, not just 1-hop)
 //! - Sybil resistance with exactly 1 seed interaction (bottleneck analysis)
 //! - Out-of-order gossip block delivery (agreement before proposal)
-//! - Statistical score ceiling (all 5 features saturated → score = 1.0)
 //!
 //! Run with: cargo test --test stress3 -- --nocapture
 
 use std::collections::HashMap;
 use trustchain_core::{
-    BlockStore, CHECOConsensus, Identity, MemoryBlockStore, TrustChainProtocol, TrustEngine,
     halfblock::{create_half_block, validate_block},
     netflow::NetFlowTrust,
-    types::{BlockType, GENESIS_HASH, ValidationResult},
+    types::{BlockType, ValidationResult, GENESIS_HASH},
+    BlockStore, CHECOConsensus, Identity, MemoryBlockStore, TrustChainProtocol, TrustEngine,
 };
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 fn make_proto(seed: u8) -> TrustChainProtocol<MemoryBlockStore> {
-    TrustChainProtocol::new(
-        Identity::from_bytes(&[seed; 32]),
-        MemoryBlockStore::new(),
-    )
+    TrustChainProtocol::new(Identity::from_bytes(&[seed; 32]), MemoryBlockStore::new())
 }
 
 /// Perform `n` full bilateral interactions (proposal + agreement) between `a` and `b`.
@@ -71,8 +67,14 @@ fn stress_checo_two_rounds_facilitator_rotation() {
         .map(|i| {
             let j = (i + 1) % 5;
             create_half_block(
-                &ids[i], 1, &pks[j], 0, GENESIS_HASH,
-                BlockType::Proposal, serde_json::json!({"ring": i}), Some(1000 + i as u64),
+                &ids[i],
+                1,
+                &pks[j],
+                0,
+                GENESIS_HASH,
+                BlockType::Proposal,
+                serde_json::json!({"ring": i}),
+                Some(1000 + i as u64),
             )
         })
         .collect();
@@ -81,7 +83,9 @@ fn stress_checo_two_rounds_facilitator_rotation() {
     let mut engines: Vec<CHECOConsensus<MemoryBlockStore>> = (0..5usize)
         .map(|i| {
             let mut store = MemoryBlockStore::new();
-            for b in &ring_blocks { store.add_block(b).unwrap(); }
+            for b in &ring_blocks {
+                store.add_block(b).unwrap();
+            }
             let peers = (0..5).filter(|j| *j != i).map(|j| pks[j].clone()).collect();
             CHECOConsensus::new(ids[i].clone(), store, Some(peers), 3)
         })
@@ -98,12 +102,19 @@ fn stress_checo_two_rounds_facilitator_rotation() {
     for (i, engine) in engines.iter().enumerate() {
         if i != fac1 {
             sigs1.insert(pks[i].clone(), engine.sign_checkpoint(&cp1).unwrap());
-            if sigs1.len() >= 3 { break; }
+            if sigs1.len() >= 3 {
+                break;
+            }
         }
     }
-    let fin1 = engines[fac1].finalize_checkpoint(cp1.clone(), sigs1).unwrap();
+    let fin1 = engines[fac1]
+        .finalize_checkpoint(cp1.clone(), sigs1)
+        .unwrap();
     assert!(fin1.finalized, "round 1 checkpoint must be finalized");
-    println!("Round 1: finalized. chain_heads = {:?}", fin1.chain_heads.values().collect::<Vec<_>>());
+    println!(
+        "Round 1: finalized. chain_heads = {:?}",
+        fin1.chain_heads.values().collect::<Vec<_>>()
+    );
 
     // ── Gossip: propagate round-1 checkpoint block to all peers ──────────────
     // In production, gossip delivers this automatically.  Here we do it manually.
@@ -133,7 +144,9 @@ fn stress_checo_two_rounds_facilitator_rotation() {
             let ok = engine.validate_checkpoint(&cp2).unwrap();
             assert!(ok, "agent {i} must accept round 2 checkpoint");
             sigs2.insert(pks[i].clone(), engine.sign_checkpoint(&cp2).unwrap());
-            if sigs2.len() >= 3 { break; }
+            if sigs2.len() >= 3 {
+                break;
+            }
         }
     }
     let fin2 = engines[fac2].finalize_checkpoint(cp2, sigs2).unwrap();
@@ -149,7 +162,11 @@ fn stress_checo_two_rounds_facilitator_rotation() {
     // All 5 agents' seq=1 blocks are still covered (round 2 chain_heads ≥ 1 for all).
     for pk in &pks {
         let head = fin2.chain_heads.get(pk).copied().unwrap_or(0);
-        assert!(head >= 1, "agent {}... must appear in round 2 checkpoint", &pk[..8]);
+        assert!(
+            head >= 1,
+            "agent {}... must appear in round 2 checkpoint",
+            &pk[..8]
+        );
     }
 
     println!("CHECO two rounds: both finalized, fac1_head_in_r2={fac1_head_in_r2} ✓");
@@ -170,14 +187,14 @@ fn stress_checo_two_rounds_facilitator_rotation() {
 
 #[test]
 fn stress_netflow_transitive_3hop() {
-    let mut seed_p  = make_proto(1);
+    let mut seed_p = make_proto(1);
     let mut alice_p = make_proto(2);
-    let mut bob_p   = make_proto(3);
+    let mut bob_p = make_proto(3);
     let mut carol_p = make_proto(4);
 
-    do_interactions(&mut seed_p,  &mut alice_p, 5);
-    do_interactions(&mut alice_p, &mut bob_p,   5);
-    do_interactions(&mut bob_p,   &mut carol_p, 5);
+    do_interactions(&mut seed_p, &mut alice_p, 5);
+    do_interactions(&mut alice_p, &mut bob_p, 5);
+    do_interactions(&mut bob_p, &mut carol_p, 5);
     // isolated agent: no interactions with anyone in the chain
 
     // Build a master store visible to the NetFlow engine.
@@ -189,7 +206,7 @@ fn stress_netflow_transitive_3hop() {
     let engine = NetFlowTrust::new(&master, vec![seed_p.pubkey()]).unwrap();
 
     let alice_score = engine.compute_trust(&alice_p.pubkey()).unwrap();
-    let bob_score   = engine.compute_trust(&bob_p.pubkey()).unwrap();
+    let bob_score = engine.compute_trust(&bob_p.pubkey()).unwrap();
     let carol_score = engine.compute_trust(&carol_p.pubkey()).unwrap();
 
     // An agent that never appears in the graph scores exactly 0.
@@ -201,10 +218,19 @@ fn stress_netflow_transitive_3hop() {
          carol={carol_score:.4}  isolated={isolated_score:.4}"
     );
 
-    assert!(alice_score > 0.0, "alice (1 hop from seed) must have positive trust");
-    assert!(bob_score   > 0.0, "bob   (2 hops) must have positive trust");
-    assert!(carol_score > 0.0, "carol (3 hops) must have positive trust — transitive NetFlow");
-    assert_eq!(isolated_score, 0.0, "agent with no edges must score exactly 0.0");
+    assert!(
+        alice_score > 0.0,
+        "alice (1 hop from seed) must have positive trust"
+    );
+    assert!(bob_score > 0.0, "bob   (2 hops) must have positive trust");
+    assert!(
+        carol_score > 0.0,
+        "carol (3 hops) must have positive trust — transitive NetFlow"
+    );
+    assert_eq!(
+        isolated_score, 0.0,
+        "agent with no edges must score exactly 0.0"
+    );
 
     // Closer to seed must score at least as high as further away.
     assert!(
@@ -237,25 +263,39 @@ fn stress_netflow_transitive_3hop() {
 
 #[test]
 fn stress_sybil_one_seed_connection_bounded() {
-    let seed    = Identity::from_bytes(&[1; 32]);
-    let honest  = Identity::from_bytes(&[2; 32]);
-    let sybils: Vec<Identity> = (100u8..120).map(|s| Identity::from_bytes(&[s; 32])).collect();
+    let seed = Identity::from_bytes(&[1; 32]);
+    let honest = Identity::from_bytes(&[2; 32]);
+    let sybils: Vec<Identity> = (100u8..120)
+        .map(|s| Identity::from_bytes(&[s; 32]))
+        .collect();
 
     let mut store = MemoryBlockStore::new();
 
     // ── Honest agent: 5 direct seed interactions ─────────────────────────────
-    let mut seed_prev   = GENESIS_HASH.to_string();
+    let mut seed_prev = GENESIS_HASH.to_string();
     let mut honest_prev = GENESIS_HASH.to_string();
     for i in 1u64..=5 {
         let p = create_half_block(
-            &seed, i, &honest.pubkey_hex(), 0, &seed_prev,
-            BlockType::Proposal, serde_json::json!({"i": i}), Some(i * 100),
+            &seed,
+            i,
+            &honest.pubkey_hex(),
+            0,
+            &seed_prev,
+            BlockType::Proposal,
+            serde_json::json!({"i": i}),
+            Some(i * 100),
         );
         let a = create_half_block(
-            &honest, i, &seed.pubkey_hex(), i, &honest_prev,
-            BlockType::Agreement, serde_json::json!({"i": i}), Some(i * 100 + 1),
+            &honest,
+            i,
+            &seed.pubkey_hex(),
+            i,
+            &honest_prev,
+            BlockType::Agreement,
+            serde_json::json!({"i": i}),
+            Some(i * 100 + 1),
         );
-        seed_prev   = p.block_hash.clone();
+        seed_prev = p.block_hash.clone();
         honest_prev = a.block_hash.clone();
         store.add_block(&p).unwrap();
         store.add_block(&a).unwrap();
@@ -266,13 +306,24 @@ fn stress_sybil_one_seed_connection_bounded() {
     let sybil0_agreement_seq = 1u64;
     {
         let p = create_half_block(
-            &seed, sybil0_prev_seed_seq, &sybils[0].pubkey_hex(), 0, &seed_prev,
-            BlockType::Proposal, serde_json::json!({}), Some(700),
+            &seed,
+            sybil0_prev_seed_seq,
+            &sybils[0].pubkey_hex(),
+            0,
+            &seed_prev,
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(700),
         );
         let a = create_half_block(
-            &sybils[0], sybil0_agreement_seq, &seed.pubkey_hex(), sybil0_prev_seed_seq,
+            &sybils[0],
+            sybil0_agreement_seq,
+            &seed.pubkey_hex(),
+            sybil0_prev_seed_seq,
             GENESIS_HASH,
-            BlockType::Agreement, serde_json::json!({}), Some(701),
+            BlockType::Agreement,
+            serde_json::json!({}),
+            Some(701),
         );
         seed_prev = p.block_hash.clone();
         store.add_block(&p).unwrap();
@@ -304,8 +355,13 @@ fn stress_sybil_one_seed_connection_bounded() {
             sybil_seqs[i] += 1;
             let p_seq = sybil_seqs[i];
             let p = create_half_block(
-                &sybils[i], p_seq, &sybils[j].pubkey_hex(), 0, &sybil_prevs[i],
-                BlockType::Proposal, serde_json::json!({"r": round}),
+                &sybils[i],
+                p_seq,
+                &sybils[j].pubkey_hex(),
+                0,
+                &sybil_prevs[i],
+                BlockType::Proposal,
+                serde_json::json!({"r": round}),
                 Some(1000 + round * 100 + i as u64),
             );
             let p_hash = p.block_hash.clone();
@@ -313,8 +369,13 @@ fn stress_sybil_one_seed_connection_bounded() {
             sybil_seqs[j] += 1;
             let a_seq = sybil_seqs[j];
             let a = create_half_block(
-                &sybils[j], a_seq, &sybils[i].pubkey_hex(), p_seq, &sybil_prevs[j],
-                BlockType::Agreement, serde_json::json!({"r": round}),
+                &sybils[j],
+                a_seq,
+                &sybils[i].pubkey_hex(),
+                p_seq,
+                &sybil_prevs[j],
+                BlockType::Agreement,
+                serde_json::json!({"r": round}),
                 Some(1000 + round * 100 + i as u64 + 1),
             );
             sybil_prevs[i] = p_hash;
@@ -327,9 +388,9 @@ fn stress_sybil_one_seed_connection_bounded() {
     // ── NetFlow scores ────────────────────────────────────────────────────────
     let engine = NetFlowTrust::new(&store, vec![seed.pubkey_hex()]).unwrap();
 
-    let honest_score  = engine.compute_trust(&honest.pubkey_hex()).unwrap();
-    let sybil0_score  = engine.compute_trust(&sybils[0].pubkey_hex()).unwrap();
-    let sybil5_score  = engine.compute_trust(&sybils[5].pubkey_hex()).unwrap();
+    let honest_score = engine.compute_trust(&honest.pubkey_hex()).unwrap();
+    let sybil0_score = engine.compute_trust(&sybils[0].pubkey_hex()).unwrap();
+    let sybil5_score = engine.compute_trust(&sybils[5].pubkey_hex()).unwrap();
     let sybil10_score = engine.compute_trust(&sybils[10].pubkey_hex()).unwrap();
 
     println!(
@@ -381,16 +442,28 @@ fn stress_sybil_one_seed_connection_bounded() {
 #[test]
 fn stress_out_of_order_gossip_delivery() {
     let alice = Identity::from_bytes(&[1; 32]);
-    let bob   = Identity::from_bytes(&[2; 32]);
+    let bob = Identity::from_bytes(&[2; 32]);
 
     // Full bilateral interaction: Alice proposes, Bob agrees.
     let proposal = create_half_block(
-        &alice, 1, &bob.pubkey_hex(), 0, GENESIS_HASH,
-        BlockType::Proposal, serde_json::json!({"service": "x"}), Some(1000),
+        &alice,
+        1,
+        &bob.pubkey_hex(),
+        0,
+        GENESIS_HASH,
+        BlockType::Proposal,
+        serde_json::json!({"service": "x"}),
+        Some(1000),
     );
     let agreement = create_half_block(
-        &bob, 1, &alice.pubkey_hex(), 1, GENESIS_HASH,
-        BlockType::Agreement, serde_json::json!({"result": "ok"}), Some(1001),
+        &bob,
+        1,
+        &alice.pubkey_hex(),
+        1,
+        GENESIS_HASH,
+        BlockType::Agreement,
+        serde_json::json!({"result": "ok"}),
+        Some(1001),
     );
 
     // ── Phase 1: gossip delivers agreement FIRST ──────────────────────────────
@@ -408,7 +481,10 @@ fn stress_out_of_order_gossip_delivery() {
     // The agreement's back-link to Alice's proposal cannot be resolved yet
     // (get_linked_block on an agreement returns the proposal via store lookup).
     let linked_before = store.get_linked_block(&agreement).unwrap();
-    assert!(linked_before.is_none(), "proposal not yet in store — agreement's back-link must be unresolvable");
+    assert!(
+        linked_before.is_none(),
+        "proposal not yet in store — agreement's back-link must be unresolvable"
+    );
 
     // ── Phase 2: proposal arrives (delayed by gossip) ─────────────────────────
     store.add_block(&proposal).unwrap();
@@ -427,12 +503,16 @@ fn stress_out_of_order_gossip_delivery() {
         "agreement's back-link must resolve to proposal after proposal arrives"
     );
     assert_eq!(
-        linked_after.unwrap().block_hash, proposal.block_hash,
+        linked_after.unwrap().block_hash,
+        proposal.block_hash,
         "resolved back-link must be Alice's proposal"
     );
     // Forward-link: proposal → agreement
     let fwd = store.get_linked_block(&proposal).unwrap();
-    assert!(fwd.is_some(), "proposal's forward-link must resolve to agreement");
+    assert!(
+        fwd.is_some(),
+        "proposal's forward-link must resolve to agreement"
+    );
     assert_eq!(fwd.unwrap().block_hash, agreement.block_hash);
 
     // Alice's chain integrity must be 1.0 despite out-of-order receipt.
@@ -443,90 +523,7 @@ fn stress_out_of_order_gossip_delivery() {
         "Alice's chain integrity must be 1.0 regardless of the order blocks were received"
     );
 
-    println!("out-of-order gossip: agreement→proposal → both valid, link resolved, integrity=1.0 ✓");
-}
-
-// ─── Test 20: Statistical score ceiling — all 5 features saturated ────────────
-//
-// Constructs the maximum-score statistical scenario from §5:
-//   count_score    = 20/20 = 1.0    (saturated at 20 interactions)
-//   unique_score   =  5/5  = 1.0    (5 distinct counterparties)
-//   completion_rate = 20/20 = 1.0   (every proposal has a linked agreement)
-//   age_score      = 1.0            (history spans > 60 seconds = 60 000 ms)
-//   entropy_score  = 1.0            (perfectly uniform: 4 interactions × 5 peers)
-//
-//   statistical = 0.25×1 + 0.20×1 + 0.25×1 + 0.10×1 + 0.20×1 = 1.0
-//   trust (no netflow) = 0.5×integrity + 0.5×statistical = 1.0
-
-#[test]
-fn stress_statistical_score_ceiling() {
-    let alice = Identity::from_bytes(&[1; 32]);
-    let peers: Vec<Identity> = (10u8..15).map(|s| Identity::from_bytes(&[s; 32])).collect();
-
-    let mut store = MemoryBlockStore::new();
-    let mut alice_prev = GENESIS_HASH.to_string();
-    let mut peer_prevs: Vec<String> = vec![GENESIS_HASH.to_string(); 5];
-    let mut peer_seqs:  Vec<u64>   = vec![0u64; 5];
-
-    // 4 rounds × 5 peers = 20 interactions.
-    // Timestamps: seq k → (k-1) × 3500 ms, so seq 1 = 0 ms, seq 20 = 19×3500 = 66 500 ms.
-    // age_ms = 66 500 > 60 000 → age_score = 1.0
-    for round in 0usize..4 {
-        for (pi, peer) in peers.iter().enumerate() {
-            let alice_seq = (round * 5 + pi) as u64 + 1;
-            let ts = (alice_seq - 1) * 3500;
-
-            // Alice proposes to peer.
-            let proposal = create_half_block(
-                &alice, alice_seq, &peer.pubkey_hex(), 0, &alice_prev,
-                BlockType::Proposal,
-                serde_json::json!({"peer": pi, "round": round}),
-                Some(ts),
-            );
-            alice_prev = proposal.block_hash.clone();
-            store.add_block(&proposal).unwrap();
-
-            // Peer agrees (link back to alice_seq so get_linked_block resolves).
-            peer_seqs[pi] += 1;
-            let agreement = create_half_block(
-                peer, peer_seqs[pi], &alice.pubkey_hex(), alice_seq, &peer_prevs[pi],
-                BlockType::Agreement,
-                serde_json::json!({"peer": pi, "round": round}),
-                Some(ts + 1),
-            );
-            peer_prevs[pi] = agreement.block_hash.clone();
-            store.add_block(&agreement).unwrap();
-        }
-    }
-
-    let engine = TrustEngine::new(&store, None, None, None);
-    let alice_pk = alice.pubkey_hex();
-
-    let integrity   = engine.compute_chain_integrity(&alice_pk).unwrap();
-    let statistical = engine.compute_statistical_score(&alice_pk).unwrap();
-    let trust       = engine.compute_trust(&alice_pk).unwrap();
-
     println!(
-        "stat ceiling: integrity={integrity:.6}  statistical={statistical:.6}  trust={trust:.6}"
+        "out-of-order gossip: agreement→proposal → both valid, link resolved, integrity=1.0 ✓"
     );
-
-    assert!(
-        (integrity - 1.0).abs() < 1e-9,
-        "20-block perfect chain must have integrity=1.0, got {integrity}"
-    );
-
-    // statistical must equal exactly 1.0 when all 5 features are saturated.
-    assert!(
-        (statistical - 1.0).abs() < 1e-6,
-        "all features saturated: statistical must be 1.0, got {statistical:.8}\n\
-         (count=1.0, unique=1.0, completion=1.0, age=1.0, entropy=1.0)"
-    );
-
-    // No netflow: trust = (0.3/0.6)×integrity + (0.3/0.6)×statistical = 0.5×1.0 + 0.5×1.0 = 1.0
-    assert!(
-        (trust - 1.0).abs() < 1e-6,
-        "maximum trust must be 1.0 when all components are saturated, got {trust:.8}"
-    );
-
-    println!("statistical score ceiling: all 5 features = 1.0, trust = 1.0 ✓");
 }

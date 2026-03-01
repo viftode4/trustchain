@@ -19,10 +19,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    Router,
     extract::State,
-    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
+    Router,
 };
 use hyper::upgrade::OnUpgrade;
 use reqwest::Client;
@@ -34,7 +34,7 @@ use trustchain_core::{BlockStore, DelegationStore, TrustChainProtocol};
 
 use crate::discovery::{PeerDiscovery, PeerRecord};
 use crate::http::uuid_v4;
-use crate::message::{MessageType, TransportMessage, block_to_bytes, bytes_to_block};
+use crate::message::{block_to_bytes, bytes_to_block, MessageType, TransportMessage};
 use crate::quic::QuicTransport;
 
 /// Headers that must not be forwarded through a proxy (hop-by-hop per RFC 7230).
@@ -51,7 +51,10 @@ const HOP_BY_HOP: &[&str] = &[
 ];
 
 /// Shared state for the proxy server.
-pub struct ProxyState<S: BlockStore + 'static, D: DelegationStore + 'static = trustchain_core::MemoryDelegationStore> {
+pub struct ProxyState<
+    S: BlockStore + 'static,
+    D: DelegationStore + 'static = trustchain_core::MemoryDelegationStore,
+> {
     pub protocol: Arc<Mutex<TrustChainProtocol<S>>>,
     pub discovery: Arc<PeerDiscovery>,
     pub quic: Arc<QuicTransport>,
@@ -90,7 +93,10 @@ impl<S: BlockStore + 'static, D: DelegationStore + 'static> ProxyState<S, D> {
 }
 
 /// Start the transparent proxy server.
-pub async fn start_proxy_server<S: BlockStore + Send + 'static, D: DelegationStore + Send + 'static>(
+pub async fn start_proxy_server<
+    S: BlockStore + Send + 'static,
+    D: DelegationStore + Send + 'static,
+>(
     addr: SocketAddr,
     state: ProxyState<S, D>,
 ) -> anyhow::Result<()> {
@@ -121,7 +127,11 @@ async fn proxy_handler<S: BlockStore + 'static, D: DelegationStore + 'static>(
     let target_url = match resolve_target(&req) {
         Some(u) => u,
         None => {
-            return (StatusCode::BAD_REQUEST, "proxy: cannot determine target URL").into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                "proxy: cannot determine target URL",
+            )
+                .into_response();
         }
     };
 
@@ -335,7 +345,10 @@ async fn handle_connect<S: BlockStore + 'static, D: DelegationStore + 'static>(
     let target_stream = match TcpStream::connect(&target_addr).await {
         Ok(s) => s,
         Err(e) => {
-            return (StatusCode::BAD_GATEWAY, format!("CONNECT: cannot reach {target_addr}: {e}"))
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("CONNECT: cannot reach {target_addr}: {e}"),
+            )
                 .into_response();
         }
     };
@@ -437,7 +450,10 @@ async fn run_handshake<S: BlockStore + 'static, D: DelegationStore + 'static>(
 ) -> anyhow::Result<()> {
     // Derive QUIC address from peer's HTTP address (QUIC is HTTP port - QUIC_PORT_OFFSET).
     let quic_addr: SocketAddr = {
-        let addr = peer.address.strip_prefix("http://").unwrap_or(&peer.address);
+        let addr = peer
+            .address
+            .strip_prefix("http://")
+            .unwrap_or(&peer.address);
         let sa: SocketAddr = addr
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid peer address '{addr}': {e}"))?;
@@ -529,7 +545,10 @@ async fn forward_request(
     let body = match axum::body::to_bytes(req.into_body(), 16 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("proxy: failed to read body: {e}"))
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("proxy: failed to read body: {e}"),
+            )
                 .into_response();
         }
     };

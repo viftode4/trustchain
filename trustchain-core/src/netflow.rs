@@ -222,10 +222,8 @@ fn edmonds_karp<'a>(
             }
             if let Some(neighbors) = capacity.get(node) {
                 // Collect neighbors to avoid borrow issues.
-                let neighbors_vec: Vec<(&str, f64)> = neighbors
-                    .iter()
-                    .map(|(&k, &v)| (k, v))
-                    .collect();
+                let neighbors_vec: Vec<(&str, f64)> =
+                    neighbors.iter().map(|(&k, &v)| (k, v)).collect();
                 for (next, cap) in neighbors_vec {
                     if !visited.contains(next) && cap > 1e-10 {
                         visited.insert(next);
@@ -331,22 +329,8 @@ impl<S: BlockStore> CachedNetFlow<S> {
             return Ok(());
         }
 
-        if self.cached_graph.is_none() {
-            // Full rebuild.
-            let nf = NetFlowTrust::new(&self.store, self.seed_nodes.clone())?;
-            self.cached_graph = Some(nf.build_contribution_graph()?);
-            // Record per-pubkey sequence numbers.
-            self.known_seqs.clear();
-            let pubkeys = self.store.get_all_pubkeys()?;
-            for pk in &pubkeys {
-                let seq = self.store.get_latest_seq(pk)?;
-                if seq > 0 {
-                    self.known_seqs.insert(pk.clone(), seq);
-                }
-            }
-        } else {
+        if let Some(graph) = self.cached_graph.as_mut() {
             // Incremental update: only process new blocks.
-            let graph = self.cached_graph.as_mut().unwrap();
             let pubkeys = self.store.get_all_pubkeys()?;
             for pk in &pubkeys {
                 let current_seq = self.store.get_latest_seq(pk)?;
@@ -371,6 +355,19 @@ impl<S: BlockStore> CachedNetFlow<S> {
                     *entry += 0.5;
                 }
                 self.known_seqs.insert(pk.clone(), current_seq);
+            }
+        } else {
+            // Full rebuild.
+            let nf = NetFlowTrust::new(&self.store, self.seed_nodes.clone())?;
+            self.cached_graph = Some(nf.build_contribution_graph()?);
+            // Record per-pubkey sequence numbers.
+            self.known_seqs.clear();
+            let pubkeys = self.store.get_all_pubkeys()?;
+            for pk in &pubkeys {
+                let seq = self.store.get_latest_seq(pk)?;
+                if seq > 0 {
+                    self.known_seqs.insert(pk.clone(), seq);
+                }
             }
         }
 
@@ -567,7 +564,10 @@ mod tests {
 
         let engine = NetFlowTrust::new(&store, vec![seed.pubkey_hex()]).unwrap();
         let score = engine.compute_trust(&agent.pubkey_hex()).unwrap();
-        assert!(score > 0.0, "direct interaction should yield positive trust");
+        assert!(
+            score > 0.0,
+            "direct interaction should yield positive trust"
+        );
         assert!(score <= 1.0);
     }
 
@@ -579,13 +579,18 @@ mod tests {
         let target = Identity::from_bytes(&[3u8; 32]);
 
         // seed ↔ middle
-        let (p1, _a1) = create_interaction(
-            &mut store, &seed, &middle, 1, 1, GENESIS_HASH, GENESIS_HASH,
-        );
+        let (p1, _a1) =
+            create_interaction(&mut store, &seed, &middle, 1, 1, GENESIS_HASH, GENESIS_HASH);
 
         // middle ↔ target
         let (_p2, _a2) = create_interaction(
-            &mut store, &middle, &target, 2, 1, &p1.block_hash, GENESIS_HASH,
+            &mut store,
+            &middle,
+            &target,
+            2,
+            1,
+            &p1.block_hash,
+            GENESIS_HASH,
         );
 
         let engine = NetFlowTrust::new(&store, vec![seed.pubkey_hex()]).unwrap();
@@ -611,9 +616,7 @@ mod tests {
         let mut s1_prev = GENESIS_HASH.to_string();
         let mut s2_prev = GENESIS_HASH.to_string();
         for i in 1..=10 {
-            let (p, a) = create_interaction(
-                &mut store, &sybil1, &sybil2, i, i, &s1_prev, &s2_prev,
-            );
+            let (p, a) = create_interaction(&mut store, &sybil1, &sybil2, i, i, &s1_prev, &s2_prev);
             s1_prev = p.block_hash.clone();
             s2_prev = a.block_hash.clone();
         }
@@ -685,7 +688,10 @@ mod tests {
 
         // Second call should reuse (same block count).
         let score2 = cached.compute_trust(&agent.pubkey_hex()).unwrap();
-        assert!((score1 - score2).abs() < 1e-10, "cached result should be identical");
+        assert!(
+            (score1 - score2).abs() < 1e-10,
+            "cached result should be identical"
+        );
     }
 
     #[test]
@@ -695,9 +701,7 @@ mod tests {
         let agent = Identity::from_bytes(&[2u8; 32]);
         let agent2 = Identity::from_bytes(&[3u8; 32]);
 
-        create_interaction(
-            &mut store, &seed, &agent, 1, 1, GENESIS_HASH, GENESIS_HASH,
-        );
+        create_interaction(&mut store, &seed, &agent, 1, 1, GENESIS_HASH, GENESIS_HASH);
 
         let mut cached = CachedNetFlow::new(store, vec![seed.pubkey_hex()]).unwrap();
 
@@ -712,7 +716,10 @@ mod tests {
         // Instead, test that invalidate() works.
         cached.invalidate();
         let score_after_invalidate = cached.compute_trust(&agent2.pubkey_hex()).unwrap();
-        assert_eq!(score_after_invalidate, 0.0, "should still be 0 after invalidate (no new blocks)");
+        assert_eq!(
+            score_after_invalidate, 0.0,
+            "should still be 0 after invalidate (no new blocks)"
+        );
 
         // Verify all_scores works with cache.
         let scores = cached.compute_all_scores().unwrap();
@@ -727,11 +734,16 @@ mod tests {
         let agent = Identity::from_bytes(&[2u8; 32]);
         let middle = Identity::from_bytes(&[3u8; 32]);
 
-        let (p1, _) = create_interaction(
-            &mut store, &seed, &middle, 1, 1, GENESIS_HASH, GENESIS_HASH,
-        );
+        let (p1, _) =
+            create_interaction(&mut store, &seed, &middle, 1, 1, GENESIS_HASH, GENESIS_HASH);
         create_interaction(
-            &mut store, &middle, &agent, 2, 1, &p1.block_hash, GENESIS_HASH,
+            &mut store,
+            &middle,
+            &agent,
+            2,
+            1,
+            &p1.block_hash,
+            GENESIS_HASH,
         );
 
         // Uncached scores.

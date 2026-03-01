@@ -26,11 +26,10 @@ pub fn block_to_proto(block: &HalfBlock) -> proto::HalfBlockProto {
 }
 
 /// Convert a protobuf HalfBlock to the core type.
+#[allow(clippy::result_large_err)]
 pub fn proto_to_block(proto: &proto::HalfBlockProto) -> Result<HalfBlock, Status> {
-    let transaction: serde_json::Value =
-        serde_json::from_str(&proto.transaction).map_err(|e| {
-            Status::invalid_argument(format!("invalid transaction JSON: {e}"))
-        })?;
+    let transaction: serde_json::Value = serde_json::from_str(&proto.transaction)
+        .map_err(|e| Status::invalid_argument(format!("invalid transaction JSON: {e}")))?;
 
     Ok(HalfBlock {
         public_key: proto.public_key.clone(),
@@ -53,10 +52,7 @@ pub struct TrustChainGrpcService<S: BlockStore + 'static> {
 }
 
 impl<S: BlockStore + 'static> TrustChainGrpcService<S> {
-    pub fn new(
-        protocol: Arc<Mutex<TrustChainProtocol<S>>>,
-        discovery: Arc<PeerDiscovery>,
-    ) -> Self {
+    pub fn new(protocol: Arc<Mutex<TrustChainProtocol<S>>>, discovery: Arc<PeerDiscovery>) -> Self {
         Self {
             protocol,
             discovery,
@@ -117,8 +113,7 @@ impl<S: BlockStore + 'static> proto::trust_chain_service_server::TrustChainServi
             .crawl(&req.public_key, req.start_seq)
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let proto_blocks: Vec<proto::HalfBlockProto> =
-            blocks.iter().map(block_to_proto).collect();
+        let proto_blocks: Vec<proto::HalfBlockProto> = blocks.iter().map(block_to_proto).collect();
 
         Ok(Response::new(proto::CrawlResponse {
             blocks: proto_blocks,
@@ -210,9 +205,7 @@ pub async fn start_grpc_server<S: BlockStore + 'static>(
     log::info!("gRPC server listening on {addr}");
 
     tonic::transport::Server::builder()
-        .add_service(
-            proto::trust_chain_service_server::TrustChainServiceServer::new(service),
-        )
+        .add_service(proto::trust_chain_service_server::TrustChainServiceServer::new(service))
         .serve(addr)
         .await?;
 

@@ -241,8 +241,14 @@ mod tests {
         let mut chain = PersonalChain::new(id.pubkey_hex());
 
         let block = create_half_block(
-            &id, 1, &"b".repeat(64), 0, GENESIS_HASH,
-            BlockType::Proposal, serde_json::json!({}), Some(1000),
+            &id,
+            1,
+            &"b".repeat(64),
+            0,
+            GENESIS_HASH,
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(1000),
         );
 
         chain.append(block.clone()).unwrap();
@@ -259,20 +265,38 @@ mod tests {
         let mut chain = PersonalChain::new(id.pubkey_hex());
 
         let b1 = create_half_block(
-            &id, 1, &peer, 0, GENESIS_HASH,
-            BlockType::Proposal, serde_json::json!({}), Some(1000),
+            &id,
+            1,
+            &peer,
+            0,
+            GENESIS_HASH,
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(1000),
         );
         chain.append(b1.clone()).unwrap();
 
         let b2 = create_half_block(
-            &id, 2, &peer, 0, &b1.block_hash,
-            BlockType::Proposal, serde_json::json!({}), Some(1001),
+            &id,
+            2,
+            &peer,
+            0,
+            &b1.block_hash,
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(1001),
         );
         chain.append(b2.clone()).unwrap();
 
         let b3 = create_half_block(
-            &id, 3, &peer, 0, &b2.block_hash,
-            BlockType::Proposal, serde_json::json!({}), Some(1002),
+            &id,
+            3,
+            &peer,
+            0,
+            &b2.block_hash,
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(1002),
         );
         chain.append(b3).unwrap();
 
@@ -288,8 +312,14 @@ mod tests {
         let mut chain = PersonalChain::new(id1.pubkey_hex());
 
         let block = create_half_block(
-            &id2, 1, &"b".repeat(64), 0, GENESIS_HASH,
-            BlockType::Proposal, serde_json::json!({}), Some(1000),
+            &id2,
+            1,
+            &"b".repeat(64),
+            0,
+            GENESIS_HASH,
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(1000),
         );
 
         assert!(chain.append(block).is_err());
@@ -302,8 +332,14 @@ mod tests {
 
         // Try to append seq 2 without seq 1.
         let block = create_half_block(
-            &id, 2, &"b".repeat(64), 0, GENESIS_HASH,
-            BlockType::Proposal, serde_json::json!({}), Some(1000),
+            &id,
+            2,
+            &"b".repeat(64),
+            0,
+            GENESIS_HASH,
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(1000),
         );
 
         assert!(chain.append(block).is_err());
@@ -315,15 +351,27 @@ mod tests {
         let mut chain = PersonalChain::new(id.pubkey_hex());
 
         let b1 = create_half_block(
-            &id, 1, &"b".repeat(64), 0, GENESIS_HASH,
-            BlockType::Proposal, serde_json::json!({}), Some(1000),
+            &id,
+            1,
+            &"b".repeat(64),
+            0,
+            GENESIS_HASH,
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(1000),
         );
         chain.append(b1).unwrap();
 
         // Wrong previous hash.
         let b2 = create_half_block(
-            &id, 2, &"b".repeat(64), 0, GENESIS_HASH, // should be b1.block_hash
-            BlockType::Proposal, serde_json::json!({}), Some(1001),
+            &id,
+            2,
+            &"b".repeat(64),
+            0,
+            GENESIS_HASH, // should be b1.block_hash
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(1001),
         );
 
         assert!(chain.append(b2).is_err());
@@ -336,14 +384,26 @@ mod tests {
         let mut store = MemoryBlockStore::new();
 
         let b1 = create_half_block(
-            &id, 1, &peer, 0, GENESIS_HASH,
-            BlockType::Proposal, serde_json::json!({}), Some(1000),
+            &id,
+            1,
+            &peer,
+            0,
+            GENESIS_HASH,
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(1000),
         );
         store.add_block(&b1).unwrap();
 
         let b2 = create_half_block(
-            &id, 2, &peer, 0, &b1.block_hash,
-            BlockType::Proposal, serde_json::json!({}), Some(1001),
+            &id,
+            2,
+            &peer,
+            0,
+            &b1.block_hash,
+            BlockType::Proposal,
+            serde_json::json!({}),
+            Some(1001),
         );
         store.add_block(&b2).unwrap();
 
@@ -357,8 +417,14 @@ mod tests {
         let mut chain = PersonalChain::new(id.pubkey_hex());
 
         let block = create_half_block(
-            &id, 1, &"b".repeat(64), 0, GENESIS_HASH,
-            BlockType::Proposal, serde_json::json!({"data": 42}), Some(1000),
+            &id,
+            1,
+            &"b".repeat(64),
+            0,
+            GENESIS_HASH,
+            BlockType::Proposal,
+            serde_json::json!({"data": 42}),
+            Some(1000),
         );
         chain.append(block.clone()).unwrap();
 

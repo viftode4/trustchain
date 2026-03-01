@@ -164,8 +164,8 @@ pub struct CheckpointFinalizedPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trustchain_core::{Identity, create_half_block, verify_block};
     use trustchain_core::types::{BlockType, GENESIS_HASH};
+    use trustchain_core::{create_half_block, verify_block, Identity};
 
     /// Verify that a HalfBlock survives the TransportMessage round-trip
     /// (block → bytes → TransportMessage → JSON → deserialize → extract → block)
@@ -183,13 +183,20 @@ mod tests {
     fn test_roundtrip_with_timestamp(ts: Option<u64>) {
         let id = Identity::from_bytes(&[42u8; 32]);
         let block = create_half_block(
-            &id, 1, &"b".repeat(64), 0, GENESIS_HASH,
+            &id,
+            1,
+            &"b".repeat(64),
+            0,
+            GENESIS_HASH,
             BlockType::Proposal,
             serde_json::json!({"proxy": true, "method": "GET", "path": "/"}),
             ts,
         );
 
-        assert!(verify_block(&block).unwrap(), "block should verify before transport");
+        assert!(
+            verify_block(&block).unwrap(),
+            "block should verify before transport"
+        );
 
         // Simulate the exact proxy transport path.
         let payload = block_to_bytes(&block);
@@ -207,9 +214,15 @@ mod tests {
         assert_eq!(payload, received_msg.payload, "payload bytes changed");
 
         // Block must be identical after round-trip.
-        assert_eq!(block, received_block, "block changed after TransportMessage round-trip");
+        assert_eq!(
+            block, received_block,
+            "block changed after TransportMessage round-trip"
+        );
 
         // Hash must still verify.
-        assert!(verify_block(&received_block).unwrap(), "block should verify after round-trip");
+        assert!(
+            verify_block(&received_block).unwrap(),
+            "block should verify after round-trip"
+        );
     }
 }

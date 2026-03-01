@@ -82,7 +82,7 @@ All optimizations are backward-compatible. Default behavior is unchanged when op
 
 **Files:**
 - `trustchain-core/src/trust.rs` — `TrustWeights.decay_half_life_ms`, modified `compute_statistical_score()`
-- `trustchain-sdk/src/trustchain/trust.py` — `TrustEngine(decay_half_life_ms=...)`, modified `compute_statistical_score()`
+- `trustchain-py/src/trustchain/trust.py` — `TrustEngine(decay_half_life_ms=...)`, modified `compute_statistical_score()`
 
 ### 4.3 Graph Caching
 
@@ -113,7 +113,7 @@ engine.compute_netflow_score_cached(&mut cached_netflow, pubkey)
 - `trustchain-core/src/netflow.rs` — `CachedNetFlow` struct
 - `trustchain-core/src/lib.rs` — re-export
 - `trustchain-core/src/trust.rs` — `compute_netflow_score_cached()`
-- `trustchain-sdk/src/trustchain/netflow.py` — caching in `NetFlowTrust`
+- `trustchain-py/src/trustchain/netflow.py` — caching in `NetFlowTrust`
 
 ### 4.4 Checkpoint-Anchored Verification
 
@@ -135,7 +135,7 @@ engine = TrustEngine(store, checkpoint=checkpoint)
 
 **Files:**
 - `trustchain-core/src/trust.rs` — `checkpoint` field, `with_checkpoint()`, modified `compute_chain_integrity()`
-- `trustchain-sdk/src/trustchain/trust.py` — `checkpoint` param, modified `compute_chain_integrity()`
+- `trustchain-py/src/trustchain/trust.py` — `checkpoint` param, modified `compute_chain_integrity()`
 
 ## 5. Rust vs Python Differences
 

@@ -6,7 +6,7 @@
 //! - **BlockStore**: Pluggable storage (memory, SQLite)
 //! - **Protocol**: Two-phase proposal/agreement state machine
 //! - **NetFlow**: Max-flow Sybil-resistant trust computation
-//! - **Trust**: Unified trust engine (integrity + netflow + statistical)
+//! - **Trust**: Unified trust engine (integrity + netflow)
 //! - **Consensus**: CHECO checkpoint finality
 //! - **Chain**: Personal chain validation
 //! - **Crawler**: DAG traversal and tampering detection
@@ -30,10 +30,14 @@ pub use chain::PersonalChain;
 pub use consensus::{CHECOConsensus, Checkpoint};
 pub use crawler::{BlockStoreCrawler, CrossChainLink, DAGView, TamperingReport};
 pub use delegation::{
-    DelegationRecord, DelegationStore, MemoryDelegationStore, SqliteDelegationStore, SuccessionRecord,
+    DelegationRecord, DelegationStore, MemoryDelegationStore, SqliteDelegationStore,
+    SuccessionRecord,
 };
 pub use error::{Result, TrustChainError};
-pub use halfblock::{create_half_block, validate_and_record, validate_block, validate_block_invariants, verify_block, HalfBlock};
+pub use halfblock::{
+    create_half_block, validate_and_record, validate_block, validate_block_invariants,
+    verify_block, HalfBlock,
+};
 pub use identity::Identity;
 pub use netflow::{CachedNetFlow, NetFlowTrust};
 pub use protocol::TrustChainProtocol;

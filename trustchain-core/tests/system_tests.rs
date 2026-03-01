@@ -15,10 +15,10 @@
 //! Run with: cargo test --test system_tests -- --nocapture
 
 use trustchain_core::{
-    BlockStore, CHECOConsensus, Identity, MemoryBlockStore, TrustChainProtocol, TrustEngine,
     halfblock::{create_half_block, validate_and_record, verify_block},
     netflow::NetFlowTrust,
-    types::{BlockType, GENESIS_HASH, ValidationResult},
+    types::{BlockType, ValidationResult, GENESIS_HASH},
+    BlockStore, CHECOConsensus, Identity, MemoryBlockStore, TrustChainProtocol, TrustEngine,
 };
 
 // ─── Infrastructure ───────────────────────────────────────────────────────────
@@ -131,7 +131,12 @@ fn sysnet_full_network_lifecycle() {
 
         // Chain integrity must be perfect.
         for (k, block) in chain.iter().enumerate() {
-            assert_eq!(block.sequence_number, (k + 1) as u64, "seq mismatch for agent {}", i);
+            assert_eq!(
+                block.sequence_number,
+                (k + 1) as u64,
+                "seq mismatch for agent {}",
+                i
+            );
             assert!(verify_block(block).unwrap(), "bad signature in agent {}", i);
         }
     }
@@ -139,7 +144,12 @@ fn sysnet_full_network_lifecycle() {
     // Trust: every agent has positive trust from seed = agent 0.
     for i in 1..10 {
         let score = sim.trust_score(&[0], i);
-        assert!(score > 0.0, "agent {} should have positive trust from seed 0 (score={})", i, score);
+        assert!(
+            score > 0.0,
+            "agent {} should have positive trust from seed 0 (score={})",
+            i,
+            score
+        );
     }
 
     // CHECO: 5-node committee from agents 0-4.
@@ -176,7 +186,9 @@ fn sysnet_full_network_lifecycle() {
             sigs.insert(sim.pubkey(i), sig);
         }
     }
-    consensuses[fac_idx].finalize_checkpoint(cp_block.clone(), sigs).unwrap();
+    consensuses[fac_idx]
+        .finalize_checkpoint(cp_block.clone(), sigs)
+        .unwrap();
 
     // chain_heads in the checkpoint captures pre-checkpoint state (fac at seq N-1).
     // The checkpoint block itself is at seq N, so it's not in chain_heads yet.
@@ -184,7 +196,8 @@ fn sysnet_full_network_lifecycle() {
     let pre_cp_seq = cp_block.sequence_number - 1;
     assert!(
         consensuses[fac_idx].is_finalized(&fac_pk, pre_cp_seq),
-        "checkpoint should cover facilitator's pre-checkpoint blocks (seq {})", pre_cp_seq
+        "checkpoint should cover facilitator's pre-checkpoint blocks (seq {})",
+        pre_cp_seq
     );
 
     // Also verify a non-facilitator's blocks are covered.
@@ -192,7 +205,8 @@ fn sysnet_full_network_lifecycle() {
     let other_pk = sim.pubkey(other_idx);
     assert!(
         consensuses[fac_idx].is_finalized(&other_pk, 1),
-        "checkpoint should cover block seq=1 of agent {} (finality for all)", other_idx
+        "checkpoint should cover block seq=1 of agent {} (finality for all)",
+        other_idx
     );
 
     println!("[sysnet_full_network_lifecycle] PASS — 10 agents, 135 interactions, CHECO finalized");
@@ -209,17 +223,17 @@ fn sysnet_full_network_lifecycle() {
 fn sysnet_byzantine_three_attack_vectors() {
     // ── Attack A: tampered signature ────────────────────────────────────────
     {
-        let mut alice = TrustChainProtocol::new(
-            Identity::from_bytes(&[1u8; 32]),
-            MemoryBlockStore::new(),
-        );
-        let mut bob = TrustChainProtocol::new(
-            Identity::from_bytes(&[2u8; 32]),
-            MemoryBlockStore::new(),
-        );
+        let mut alice =
+            TrustChainProtocol::new(Identity::from_bytes(&[1u8; 32]), MemoryBlockStore::new());
+        let mut bob =
+            TrustChainProtocol::new(Identity::from_bytes(&[2u8; 32]), MemoryBlockStore::new());
 
         let mut proposal = alice
-            .create_proposal(&bob.pubkey(), serde_json::json!({"service": "compute"}), Some(1000))
+            .create_proposal(
+                &bob.pubkey(),
+                serde_json::json!({"service": "compute"}),
+                Some(1000),
+            )
             .unwrap();
 
         // Corrupt the signature bytes.
@@ -229,7 +243,10 @@ fn sysnet_byzantine_three_attack_vectors() {
         proposal.signature = hex::encode(&bad_sig);
 
         let result = bob.receive_proposal(&proposal);
-        assert!(result.is_err(), "Attack A: tampered signature must be rejected");
+        assert!(
+            result.is_err(),
+            "Attack A: tampered signature must be rejected"
+        );
     }
 
     // ── Attack B: double-sign (two proposals at same sequence number) ────────
@@ -239,16 +256,29 @@ fn sysnet_byzantine_three_attack_vectors() {
         let mut store = MemoryBlockStore::new();
 
         let p_a = create_half_block(
-            &alice, 1, &bob.pubkey_hex(), 0,
-            GENESIS_HASH, BlockType::Proposal,
-            serde_json::json!({"version": "A"}), Some(1000),
+            &alice,
+            1,
+            &bob.pubkey_hex(),
+            0,
+            GENESIS_HASH,
+            BlockType::Proposal,
+            serde_json::json!({"version": "A"}),
+            Some(1000),
         );
         let p_b = create_half_block(
-            &alice, 1, &bob.pubkey_hex(), 0,
-            GENESIS_HASH, BlockType::Proposal,
-            serde_json::json!({"version": "B"}), Some(1001),
+            &alice,
+            1,
+            &bob.pubkey_hex(),
+            0,
+            GENESIS_HASH,
+            BlockType::Proposal,
+            serde_json::json!({"version": "B"}),
+            Some(1001),
         );
-        assert_ne!(p_a.block_hash, p_b.block_hash, "different content = different hash");
+        assert_ne!(
+            p_a.block_hash, p_b.block_hash,
+            "different content = different hash"
+        );
 
         // Add first block — valid.
         store.add_block(&p_a).unwrap();
@@ -261,7 +291,10 @@ fn sysnet_byzantine_three_attack_vectors() {
         );
 
         let frauds = store.get_double_spends(&alice.pubkey_hex()).unwrap();
-        assert!(!frauds.is_empty(), "Attack B: double-spend must be recorded");
+        assert!(
+            !frauds.is_empty(),
+            "Attack B: double-spend must be recorded"
+        );
     }
 
     // ── Attack C: double-countersign (two agreements for the same proposal) ─
@@ -272,25 +305,40 @@ fn sysnet_byzantine_three_attack_vectors() {
 
         // Alice proposes (seq=1).
         let proposal = create_half_block(
-            &alice, 1, &bob.pubkey_hex(), 0,
-            GENESIS_HASH, BlockType::Proposal,
-            serde_json::json!({"service": "test"}), Some(1000),
+            &alice,
+            1,
+            &bob.pubkey_hex(),
+            0,
+            GENESIS_HASH,
+            BlockType::Proposal,
+            serde_json::json!({"service": "test"}),
+            Some(1000),
         );
         store.add_block(&proposal).unwrap();
 
         // Bob agrees once (seq=1) — valid.
         let agree_1 = create_half_block(
-            &bob, 1, &alice.pubkey_hex(), 1,
-            GENESIS_HASH, BlockType::Agreement,
-            serde_json::json!({"service": "test"}), Some(1001),
+            &bob,
+            1,
+            &alice.pubkey_hex(),
+            1,
+            GENESIS_HASH,
+            BlockType::Agreement,
+            serde_json::json!({"service": "test"}),
+            Some(1001),
         );
         store.add_block(&agree_1).unwrap();
 
         // Bob agrees again (seq=2) to the SAME proposal (link_seq=1).
         let agree_2 = create_half_block(
-            &bob, 2, &alice.pubkey_hex(), 1,
-            &agree_1.block_hash, BlockType::Agreement,
-            serde_json::json!({"service": "test"}), Some(1002),
+            &bob,
+            2,
+            &alice.pubkey_hex(),
+            1,
+            &agree_1.block_hash,
+            BlockType::Agreement,
+            serde_json::json!({"service": "test"}),
+            Some(1002),
         );
         let result = validate_and_record(&agree_2, &mut store);
         assert!(
@@ -320,8 +368,16 @@ fn sysnet_network_partition_and_merge() {
     // ── Pre-merge: isolated groups ─────────────────────────────────────────
     let score_a_sees_b = sim.netflow_trust(&[0], 5);
     let score_b_sees_a = sim.netflow_trust(&[5], 0);
-    assert_eq!(score_a_sees_b, 0.0, "A cannot see B before bridge (got {})", score_a_sees_b);
-    assert_eq!(score_b_sees_a, 0.0, "B cannot see A before bridge (got {})", score_b_sees_a);
+    assert_eq!(
+        score_a_sees_b, 0.0,
+        "A cannot see B before bridge (got {})",
+        score_a_sees_b
+    );
+    assert_eq!(
+        score_b_sees_a, 0.0,
+        "B cannot see A before bridge (got {})",
+        score_b_sees_a
+    );
 
     // ── Bridge: agent 0 ↔ agent 5 interact ───────────────────────────────
     sim.interact(0, 5, 5);
@@ -329,20 +385,33 @@ fn sysnet_network_partition_and_merge() {
     // ── Post-merge: cross-group trust flows ───────────────────────────────
     // Agent 5 is now reachable from seed 0 via the direct bridge.
     let bridge_score = sim.netflow_trust(&[0], 5);
-    assert!(bridge_score > 0.0, "agent 5 reachable from seed 0 after bridge (got {})", bridge_score);
+    assert!(
+        bridge_score > 0.0,
+        "agent 5 reachable from seed 0 after bridge (got {})",
+        bridge_score
+    );
 
     // Agent 6 is reachable via 0→5→6 (transitive).
     let transitive_score = sim.netflow_trust(&[0], 6);
-    assert!(transitive_score > 0.0, "agent 6 reachable transitively after bridge (got {})", transitive_score);
+    assert!(
+        transitive_score > 0.0,
+        "agent 6 reachable transitively after bridge (got {})",
+        transitive_score
+    );
 
     // Bridge score ≥ transitive score (direct beats transitive).
-    assert!(bridge_score >= transitive_score, "direct bridge ≥ transitive path");
+    assert!(
+        bridge_score >= transitive_score,
+        "direct bridge ≥ transitive path"
+    );
 
     // Group A agents still have positive scores.
     let score_a1 = sim.netflow_trust(&[0], 1);
     assert!(score_a1 > 0.0, "agent 1 in Group A still positive");
 
-    println!("[sysnet_network_partition_and_merge] PASS — isolation before bridge, trust flows after");
+    println!(
+        "[sysnet_network_partition_and_merge] PASS — isolation before bridge, trust flows after"
+    );
 }
 
 // ─── Test 4: Identity cycling dilution bounded ────────────────────────────────
@@ -404,7 +473,10 @@ fn sysnet_identity_cycling_dilution_bounded() {
     let cycling_score = nf.compute_trust(&cycling_pks[0]).unwrap();
 
     assert!(honest_score > 0.0, "honest agent must have positive trust");
-    assert!(cycling_score > 0.0, "cycling agent must have positive trust");
+    assert!(
+        cycling_score > 0.0,
+        "cycling agent must have positive trust"
+    );
 
     // Honest agent should score ~10× more than any single cycling identity.
     let ratio = honest_score / cycling_score;
@@ -451,12 +523,21 @@ fn sysnet_trust_topology_isomorphism() {
 
     // ── Hub (seed) scores ─────────────────────────────────────────────────
     let hub_score = sim.trust_score(&[0], 0);
-    assert!(hub_score > 0.5, "hub/seed should have high trust, got {}", hub_score);
+    assert!(
+        hub_score > 0.5,
+        "hub/seed should have high trust, got {}",
+        hub_score
+    );
 
     // ── Spokes: positive trust via direct hub connection ──────────────────
     for spoke in 1..=10 {
         let score = sim.netflow_trust(&[0], spoke);
-        assert!(score > 0.0, "spoke {} must have positive NetFlow trust (got {})", spoke, score);
+        assert!(
+            score > 0.0,
+            "spoke {} must have positive NetFlow trust (got {})",
+            spoke,
+            score
+        );
     }
 
     // ── Isolated cluster: NO trust — no path to seed ──────────────────────
@@ -480,7 +561,8 @@ fn sysnet_trust_topology_isomorphism() {
     assert!(
         min_spoke > max_isolated,
         "topology isomorphism violated: min_spoke={:.4} must > max_isolated={:.4}",
-        min_spoke, max_isolated
+        min_spoke,
+        max_isolated
     );
 
     println!("[sysnet_trust_topology_isomorphism] PASS — hub>spokes>isolated ordering correct");
@@ -514,7 +596,11 @@ fn sysnet_checo_facilitator_election_correctness() {
     let facilitators: Vec<usize> = (0..7)
         .filter(|&i| consensuses[i].is_facilitator().unwrap())
         .collect();
-    assert_eq!(facilitators.len(), 1, "exactly 1 of 7 agents should be facilitator");
+    assert_eq!(
+        facilitators.len(),
+        1,
+        "exactly 1 of 7 agents should be facilitator"
+    );
 
     let fac_idx = facilitators[0];
 
@@ -532,7 +618,10 @@ fn sysnet_checo_facilitator_election_correctness() {
 
     // Facilitator succeeds.
     let cp_block = consensuses[fac_idx].propose_checkpoint().unwrap();
-    assert!(cp_block.is_checkpoint(), "proposed block must be a checkpoint");
+    assert!(
+        cp_block.is_checkpoint(),
+        "proposed block must be a checkpoint"
+    );
 
     // Election is deterministic: rebuild consensuses with same state → same facilitator.
     let consensuses2: Vec<CHECOConsensus<MemoryBlockStore>> = (0..7)
@@ -589,10 +678,10 @@ fn sysnet_world_simulation() {
     }
 
     // Cross-sector bridges.
-    sim.interact(0, 10, 5);  // Finance ↔ Tech
+    sim.interact(0, 10, 5); // Finance ↔ Tech
     sim.interact(10, 20, 5); // Tech ↔ Health
     sim.interact(20, 30, 5); // Health ↔ Gov
-    // Sybil sector (40-49): no bridge to any seed!
+                             // Sybil sector (40-49): no bridge to any seed!
 
     let seeds = &[0usize, 10usize];
 
@@ -609,18 +698,32 @@ fn sysnet_world_simulation() {
     // ── Finance (near seed 0) should score well ───────────────────────────
     let finance_scores: Vec<f64> = (1..10).map(|i| sim.netflow_trust(seeds, i)).collect();
     for (i, &s) in finance_scores.iter().enumerate() {
-        assert!(s > 0.0, "Finance agent {} should have positive trust (got {})", i + 1, s);
+        assert!(
+            s > 0.0,
+            "Finance agent {} should have positive trust (got {})",
+            i + 1,
+            s
+        );
     }
 
     // ── Tech (direct bridge from seed 0 via agent 0→10) ─────────────────
     let tech_score_10 = sim.netflow_trust(seeds, 10);
-    assert!(tech_score_10 > 0.0, "Tech agent 10 (seed) should have positive trust");
+    assert!(
+        tech_score_10 > 0.0,
+        "Tech agent 10 (seed) should have positive trust"
+    );
     let tech_score_11 = sim.netflow_trust(seeds, 11);
-    assert!(tech_score_11 > 0.0, "Tech agent 11 should have positive trust");
+    assert!(
+        tech_score_11 > 0.0,
+        "Tech agent 11 should have positive trust"
+    );
 
     // ── Health (2 hops: 0→10→20) ─────────────────────────────────────────
     let health_score = sim.netflow_trust(seeds, 20);
-    assert!(health_score > 0.0, "Health agent 20 reachable via 2-hop bridge");
+    assert!(
+        health_score > 0.0,
+        "Health agent 20 reachable via 2-hop bridge"
+    );
 
     // ── Gov (3 hops: 0→10→20→30) ─────────────────────────────────────────
     let gov_score = sim.netflow_trust(seeds, 30);
@@ -632,23 +735,40 @@ fn sysnet_world_simulation() {
     assert!(
         finance_1 >= health_score,
         "Finance ({:.4}) should score ≥ Health ({:.4})",
-        finance_1, health_score
+        finance_1,
+        health_score
     );
 
     // Print trust landscape.
     println!("[sysnet_world_simulation] PASS — 50 agents, 5 sectors");
-    println!("  Seeds:   agent 0={:.3}, agent 10={:.3}",
+    println!(
+        "  Seeds:   agent 0={:.3}, agent 10={:.3}",
         sim.netflow_trust(seeds, 0),
         sim.netflow_trust(seeds, 10),
     );
-    println!("  Finance: agent 1={:.3}  agent 5={:.3}",
-        sim.netflow_trust(seeds, 1), sim.netflow_trust(seeds, 5));
-    println!("  Tech:    agent 11={:.3} agent 15={:.3}",
-        sim.netflow_trust(seeds, 11), sim.netflow_trust(seeds, 15));
-    println!("  Health:  agent 20={:.3} agent 25={:.3}",
-        sim.netflow_trust(seeds, 20), sim.netflow_trust(seeds, 25));
-    println!("  Gov:     agent 30={:.3} agent 35={:.3}",
-        sim.netflow_trust(seeds, 30), sim.netflow_trust(seeds, 35));
-    println!("  Sybil:   agent 40={:.3} agent 45={:.3}",
-        sim.netflow_trust(seeds, 40), sim.netflow_trust(seeds, 45));
+    println!(
+        "  Finance: agent 1={:.3}  agent 5={:.3}",
+        sim.netflow_trust(seeds, 1),
+        sim.netflow_trust(seeds, 5)
+    );
+    println!(
+        "  Tech:    agent 11={:.3} agent 15={:.3}",
+        sim.netflow_trust(seeds, 11),
+        sim.netflow_trust(seeds, 15)
+    );
+    println!(
+        "  Health:  agent 20={:.3} agent 25={:.3}",
+        sim.netflow_trust(seeds, 20),
+        sim.netflow_trust(seeds, 25)
+    );
+    println!(
+        "  Gov:     agent 30={:.3} agent 35={:.3}",
+        sim.netflow_trust(seeds, 30),
+        sim.netflow_trust(seeds, 35)
+    );
+    println!(
+        "  Sybil:   agent 40={:.3} agent 45={:.3}",
+        sim.netflow_trust(seeds, 40),
+        sim.netflow_trust(seeds, 45)
+    );
 }

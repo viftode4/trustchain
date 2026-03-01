@@ -16,13 +16,9 @@ fn bench_netflow_single(c: &mut Criterion) {
         let netflow = NetFlowTrust::new(&store, vec![seed_pk]).unwrap();
         let target = &spoke_pks[spoke_pks.len() / 2];
 
-        group.bench_with_input(
-            BenchmarkId::new("star", n_agents),
-            &n_agents,
-            |b, _| {
-                b.iter(|| netflow.compute_trust(target).unwrap());
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("star", n_agents), &n_agents, |b, _| {
+            b.iter(|| netflow.compute_trust(target).unwrap());
+        });
     }
     group.finish();
 }
@@ -40,13 +36,9 @@ fn bench_netflow_single_large(c: &mut Criterion) {
         let netflow = NetFlowTrust::new(&store, vec![seed_pk]).unwrap();
         let target = &spoke_pks[spoke_pks.len() / 2];
 
-        group.bench_with_input(
-            BenchmarkId::new("star", n_agents),
-            &n_agents,
-            |b, _| {
-                b.iter(|| netflow.compute_trust(target).unwrap());
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("star", n_agents), &n_agents, |b, _| {
+            b.iter(|| netflow.compute_trust(target).unwrap());
+        });
     }
     group.finish();
 }
@@ -62,13 +54,9 @@ fn bench_netflow_all_scores(c: &mut Criterion) {
         let (store, seed_pk, _) = helpers::build_star_network(n_agents, 3);
         let netflow = NetFlowTrust::new(&store, vec![seed_pk]).unwrap();
 
-        group.bench_with_input(
-            BenchmarkId::new("star", n_agents),
-            &n_agents,
-            |b, _| {
-                b.iter(|| netflow.compute_all_scores().unwrap());
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("star", n_agents), &n_agents, |b, _| {
+            b.iter(|| netflow.compute_all_scores().unwrap());
+        });
     }
     group.finish();
 }
@@ -112,13 +100,9 @@ fn bench_cached_netflow_single(c: &mut Criterion) {
         // Warm up: build graph once.
         let _ = cached.compute_trust(&target).unwrap();
 
-        group.bench_with_input(
-            BenchmarkId::new("star", n_agents),
-            &n_agents,
-            |b, _| {
-                b.iter(|| cached.compute_trust(&target).unwrap());
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("star", n_agents), &n_agents, |b, _| {
+            b.iter(|| cached.compute_trust(&target).unwrap());
+        });
     }
     group.finish();
 }
@@ -137,13 +121,9 @@ fn bench_cached_netflow_single_large(c: &mut Criterion) {
         let target = spoke_pks[spoke_pks.len() / 2].clone();
         let _ = cached.compute_trust(&target).unwrap();
 
-        group.bench_with_input(
-            BenchmarkId::new("star", n_agents),
-            &n_agents,
-            |b, _| {
-                b.iter(|| cached.compute_trust(&target).unwrap());
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("star", n_agents), &n_agents, |b, _| {
+            b.iter(|| cached.compute_trust(&target).unwrap());
+        });
     }
     group.finish();
 }
@@ -160,13 +140,9 @@ fn bench_cached_netflow_all_scores(c: &mut Criterion) {
         let mut cached = CachedNetFlow::new(store, vec![seed_pk]).unwrap();
         let _ = cached.compute_all_scores().unwrap();
 
-        group.bench_with_input(
-            BenchmarkId::new("star", n_agents),
-            &n_agents,
-            |b, _| {
-                b.iter(|| cached.compute_all_scores().unwrap());
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("star", n_agents), &n_agents, |b, _| {
+            b.iter(|| cached.compute_all_scores().unwrap());
+        });
     }
     group.finish();
 }

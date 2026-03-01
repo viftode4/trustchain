@@ -37,9 +37,9 @@ pub mod proto {
 
 // Re-exports.
 pub use discovery::PeerDiscovery;
-pub use grpc::{TrustChainGrpcService, start_grpc_server};
-pub use http::{AppState, build_router, start_http_server};
+pub use grpc::{start_grpc_server, TrustChainGrpcService};
+pub use http::{build_router, start_http_server, AppState};
 pub use pool::ConnectionPool;
-pub use proxy::{ProxyState, start_proxy_server};
+pub use proxy::{start_proxy_server, ProxyState};
 pub use quic::QuicTransport;
 pub use transport::{Transport, TransportError};

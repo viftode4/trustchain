@@ -166,7 +166,8 @@ mod tests {
     #[tokio::test]
     async fn test_add_and_get_peer() {
         let disc = PeerDiscovery::new("us".to_string(), vec![]);
-        disc.add_peer("peer1".to_string(), "127.0.0.1:8200".to_string(), 5).await;
+        disc.add_peer("peer1".to_string(), "127.0.0.1:8200".to_string(), 5)
+            .await;
 
         let peer = disc.get_peer("peer1").await.unwrap();
         assert_eq!(peer.address, "127.0.0.1:8200");
@@ -176,7 +177,8 @@ mod tests {
     #[tokio::test]
     async fn test_dont_add_self() {
         let disc = PeerDiscovery::new("us".to_string(), vec![]);
-        disc.add_peer("us".to_string(), "127.0.0.1:8200".to_string(), 0).await;
+        disc.add_peer("us".to_string(), "127.0.0.1:8200".to_string(), 0)
+            .await;
         assert_eq!(disc.peer_count().await, 0);
     }
 
@@ -202,7 +204,8 @@ mod tests {
         disc.merge_peers(vec![
             ("a".to_string(), "addr1".to_string(), 1),
             ("b".to_string(), "addr2".to_string(), 2),
-        ]).await;
+        ])
+        .await;
         assert_eq!(disc.peer_count().await, 2);
     }
 
@@ -219,19 +222,28 @@ mod tests {
     #[tokio::test]
     async fn test_get_peer_by_address_direct() {
         let disc = PeerDiscovery::new("us".to_string(), vec![]);
-        disc.add_peer("peer1".to_string(), "http://127.0.0.1:8212".to_string(), 5).await;
+        disc.add_peer("peer1".to_string(), "http://127.0.0.1:8212".to_string(), 5)
+            .await;
 
-        let peer = disc.get_peer_by_address("http://127.0.0.1:8212").await.unwrap();
+        let peer = disc
+            .get_peer_by_address("http://127.0.0.1:8212")
+            .await
+            .unwrap();
         assert_eq!(peer.pubkey, "peer1");
     }
 
     #[tokio::test]
     async fn test_get_peer_by_address_alias() {
         let disc = PeerDiscovery::new("us".to_string(), vec![]);
-        disc.add_peer("peer1".to_string(), "http://127.0.0.1:8212".to_string(), 5).await;
-        disc.add_alias("http://localhost:9002".to_string(), "peer1".to_string()).await;
+        disc.add_peer("peer1".to_string(), "http://127.0.0.1:8212".to_string(), 5)
+            .await;
+        disc.add_alias("http://localhost:9002".to_string(), "peer1".to_string())
+            .await;
 
-        let peer = disc.get_peer_by_address("http://localhost:9002").await.unwrap();
+        let peer = disc
+            .get_peer_by_address("http://localhost:9002")
+            .await
+            .unwrap();
         assert_eq!(peer.pubkey, "peer1");
         assert_eq!(peer.address, "http://127.0.0.1:8212");
     }
@@ -239,17 +251,25 @@ mod tests {
     #[tokio::test]
     async fn test_get_peer_by_address_localhost_normalization() {
         let disc = PeerDiscovery::new("us".to_string(), vec![]);
-        disc.add_peer("peer1".to_string(), "http://localhost:8212".to_string(), 5).await;
+        disc.add_peer("peer1".to_string(), "http://localhost:8212".to_string(), 5)
+            .await;
 
-        let peer = disc.get_peer_by_address("http://127.0.0.1:8212").await.unwrap();
+        let peer = disc
+            .get_peer_by_address("http://127.0.0.1:8212")
+            .await
+            .unwrap();
         assert_eq!(peer.pubkey, "peer1");
     }
 
     #[tokio::test]
     async fn test_get_peer_by_address_miss() {
         let disc = PeerDiscovery::new("us".to_string(), vec![]);
-        disc.add_peer("peer1".to_string(), "http://127.0.0.1:8212".to_string(), 5).await;
+        disc.add_peer("peer1".to_string(), "http://127.0.0.1:8212".to_string(), 5)
+            .await;
 
-        assert!(disc.get_peer_by_address("http://127.0.0.1:9999").await.is_none());
+        assert!(disc
+            .get_peer_by_address("http://127.0.0.1:9999")
+            .await
+            .is_none());
     }
 }

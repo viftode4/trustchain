@@ -9,10 +9,8 @@ fn bench_propose_agree_memory(c: &mut Criterion) {
 
     c.bench_function("propose_agree_memory", |b| {
         b.iter(|| {
-            let mut alice =
-                TrustChainProtocol::new(alice_id.clone(), MemoryBlockStore::new());
-            let mut bob =
-                TrustChainProtocol::new(bob_id.clone(), MemoryBlockStore::new());
+            let mut alice = TrustChainProtocol::new(alice_id.clone(), MemoryBlockStore::new());
+            let mut bob = TrustChainProtocol::new(bob_id.clone(), MemoryBlockStore::new());
 
             let proposal = alice
                 .create_proposal(
@@ -22,7 +20,9 @@ fn bench_propose_agree_memory(c: &mut Criterion) {
                 )
                 .unwrap();
             bob.receive_proposal(black_box(&proposal)).unwrap();
-            let agreement = bob.create_agreement(black_box(&proposal), Some(1001)).unwrap();
+            let agreement = bob
+                .create_agreement(black_box(&proposal), Some(1001))
+                .unwrap();
             alice.receive_agreement(black_box(&agreement)).unwrap();
         })
     });
@@ -47,7 +47,9 @@ fn bench_propose_agree_sqlite(c: &mut Criterion) {
                 )
                 .unwrap();
             bob.receive_proposal(black_box(&proposal)).unwrap();
-            let agreement = bob.create_agreement(black_box(&proposal), Some(1001)).unwrap();
+            let agreement = bob
+                .create_agreement(black_box(&proposal), Some(1001))
+                .unwrap();
             alice.receive_agreement(black_box(&agreement)).unwrap();
         })
     });
@@ -58,10 +60,8 @@ fn bench_propose_agree_sequential_100(c: &mut Criterion) {
         b.iter(|| {
             let alice_id = Identity::from_bytes(&[1u8; 32]);
             let bob_id = Identity::from_bytes(&[2u8; 32]);
-            let mut alice =
-                TrustChainProtocol::new(alice_id.clone(), MemoryBlockStore::new());
-            let mut bob =
-                TrustChainProtocol::new(bob_id.clone(), MemoryBlockStore::new());
+            let mut alice = TrustChainProtocol::new(alice_id.clone(), MemoryBlockStore::new());
+            let mut bob = TrustChainProtocol::new(bob_id.clone(), MemoryBlockStore::new());
 
             for i in 0..100u64 {
                 let proposal = alice
@@ -79,5 +79,10 @@ fn bench_propose_agree_sequential_100(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_propose_agree_memory, bench_propose_agree_sqlite, bench_propose_agree_sequential_100);
+criterion_group!(
+    benches,
+    bench_propose_agree_memory,
+    bench_propose_agree_sqlite,
+    bench_propose_agree_sequential_100
+);
 criterion_main!(benches);

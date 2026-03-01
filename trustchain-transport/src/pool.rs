@@ -40,12 +40,14 @@ impl ConnectionPool {
             self.evict_oldest(&mut conns);
         }
 
-        let entry = conns.entry(address.clone()).or_insert_with(|| PooledConnection {
-            address: address.clone(),
-            pubkey: pubkey.clone(),
-            last_used: Instant::now(),
-            created_at: Instant::now(),
-        });
+        let entry = conns
+            .entry(address.clone())
+            .or_insert_with(|| PooledConnection {
+                address: address.clone(),
+                pubkey: pubkey.clone(),
+                last_used: Instant::now(),
+                created_at: Instant::now(),
+            });
         entry.last_used = Instant::now();
         if pubkey.is_some() {
             entry.pubkey = pubkey;
@@ -82,16 +84,18 @@ impl ConnectionPool {
         self.connections.read().await.len()
     }
 
+    /// Whether the pool is empty.
+    pub async fn is_empty(&self) -> bool {
+        self.connections.read().await.is_empty()
+    }
+
     /// Clean up idle connections.
     pub async fn cleanup(&self) {
         let mut conns = self.connections.write().await;
         conns.retain(|_, conn| conn.last_used.elapsed() <= self.max_idle_duration);
     }
 
-    fn evict_oldest(
-        &self,
-        conns: &mut HashMap<String, PooledConnection>,
-    ) {
+    fn evict_oldest(&self, conns: &mut HashMap<String, PooledConnection>) {
         if let Some(oldest_key) = conns
             .iter()
             .min_by_key(|(_, c)| c.last_used)
@@ -115,7 +119,8 @@ mod tests {
     #[tokio::test]
     async fn test_pool_put_get() {
         let pool = ConnectionPool::new(10, 60);
-        pool.put("127.0.0.1:8200".to_string(), Some("aaa".to_string())).await;
+        pool.put("127.0.0.1:8200".to_string(), Some("aaa".to_string()))
+            .await;
 
         let conn = pool.get("127.0.0.1:8200").await.unwrap();
         assert_eq!(conn.address, "127.0.0.1:8200");

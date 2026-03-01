@@ -1,0 +1,86 @@
+{
+  "block_vectors": [
+    {
+      "block_type": "proposal",
+      "counterparty_seed": "0202020202020202020202020202020202020202020202020202020202020202",
+      "creator_seed": "0101010101010101010101010101010101010101010101010101010101010101",
+      "expected_block_hash": "b482621c2720c5854def899c566a19c115a243ff8c79d88e6fbecebbb6dad103",
+      "expected_public_key": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "expected_signature": "4a620c37aead4db9588975121d7a6e92e8cea5d82961112ee6bf444837ba6eb77798023f0455632d31f3ee833121501d35668fda357f4350bc93afd15eb7670f",
+      "link_sequence_number": 0,
+      "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "sequence_number": 1,
+      "timestamp": 1700000000000,
+      "transaction": {
+        "amount": 42,
+        "interaction_type": "test"
+      }
+    }
+  ],
+  "hash_vectors": [
+    {
+      "canonical": "{\"a\":1,\"b\":2}",
+      "input": {
+        "a": 1,
+        "b": 2
+      },
+      "sha256": "43258cff783fe7036d8a43033f830adfc60ec037382473548ac742b888292777"
+    },
+    {
+      "canonical": "{\"a\":\"first\",\"z\":\"last\"}",
+      "input": {
+        "a": "first",
+        "z": "last"
+      },
+      "sha256": "af3bf072ea841a14c20d546622a7edd6ecb1b6a59c12f49cef627eac17416041"
+    },
+    {
+      "canonical": "{\"flat\":true,\"nested\":{\"x\":1}}",
+      "input": {
+        "flat": true,
+        "nested": {
+          "x": 1
+        }
+      },
+      "sha256": "216a5c2c1202c6ffd2229ddd5b55a8ed27a4c42a1833f6e6ce5357ec29639e08"
+    }
+  ],
+  "identity_vectors": [
+    {
+      "pubkey": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "seed": "0101010101010101010101010101010101010101010101010101010101010101"
+    },
+    {
+      "pubkey": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+      "seed": "0202020202020202020202020202020202020202020202020202020202020202"
+    },
+    {
+      "pubkey": "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
+      "seed": "0303030303030303030303030303030303030303030303030303030303030303"
+    },
+    {
+      "pubkey": "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
+      "seed": "0404040404040404040404040404040404040404040404040404040404040404"
+    },
+    {
+      "pubkey": "6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1",
+      "seed": "0505050505050505050505050505050505050505050505050505050505050505"
+    }
+  ],
+  "trust_vectors": [
+    {
+      "base_timestamp": 1700000000000,
+      "description": "3 bilateral interactions between A(seed=1) and B(seed=2)",
+      "n_interactions": 3,
+      "scores_a": {
+        "integrity": 1.0
+      },
+      "scores_b": {
+        "integrity": 1.0
+      },
+      "seed_a": "0101010101010101010101010101010101010101010101010101010101010101",
+      "seed_b": "0202020202020202020202020202020202020202020202020202020202020202",
+      "timestamp_step": 10000
+    }
+  ]
+}

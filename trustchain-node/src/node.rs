@@ -8,20 +8,18 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 
 use trustchain_core::{
-    BlockStore, CHECOConsensus, HalfBlock, Identity, PersistentPeer, SqliteBlockStore,
-    SqliteDelegationStore, TrustChainProtocol, validate_block_invariants, verify_block,
-    ValidationResult,
+    validate_block_invariants, verify_block, BlockStore, CHECOConsensus, HalfBlock, Identity,
+    PersistentPeer, SqliteBlockStore, SqliteDelegationStore, TrustChainProtocol, ValidationResult,
 };
 use trustchain_transport::{
-    AppState, ConnectionPool, PeerDiscovery, ProxyState, QuicTransport,
-    QUIC_PORT_OFFSET,
-    discover,
-    build_router, start_grpc_server, start_proxy_server,
+    build_router, discover,
     message::{
-        BlockPairBroadcastPayload, CheckpointFinalizedPayload, CheckpointProposalPayload,
-        CheckpointVotePayload, CheckpointWire, FraudProofPayload, MessageType,
-        TransportMessage, block_to_bytes, bytes_to_block,
+        block_to_bytes, bytes_to_block, BlockPairBroadcastPayload, CheckpointFinalizedPayload,
+        CheckpointProposalPayload, CheckpointVotePayload, CheckpointWire, FraudProofPayload,
+        MessageType, TransportMessage,
     },
+    start_grpc_server, start_proxy_server, AppState, ConnectionPool, PeerDiscovery, ProxyState,
+    QuicTransport, QUIC_PORT_OFFSET,
 };
 
 use crate::config::NodeConfig;
@@ -85,25 +83,19 @@ impl Node {
     /// Create a new node from configuration.
     pub fn new(identity: Identity, config: NodeConfig) -> Self {
         let db_path = config.db_path.to_str().unwrap_or("trustchain.db");
-        let store = SqliteBlockStore::open(db_path)
-            .expect("failed to open SQLite database");
+        let store = SqliteBlockStore::open(db_path).expect("failed to open SQLite database");
         let protocol = TrustChainProtocol::new(identity.clone(), store);
 
         // Second store handle to the same DB file (WAL mode enables concurrent readers).
-        let consensus_store = SqliteBlockStore::open(db_path)
-            .expect("failed to open SQLite database for consensus");
+        let consensus_store =
+            SqliteBlockStore::open(db_path).expect("failed to open SQLite database for consensus");
 
         // Load persisted checkpoints from previous runs.
-        let persisted_checkpoints = consensus_store.load_checkpoints()
-            .unwrap_or_default();
+        let persisted_checkpoints = consensus_store.load_checkpoints().unwrap_or_default();
         let checkpoint_count = persisted_checkpoints.len();
 
-        let mut consensus = CHECOConsensus::new(
-            identity.clone(),
-            consensus_store,
-            None,
-            config.min_signers,
-        );
+        let mut consensus =
+            CHECOConsensus::new(identity.clone(), consensus_store, None, config.min_signers);
         // Extract latest checkpoint before loading into consensus.
         let latest_cp = persisted_checkpoints.last().cloned();
         if !persisted_checkpoints.is_empty() {
@@ -111,10 +103,8 @@ impl Node {
             tracing::info!(count = checkpoint_count, "loaded persisted checkpoints");
         }
 
-        let discovery = PeerDiscovery::new(
-            identity.pubkey_hex(),
-            config.effective_bootstrap_nodes(),
-        );
+        let discovery =
+            PeerDiscovery::new(identity.pubkey_hex(), config.effective_bootstrap_nodes());
         let pool = ConnectionPool::default();
 
         // Open delegation store in the same data directory.
@@ -138,26 +128,34 @@ impl Node {
     /// Start all node services (QUIC, gRPC, HTTP, discovery).
     pub async fn run(&self) -> anyhow::Result<()> {
         let pubkey = self.identity.pubkey_hex();
-        tracing::info!(
-            pubkey = &pubkey[..8],
-            "starting TrustChain node"
-        );
+        tracing::info!(pubkey = &pubkey[..8], "starting TrustChain node");
 
         // Start QUIC transport.
         let quic_addr: SocketAddr = self.config.quic_addr.parse()?;
         let quic = QuicTransport::bind_with_rate_limit(
-            quic_addr, &pubkey, self.config.max_connections_per_ip_per_sec,
-        ).await.map_err(|e| anyhow::anyhow!("QUIC bind failed: {e}"))?;
-        let quic_local = quic.local_addr()
+            quic_addr,
+            &pubkey,
+            self.config.max_connections_per_ip_per_sec,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("QUIC bind failed: {e}"))?;
+        let quic_local = quic
+            .local_addr()
             .map_err(|e| anyhow::anyhow!("QUIC local addr: {e}"))?;
         tracing::info!(%quic_local, "QUIC transport ready");
 
         // Compute the HTTP address we will advertise to other peers.
         // Priority: explicit advertise_addr > STUN-derived > loopback fallback.
-        let http_port: u16 = self.config.http_addr.parse::<SocketAddr>()
+        let http_port: u16 = self
+            .config
+            .http_addr
+            .parse::<SocketAddr>()
             .map(|a| a.port())
             .unwrap_or(8202);
-        let mut our_http_addr: String = self.config.advertise_addr.clone()
+        let mut our_http_addr: String = self
+            .config
+            .advertise_addr
+            .clone()
             .unwrap_or_else(|| format!("http://127.0.0.1:{http_port}"));
 
         // Discover public address via STUN (for NAT traversal).
@@ -196,7 +194,14 @@ impl Node {
             let checkpoint_for_router = self.latest_checkpoint.clone();
             let delegation_for_router = self.delegation_store.clone();
             tokio::spawn(Self::quic_message_router(
-                quic_rx, protocol, discovery, tracker, quic_for_router, consensus_for_router, checkpoint_for_router, delegation_for_router,
+                quic_rx,
+                protocol,
+                discovery,
+                tracker,
+                quic_for_router,
+                consensus_for_router,
+                checkpoint_for_router,
+                delegation_for_router,
             ));
             (handle, quic)
         };
@@ -231,6 +236,8 @@ impl Node {
         let mcp_discovery = self.discovery.clone();
         #[cfg(feature = "mcp")]
         let mcp_endpoint = self.config.agent_endpoint.clone();
+        #[cfg(feature = "mcp")]
+        let mcp_seed_nodes = self.config.effective_bootstrap_nodes();
 
         let http_handle = tokio::spawn(async move {
             let router = build_router(http_state);
@@ -241,6 +248,7 @@ impl Node {
                     mcp_protocol,
                     mcp_discovery,
                     mcp_endpoint,
+                    mcp_seed_nodes,
                 );
                 router.nest_service("/mcp", mcp_svc)
             };
@@ -267,7 +275,9 @@ impl Node {
             discovery: self.discovery.clone(),
             quic: quic_accept_handle.1.clone(),
             client: reqwest::Client::new(),
-            peer_locks: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            peer_locks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             delegation_store: Some(self.delegation_store.clone()),
         };
         let proxy_handle = tokio::spawn(async move {
@@ -300,9 +310,13 @@ impl Node {
                 checkpoint_quic,
                 checkpoint_interval,
                 checkpoint_shared,
-            ).await;
+            )
+            .await;
         });
-        tracing::info!(interval_secs = checkpoint_interval, "CHECO checkpoint loop started");
+        tracing::info!(
+            interval_secs = checkpoint_interval,
+            "CHECO checkpoint loop started"
+        );
 
         // Start connection pool cleanup task.
         let pool = self.pool.clone();
@@ -314,14 +328,12 @@ impl Node {
         });
 
         // Register ourselves in the discovery layer so peers can find us.
-        self.discovery.add_peer(
-            pubkey.clone(),
-            our_http_addr,
-            {
+        self.discovery
+            .add_peer(pubkey.clone(), our_http_addr, {
                 let proto = self.protocol.lock().await;
                 proto.store().get_latest_seq(&pubkey).unwrap_or(0)
-            },
-        ).await;
+            })
+            .await;
 
         // Load persisted peers from previous sessions.
         {
@@ -330,7 +342,9 @@ impl Node {
                 Ok(peers) => {
                     let count = peers.len();
                     for p in peers {
-                        self.discovery.add_peer(p.pubkey, p.address, p.latest_seq).await;
+                        self.discovery
+                            .add_peer(p.pubkey, p.address, p.latest_seq)
+                            .await;
                     }
                     if count > 0 {
                         tracing::info!(count, "loaded persisted peers");
@@ -342,7 +356,9 @@ impl Node {
 
         // Register agent endpoint alias so the proxy can resolve it.
         if let Some(ref endpoint) = self.config.agent_endpoint {
-            self.discovery.add_alias(endpoint.clone(), pubkey.clone()).await;
+            self.discovery
+                .add_alias(endpoint.clone(), pubkey.clone())
+                .await;
             tracing::info!(
                 agent_endpoint = %endpoint,
                 "registered agent endpoint alias"
@@ -386,6 +402,7 @@ impl Node {
     }
 
     /// Route incoming QUIC messages to the protocol engine.
+    #[allow(clippy::too_many_arguments)]
     async fn quic_message_router(
         mut rx: mpsc::Receiver<(Vec<u8>, mpsc::Sender<Vec<u8>>)>,
         protocol: Arc<Mutex<TrustChainProtocol<SqliteBlockStore>>>,
@@ -406,14 +423,23 @@ impl Node {
             let delegation_store = delegation_store.clone();
             tokio::spawn(async move {
                 let response = Self::handle_quic_message(
-                    &data, &protocol, &discovery, &tracker, &quic, &consensus, &latest_checkpoint, &delegation_store,
-                ).await;
+                    &data,
+                    &protocol,
+                    &discovery,
+                    &tracker,
+                    &quic,
+                    &consensus,
+                    &latest_checkpoint,
+                    &delegation_store,
+                )
+                .await;
                 let _ = resp_tx.send(response).await;
             });
         }
     }
 
     /// Handle a single incoming QUIC message.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_quic_message(
         data: &[u8],
         protocol: &Arc<Mutex<TrustChainProtocol<SqliteBlockStore>>>,
@@ -444,8 +470,10 @@ impl Node {
                 };
 
                 let sender_pubkey = proposal.public_key.clone();
-                let is_delegation = proposal.block_type == trustchain_core::BlockType::Delegation.to_string();
-                let is_succession = proposal.block_type == trustchain_core::BlockType::Succession.to_string();
+                let is_delegation =
+                    proposal.block_type == trustchain_core::BlockType::Delegation.to_string();
+                let is_succession =
+                    proposal.block_type == trustchain_core::BlockType::Succession.to_string();
 
                 let (response, agreement_opt) = if is_delegation {
                     // Delegation proposal — use accept_delegation to also store DelegationRecord.
@@ -466,12 +494,19 @@ impl Node {
                                 msg.request_id,
                             );
                             tracing::info!(
-                                delegator = &proposal.public_key[..8.min(proposal.public_key.len())],
+                                delegator =
+                                    &proposal.public_key[..8.min(proposal.public_key.len())],
                                 "accepted delegation via QUIC"
                             );
-                            (serde_json::to_vec(&resp).unwrap_or_default(), Some(agreement))
+                            (
+                                serde_json::to_vec(&resp).unwrap_or_default(),
+                                Some(agreement),
+                            )
                         }
-                        Err(e) => (Self::error_response(&format!("delegation acceptance failed: {e}")), None),
+                        Err(e) => (
+                            Self::error_response(&format!("delegation acceptance failed: {e}")),
+                            None,
+                        ),
                     }
                 } else if is_succession {
                     // Succession proposals require explicit operator approval.
@@ -503,9 +538,15 @@ impl Node {
                                 block_to_bytes(&agreement),
                                 msg.request_id,
                             );
-                            (serde_json::to_vec(&resp).unwrap_or_default(), Some(agreement))
+                            (
+                                serde_json::to_vec(&resp).unwrap_or_default(),
+                                Some(agreement),
+                            )
                         }
-                        Err(e) => (Self::error_response(&format!("agreement failed: {e}")), None),
+                        Err(e) => (
+                            Self::error_response(&format!("agreement failed: {e}")),
+                            None,
+                        ),
                     }
                 };
 
@@ -516,14 +557,19 @@ impl Node {
                         proto.pubkey()
                     };
                     Self::broadcast_block_pair(
-                        &proposal, agreement, &our_pubkey, discovery, quic, tracker,
-                    ).await;
+                        &proposal,
+                        agreement,
+                        &our_pubkey,
+                        discovery,
+                        quic,
+                        tracker,
+                    )
+                    .await;
                 }
 
                 // Check for fraud and broadcast if found.
-                Self::check_and_broadcast_fraud(
-                    &sender_pubkey, protocol, discovery, quic, tracker,
-                ).await;
+                Self::check_and_broadcast_fraud(&sender_pubkey, protocol, discovery, quic, tracker)
+                    .await;
 
                 response
             }
@@ -541,18 +587,15 @@ impl Node {
                 let response = {
                     let mut proto = protocol.lock().await;
                     match proto.receive_agreement(&agreement) {
-                        Ok(_) => {
-                            serde_json::to_vec(&serde_json::json!({"accepted": true}))
-                                .unwrap_or_default()
-                        }
+                        Ok(_) => serde_json::to_vec(&serde_json::json!({"accepted": true}))
+                            .unwrap_or_default(),
                         Err(e) => Self::error_response(&format!("agreement rejected: {e}")),
                     }
                 };
 
                 // After lock released, check for fraud and broadcast if found.
-                Self::check_and_broadcast_fraud(
-                    &sender_pubkey, protocol, discovery, quic, tracker,
-                ).await;
+                Self::check_and_broadcast_fraud(&sender_pubkey, protocol, discovery, quic, tracker)
+                    .await;
 
                 response
             }
@@ -560,14 +603,10 @@ impl Node {
             MessageType::CrawlRequest => {
                 let proto = protocol.lock().await;
                 // Payload is JSON: {"public_key": "...", "start_seq": N}
-                let req: serde_json::Value = serde_json::from_slice(&msg.payload)
-                    .unwrap_or_default();
-                let pubkey = req.get("public_key")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let start_seq = req.get("start_seq")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1);
+                let req: serde_json::Value =
+                    serde_json::from_slice(&msg.payload).unwrap_or_default();
+                let pubkey = req.get("public_key").and_then(|v| v.as_str()).unwrap_or("");
+                let start_seq = req.get("start_seq").and_then(|v| v.as_u64()).unwrap_or(1);
 
                 match proto.store().crawl(pubkey, start_seq) {
                     Ok(blocks) => {
@@ -593,12 +632,15 @@ impl Node {
                     "public_key": pubkey,
                     "latest_seq": latest_seq,
                     "block_count": block_count,
-                })).unwrap_or_default()
+                }))
+                .unwrap_or_default()
             }
 
             MessageType::DiscoveryRequest => {
                 // Payload: list of (pubkey, address, seq).
-                if let Ok(peers) = serde_json::from_slice::<Vec<(String, String, u64)>>(&msg.payload) {
+                if let Ok(peers) =
+                    serde_json::from_slice::<Vec<(String, String, u64)>>(&msg.payload)
+                {
                     discovery.merge_peers(peers).await;
                 }
 
@@ -629,13 +671,17 @@ impl Node {
 
             MessageType::BlockPairBroadcast => {
                 // Deserialize the broadcast payload.
-                let payload: BlockPairBroadcastPayload = match serde_json::from_slice(&msg.payload) {
+                let payload: BlockPairBroadcastPayload = match serde_json::from_slice(&msg.payload)
+                {
                     Ok(p) => p,
                     Err(e) => return Self::error_response(&format!("invalid broadcast: {e}")),
                 };
 
                 // Check if we've already seen these blocks.
-                let block_id = format!("{}:{}", payload.block1.block_hash, payload.block2.block_hash);
+                let block_id = format!(
+                    "{}:{}",
+                    payload.block1.block_hash, payload.block2.block_hash
+                );
                 {
                     let mut t = tracker.lock().await;
                     if !t.mark_if_new(&block_id) {
@@ -701,20 +747,20 @@ impl Node {
                         let proto = protocol.lock().await;
                         proto.pubkey()
                     };
-                    Self::broadcast_to_peers(
-                        &relay_payload, &our_pubkey, discovery, quic, tracker,
-                    ).await;
+                    Self::broadcast_to_peers(&relay_payload, &our_pubkey, discovery, quic, tracker)
+                        .await;
                 }
 
-                serde_json::to_vec(&serde_json::json!({"status": "ok"}))
-                    .unwrap_or_default()
+                serde_json::to_vec(&serde_json::json!({"status": "ok"})).unwrap_or_default()
             }
 
             MessageType::CapabilityRequest => {
                 // Deserialize the query.
                 let query: discover::CapabilityQuery = match serde_json::from_slice(&msg.payload) {
                     Ok(q) => q,
-                    Err(e) => return Self::error_response(&format!("invalid capability query: {e}")),
+                    Err(e) => {
+                        return Self::error_response(&format!("invalid capability query: {e}"))
+                    }
                 };
 
                 // Scan local blockstore.
@@ -784,7 +830,9 @@ impl Node {
                 // Store the double-spend.
                 {
                     let mut proto = protocol.lock().await;
-                    let _ = proto.store_mut().add_double_spend(&payload.block_a, &payload.block_b);
+                    let _ = proto
+                        .store_mut()
+                        .add_double_spend(&payload.block_a, &payload.block_b);
                 }
 
                 tracing::warn!(
@@ -805,8 +853,13 @@ impl Node {
                         proto.pubkey()
                     };
                     Self::broadcast_fraud_proof(
-                        &relay_payload, &our_pubkey, discovery, quic, tracker,
-                    ).await;
+                        &relay_payload,
+                        &our_pubkey,
+                        discovery,
+                        quic,
+                        tracker,
+                    )
+                    .await;
                 }
 
                 serde_json::to_vec(&serde_json::json!({"status": "fraud_recorded"}))
@@ -846,14 +899,16 @@ impl Node {
                     }
                 }
 
-                serde_json::to_vec(&serde_json::json!({"status": "ok"}))
-                    .unwrap_or_default()
+                serde_json::to_vec(&serde_json::json!({"status": "ok"})).unwrap_or_default()
             }
 
             MessageType::CheckpointProposal => {
-                let payload: CheckpointProposalPayload = match serde_json::from_slice(&msg.payload) {
+                let payload: CheckpointProposalPayload = match serde_json::from_slice(&msg.payload)
+                {
                     Ok(p) => p,
-                    Err(e) => return Self::error_response(&format!("invalid checkpoint proposal: {e}")),
+                    Err(e) => {
+                        return Self::error_response(&format!("invalid checkpoint proposal: {e}"))
+                    }
                 };
 
                 // Validate: must be a checkpoint block with valid signature.
@@ -867,9 +922,9 @@ impl Node {
                 // Sign the checkpoint block hash as our vote.
                 let proto = protocol.lock().await;
                 let voter_pubkey = proto.pubkey();
-                let signature_hex = proto.identity().sign_hex(
-                    payload.checkpoint_block.block_hash.as_bytes(),
-                );
+                let signature_hex = proto
+                    .identity()
+                    .sign_hex(payload.checkpoint_block.block_hash.as_bytes());
 
                 let vote = CheckpointVotePayload {
                     checkpoint_block_hash: payload.checkpoint_block.block_hash.clone(),
@@ -888,9 +943,12 @@ impl Node {
             }
 
             MessageType::CheckpointFinalized => {
-                let payload: CheckpointFinalizedPayload = match serde_json::from_slice(&msg.payload) {
+                let payload: CheckpointFinalizedPayload = match serde_json::from_slice(&msg.payload)
+                {
                     Ok(p) => p,
-                    Err(e) => return Self::error_response(&format!("invalid checkpoint finalized: {e}")),
+                    Err(e) => {
+                        return Self::error_response(&format!("invalid checkpoint finalized: {e}"))
+                    }
                 };
 
                 // Validate the checkpoint block.
@@ -929,9 +987,7 @@ impl Node {
                             );
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                "failed to persist finalized checkpoint: {e}"
-                            );
+                            tracing::warn!("failed to persist finalized checkpoint: {e}");
                         }
                     }
                 }
@@ -940,9 +996,7 @@ impl Node {
                     .unwrap_or_default()
             }
 
-            _ => {
-                Self::error_response("unhandled message type")
-            }
+            _ => Self::error_response("unhandled message type"),
         }
     }
 
@@ -969,7 +1023,8 @@ impl Node {
 
         for peer in peers {
             // Derive QUIC address from HTTP address (port - QUIC_PORT_OFFSET).
-            let quic_addr = match peer.address
+            let quic_addr = match peer
+                .address
                 .strip_prefix("http://")
                 .unwrap_or(&peer.address)
                 .parse::<SocketAddr>()
@@ -984,7 +1039,9 @@ impl Node {
                 match tokio::time::timeout(
                     Duration::from_secs(5),
                     quic.send_message(quic_addr, &msg_bytes),
-                ).await {
+                )
+                .await
+                {
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => tracing::debug!("broadcast send error: {e}"),
                     Err(_) => tracing::debug!("broadcast send timeout"),
@@ -1043,12 +1100,16 @@ impl Node {
             MessageType::FraudProof,
             our_pubkey.to_string(),
             serde_json::to_vec(payload).unwrap_or_default(),
-            format!("fraud-{}", payload.block_a.block_hash.get(..8).unwrap_or("?")),
+            format!(
+                "fraud-{}",
+                payload.block_a.block_hash.get(..8).unwrap_or("?")
+            ),
         );
         let msg_bytes = serde_json::to_vec(&msg).unwrap_or_default();
 
         for peer in peers {
-            let quic_addr = match peer.address
+            let quic_addr = match peer
+                .address
                 .strip_prefix("http://")
                 .unwrap_or(&peer.address)
                 .parse::<SocketAddr>()
@@ -1063,7 +1124,9 @@ impl Node {
                 match tokio::time::timeout(
                     Duration::from_secs(5),
                     quic.send_message(quic_addr, &msg_bytes),
-                ).await {
+                )
+                .await
+                {
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => tracing::debug!("fraud broadcast send error: {e}"),
                     Err(_) => tracing::debug!("fraud broadcast send timeout"),
@@ -1121,7 +1184,9 @@ impl Node {
             tracing::info!(addr = %addr, "bootstrapping from peer");
             match Self::fetch_status_http(addr).await {
                 Ok((pubkey, latest_seq, agent_endpoint)) => {
-                    discovery.add_peer(pubkey.clone(), addr.clone(), latest_seq).await;
+                    discovery
+                        .add_peer(pubkey.clone(), addr.clone(), latest_seq)
+                        .await;
                     if let Some(ep) = agent_endpoint {
                         discovery.add_alias(ep, pubkey).await;
                     }
@@ -1153,7 +1218,9 @@ impl Node {
                 // Refresh peer status.
                 match Self::fetch_status_http(&peer.address).await {
                     Ok((pubkey, latest_seq, agent_endpoint)) => {
-                        discovery.add_peer(pubkey.clone(), peer.address.clone(), latest_seq).await;
+                        discovery
+                            .add_peer(pubkey.clone(), peer.address.clone(), latest_seq)
+                            .await;
                         if let Some(ep) = agent_endpoint {
                             discovery.add_alias(ep, pubkey).await;
                         }
@@ -1184,7 +1251,9 @@ impl Node {
                 };
                 if peer.latest_seq > our_seq {
                     // Fetch missing blocks.
-                    if let Ok(blocks) = Self::fetch_crawl_http(&peer.address, &peer.pubkey, our_seq + 1).await {
+                    if let Ok(blocks) =
+                        Self::fetch_crawl_http(&peer.address, &peer.pubkey, our_seq + 1).await
+                    {
                         let mut proto = protocol.lock().await;
                         let our_pubkey = proto.pubkey();
                         for block in &blocks {
@@ -1209,11 +1278,15 @@ impl Node {
                         // operator consent. The operator MUST explicitly call
                         // POST /accept_delegation to accept each delegation.
                         for block in &blocks {
-                            if block.block_type == trustchain_core::BlockType::Delegation.to_string()
+                            if block.block_type
+                                == trustchain_core::BlockType::Delegation.to_string()
                                 && block.link_public_key == our_pubkey
-                                && block.link_sequence_number == 0  // proposal (not yet accepted)
+                                && block.link_sequence_number == 0
+                            // proposal (not yet accepted)
                             {
-                                let delegation_id = block.transaction.get("delegation_id")
+                                let delegation_id = block
+                                    .transaction
+                                    .get("delegation_id")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("<unknown>");
                                 tracing::info!(
@@ -1260,14 +1333,14 @@ impl Node {
             .json()
             .await?;
 
-        let pubkey = resp.get("public_key")
+        let pubkey = resp
+            .get("public_key")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing public_key"))?
             .to_string();
-        let latest_seq = resp.get("latest_seq")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let agent_endpoint = resp.get("agent_endpoint")
+        let latest_seq = resp.get("latest_seq").and_then(|v| v.as_u64()).unwrap_or(0);
+        let agent_endpoint = resp
+            .get("agent_endpoint")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
@@ -1411,7 +1484,8 @@ impl Node {
 
             // Fan out to peers with 10s timeout per peer.
             for peer in &peers {
-                let quic_addr = match peer.address
+                let quic_addr = match peer
+                    .address
                     .strip_prefix("http://")
                     .unwrap_or(&peer.address)
                     .parse::<SocketAddr>()
@@ -1423,12 +1497,16 @@ impl Node {
                 match tokio::time::timeout(
                     Duration::from_secs(10),
                     quic.send_message(quic_addr, &msg_bytes),
-                ).await {
+                )
+                .await
+                {
                     Ok(Ok(resp_bytes)) => {
                         // Parse vote response.
                         if let Ok(resp) = serde_json::from_slice::<TransportMessage>(&resp_bytes) {
                             if resp.message_type == MessageType::CheckpointVote {
-                                if let Ok(vote) = serde_json::from_slice::<CheckpointVotePayload>(&resp.payload) {
+                                if let Ok(vote) =
+                                    serde_json::from_slice::<CheckpointVotePayload>(&resp.payload)
+                                {
                                     if vote.checkpoint_block_hash == checkpoint_block.block_hash {
                                         signatures.insert(vote.voter_pubkey, vote.signature_hex);
                                     }
@@ -1436,12 +1514,18 @@ impl Node {
                             }
                         }
                     }
-                    Ok(Err(e)) => tracing::debug!(peer = &peer.pubkey[..8], err = %e, "checkpoint vote error"),
+                    Ok(Err(e)) => {
+                        tracing::debug!(peer = &peer.pubkey[..8], err = %e, "checkpoint vote error")
+                    }
                     Err(_) => tracing::debug!(peer = &peer.pubkey[..8], "checkpoint vote timeout"),
                 }
             }
 
-            tracing::info!(round, votes = signatures.len(), "collected checkpoint votes");
+            tracing::info!(
+                round,
+                votes = signatures.len(),
+                "collected checkpoint votes"
+            );
 
             // Finalize if we have enough signatures.
             let finalized = {
@@ -1492,12 +1576,15 @@ impl Node {
                     let finalized_bytes = serde_json::to_vec(&finalized_msg).unwrap_or_default();
 
                     for peer in &peers {
-                        let quic_addr = match peer.address
+                        let quic_addr = match peer
+                            .address
                             .strip_prefix("http://")
                             .unwrap_or(&peer.address)
                             .parse::<SocketAddr>()
                         {
-                            Ok(a) => SocketAddr::new(a.ip(), a.port().saturating_sub(QUIC_PORT_OFFSET)),
+                            Ok(a) => {
+                                SocketAddr::new(a.ip(), a.port().saturating_sub(QUIC_PORT_OFFSET))
+                            }
                             Err(_) => continue,
                         };
                         let quic = quic.clone();
@@ -1506,7 +1593,8 @@ impl Node {
                             let _ = tokio::time::timeout(
                                 Duration::from_secs(5),
                                 quic.send_message(quic_addr, &bytes),
-                            ).await;
+                            )
+                            .await;
                         });
                     }
                 }

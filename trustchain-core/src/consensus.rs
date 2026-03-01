@@ -132,9 +132,7 @@ impl<S: BlockStore> CHECOConsensus<S> {
     /// Creates a CHECKPOINT block referencing all known chain heads.
     pub fn propose_checkpoint(&mut self) -> Result<HalfBlock> {
         if !self.is_facilitator()? {
-            return Err(TrustChainError::checkpoint(
-                "not the current facilitator",
-            ));
+            return Err(TrustChainError::checkpoint("not the current facilitator"));
         }
 
         // Collect chain heads.
@@ -226,7 +224,9 @@ impl<S: BlockStore> CHECOConsensus<S> {
         if !checkpoint_block.is_checkpoint() {
             return Err(TrustChainError::checkpoint("block is not a checkpoint"));
         }
-        Ok(self.identity.sign_hex(checkpoint_block.block_hash.as_bytes()))
+        Ok(self
+            .identity
+            .sign_hex(checkpoint_block.block_hash.as_bytes()))
     }
 
     /// Finalize a checkpoint with collected co-signatures.
@@ -245,11 +245,8 @@ impl<S: BlockStore> CHECOConsensus<S> {
 
         // Verify all signatures.
         for (pubkey, sig_hex) in &signatures {
-            let valid = Identity::verify_hex(
-                checkpoint_block.block_hash.as_bytes(),
-                sig_hex,
-                pubkey,
-            )?;
+            let valid =
+                Identity::verify_hex(checkpoint_block.block_hash.as_bytes(), sig_hex, pubkey)?;
             if !valid {
                 return Err(TrustChainError::checkpoint(format!(
                     "invalid signature from {}",
@@ -291,7 +288,7 @@ impl<S: BlockStore> CHECOConsensus<S> {
                 && cp
                     .chain_heads
                     .get(pubkey)
-                    .map_or(false, |&cp_seq| seq <= cp_seq)
+                    .is_some_and(|&cp_seq| seq <= cp_seq)
         })
     }
 }
@@ -333,9 +330,14 @@ mod tests {
         alice_prev: &str,
     ) -> String {
         let proposal = create_half_block(
-            alice, alice_seq, &bob.pubkey_hex(), 0,
-            alice_prev, BlockType::Proposal,
-            serde_json::json!({"service": "test"}), Some(1000),
+            alice,
+            alice_seq,
+            &bob.pubkey_hex(),
+            0,
+            alice_prev,
+            BlockType::Proposal,
+            serde_json::json!({"service": "test"}),
+            Some(1000),
         );
         let hash = proposal.block_hash.clone();
         store.add_block(&proposal).unwrap();
@@ -379,7 +381,8 @@ mod tests {
 
             // Validate from another peer's perspective.
             let store_b = MemoryBlockStore::new();
-            let consensus_b = CHECOConsensus::new(b.clone(), store_b, Some(vec![a.pubkey_hex()]), 1);
+            let consensus_b =
+                CHECOConsensus::new(b.clone(), store_b, Some(vec![a.pubkey_hex()]), 1);
             // b doesn't know about a's blocks, so validation may differ.
             // With our_seq == 0, it accepts any claimed seq.
             assert!(consensus_b.validate_checkpoint(&checkpoint).unwrap());
@@ -399,7 +402,8 @@ mod tests {
 
             // B co-signs.
             let store_b = MemoryBlockStore::new();
-            let consensus_b = CHECOConsensus::new(b.clone(), store_b, Some(vec![a.pubkey_hex()]), 1);
+            let consensus_b =
+                CHECOConsensus::new(b.clone(), store_b, Some(vec![a.pubkey_hex()]), 1);
             let sig_b = consensus_b.sign_checkpoint(&checkpoint).unwrap();
 
             // Finalize with B's signature.
@@ -443,7 +447,10 @@ mod tests {
         add_interaction(&mut store_a, &a, &b, 1, GENESIS_HASH);
 
         let mut consensus_a = CHECOConsensus::new(
-            a.clone(), store_a, Some(vec![]), 3, // require 3 signers
+            a.clone(),
+            store_a,
+            Some(vec![]),
+            3, // require 3 signers
         );
 
         if consensus_a.is_facilitator().unwrap() {

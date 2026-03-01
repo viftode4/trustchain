@@ -384,25 +384,34 @@ impl SqliteBlockStore {
                 let sigs_json: String = row.get(3)?;
                 let timestamp: u64 = row.get(4)?;
                 let finalized: i32 = row.get(5)?;
-                Ok((facilitator_pubkey, chain_heads_json, block_json, sigs_json, timestamp, finalized))
+                Ok((
+                    facilitator_pubkey,
+                    chain_heads_json,
+                    block_json,
+                    sigs_json,
+                    timestamp,
+                    finalized,
+                ))
             })?
             .filter_map(|r| r.ok())
-            .filter_map(|(facilitator, heads_json, block_json, sigs_json, ts, fin)| {
-                let chain_heads: HashMap<String, u64> =
-                    serde_json::from_str(&heads_json).ok()?;
-                let checkpoint_block: crate::halfblock::HalfBlock =
-                    serde_json::from_str(&block_json).ok()?;
-                let signatures: HashMap<String, String> =
-                    serde_json::from_str(&sigs_json).ok()?;
-                Some(crate::consensus::Checkpoint {
-                    facilitator_pubkey: facilitator,
-                    chain_heads,
-                    checkpoint_block,
-                    signatures,
-                    timestamp: ts,
-                    finalized: fin != 0,
-                })
-            })
+            .filter_map(
+                |(facilitator, heads_json, block_json, sigs_json, ts, fin)| {
+                    let chain_heads: HashMap<String, u64> =
+                        serde_json::from_str(&heads_json).ok()?;
+                    let checkpoint_block: crate::halfblock::HalfBlock =
+                        serde_json::from_str(&block_json).ok()?;
+                    let signatures: HashMap<String, String> =
+                        serde_json::from_str(&sigs_json).ok()?;
+                    Some(crate::consensus::Checkpoint {
+                        facilitator_pubkey: facilitator,
+                        chain_heads,
+                        checkpoint_block,
+                        signatures,
+                        timestamp: ts,
+                        finalized: fin != 0,
+                    })
+                },
+            )
             .collect();
         Ok(checkpoints)
     }
@@ -423,7 +432,14 @@ impl SqliteBlockStore {
                 let sigs_json: String = row.get(3)?;
                 let timestamp: u64 = row.get(4)?;
                 let finalized: i32 = row.get(5)?;
-                Ok((facilitator_pubkey, chain_heads_json, block_json, sigs_json, timestamp, finalized))
+                Ok((
+                    facilitator_pubkey,
+                    chain_heads_json,
+                    block_json,
+                    sigs_json,
+                    timestamp,
+                    finalized,
+                ))
             })
             .optional()?;
 
@@ -432,8 +448,9 @@ impl SqliteBlockStore {
             Some((facilitator, heads_json, block_json, sigs_json, ts, fin)) => {
                 let chain_heads: HashMap<String, u64> = serde_json::from_str(&heads_json)
                     .map_err(|e| TrustChainError::Serialization(e.to_string()))?;
-                let checkpoint_block: crate::halfblock::HalfBlock = serde_json::from_str(&block_json)
-                    .map_err(|e| TrustChainError::Serialization(e.to_string()))?;
+                let checkpoint_block: crate::halfblock::HalfBlock =
+                    serde_json::from_str(&block_json)
+                        .map_err(|e| TrustChainError::Serialization(e.to_string()))?;
                 let signatures: HashMap<String, String> = serde_json::from_str(&sigs_json)
                     .map_err(|e| TrustChainError::Serialization(e.to_string()))?;
                 Ok(Some(crate::consensus::Checkpoint {
@@ -530,7 +547,11 @@ impl BlockStore for SqliteBlockStore {
              LIMIT 1",
         )?;
         let mut rows = stmt.query_map(
-            params![block.link_public_key, block.public_key, block.sequence_number],
+            params![
+                block.link_public_key,
+                block.public_key,
+                block.sequence_number
+            ],
             Self::row_to_block,
         )?;
         match rows.next() {
@@ -585,8 +606,8 @@ impl BlockStore for SqliteBlockStore {
 
     fn get_all_pubkeys(&self) -> Result<Vec<String>> {
         let conn = self.lock_conn();
-        let mut stmt = conn
-            .prepare("SELECT DISTINCT public_key FROM blocks ORDER BY public_key")?;
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT public_key FROM blocks ORDER BY public_key")?;
         let rows = stmt.query_map([], |row| row.get(0))?;
         let mut keys = Vec::new();
         for row in rows {
@@ -699,12 +720,7 @@ mod tests {
         Identity::from_bytes(&[1u8; 32])
     }
 
-    fn make_proposal(
-        id: &Identity,
-        seq: u64,
-        prev_hash: &str,
-        counterparty: &str,
-    ) -> HalfBlock {
+    fn make_proposal(id: &Identity, seq: u64, prev_hash: &str, counterparty: &str) -> HalfBlock {
         create_half_block(
             id,
             seq,
@@ -725,10 +741,7 @@ mod tests {
         // Empty store.
         assert_eq!(store.get_block_count().unwrap(), 0);
         assert_eq!(store.get_latest_seq(&id.pubkey_hex()).unwrap(), 0);
-        assert_eq!(
-            store.get_head_hash(&id.pubkey_hex()).unwrap(),
-            GENESIS_HASH
-        );
+        assert_eq!(store.get_head_hash(&id.pubkey_hex()).unwrap(), GENESIS_HASH);
 
         // Add first block.
         let block1 = make_proposal(&id, 1, GENESIS_HASH, &counterparty);
@@ -870,20 +883,24 @@ mod tests {
         // Save peers.
         {
             let mut store = SqliteBlockStore::open(&db_path).unwrap();
-            store.save_peer(&PersistentPeer {
-                pubkey: "aaa".to_string(),
-                address: "http://127.0.0.1:8202".to_string(),
-                latest_seq: 5,
-                last_seen_unix_ms: 1700000000000,
-                is_bootstrap: true,
-            }).unwrap();
-            store.save_peer(&PersistentPeer {
-                pubkey: "bbb".to_string(),
-                address: "http://127.0.0.1:8212".to_string(),
-                latest_seq: 3,
-                last_seen_unix_ms: 1700000001000,
-                is_bootstrap: false,
-            }).unwrap();
+            store
+                .save_peer(&PersistentPeer {
+                    pubkey: "aaa".to_string(),
+                    address: "http://127.0.0.1:8202".to_string(),
+                    latest_seq: 5,
+                    last_seen_unix_ms: 1700000000000,
+                    is_bootstrap: true,
+                })
+                .unwrap();
+            store
+                .save_peer(&PersistentPeer {
+                    pubkey: "bbb".to_string(),
+                    address: "http://127.0.0.1:8212".to_string(),
+                    latest_seq: 3,
+                    last_seen_unix_ms: 1700000001000,
+                    is_bootstrap: false,
+                })
+                .unwrap();
         }
 
         // Reopen and load.
@@ -901,13 +918,15 @@ mod tests {
     #[test]
     fn test_peer_persistence_memory() {
         let mut store = MemoryBlockStore::new();
-        store.save_peer(&PersistentPeer {
-            pubkey: "aaa".to_string(),
-            address: "addr1".to_string(),
-            latest_seq: 1,
-            last_seen_unix_ms: 1000,
-            is_bootstrap: false,
-        }).unwrap();
+        store
+            .save_peer(&PersistentPeer {
+                pubkey: "aaa".to_string(),
+                address: "addr1".to_string(),
+                latest_seq: 1,
+                last_seen_unix_ms: 1000,
+                is_bootstrap: false,
+            })
+            .unwrap();
 
         let peers = store.load_peers().unwrap();
         assert_eq!(peers.len(), 1);
@@ -929,8 +948,12 @@ mod tests {
         // Create a fake checkpoint.
         let identity = crate::identity::Identity::from_bytes(&[1u8; 32]);
         let block = crate::halfblock::create_half_block(
-            &identity, 1, &identity.pubkey_hex(), 0,
-            GENESIS_HASH, crate::types::BlockType::Checkpoint,
+            &identity,
+            1,
+            &identity.pubkey_hex(),
+            0,
+            GENESIS_HASH,
+            crate::types::BlockType::Checkpoint,
             serde_json::json!({"interaction_type": "checkpoint"}),
             Some(1000),
         );
@@ -966,13 +989,15 @@ mod tests {
     #[test]
     fn test_peer_remove_sqlite() {
         let mut store = SqliteBlockStore::in_memory().unwrap();
-        store.save_peer(&PersistentPeer {
-            pubkey: "aaa".to_string(),
-            address: "addr1".to_string(),
-            latest_seq: 1,
-            last_seen_unix_ms: 1000,
-            is_bootstrap: false,
-        }).unwrap();
+        store
+            .save_peer(&PersistentPeer {
+                pubkey: "aaa".to_string(),
+                address: "addr1".to_string(),
+                latest_seq: 1,
+                last_seen_unix_ms: 1000,
+                is_bootstrap: false,
+            })
+            .unwrap();
 
         assert_eq!(store.load_peers().unwrap().len(), 1);
         store.remove_stale_peer("aaa").unwrap();

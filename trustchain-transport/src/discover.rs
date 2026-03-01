@@ -111,7 +111,7 @@ fn block_matches_capability(block: &HalfBlock, capability: &str) -> bool {
 mod tests {
     use super::*;
     use trustchain_core::{
-        BlockType, Identity, MemoryBlockStore, GENESIS_HASH, halfblock::create_half_block,
+        halfblock::create_half_block, BlockType, Identity, MemoryBlockStore, GENESIS_HASH,
     };
 
     fn add_interaction(
@@ -165,7 +165,14 @@ mod tests {
         let bob = Identity::from_bytes(&[2u8; 32]);
 
         add_interaction(
-            &mut store, &alice, &bob, 1, 1, GENESIS_HASH, GENESIS_HASH, "compute",
+            &mut store,
+            &alice,
+            &bob,
+            1,
+            1,
+            GENESIS_HASH,
+            GENESIS_HASH,
+            "compute",
         );
 
         let results = find_capable_agents(&store, "compute", 10);
@@ -181,7 +188,14 @@ mod tests {
         let bob = Identity::from_bytes(&[2u8; 32]);
 
         add_interaction(
-            &mut store, &alice, &bob, 1, 1, GENESIS_HASH, GENESIS_HASH, "storage",
+            &mut store,
+            &alice,
+            &bob,
+            1,
+            1,
+            GENESIS_HASH,
+            GENESIS_HASH,
+            "storage",
         );
 
         let results = find_capable_agents(&store, "compute", 10);
@@ -197,12 +211,26 @@ mod tests {
 
         // Alice does 2 compute interactions (with bob, then carol).
         let (_, _) = add_interaction(
-            &mut store, &alice, &bob, 1, 1, GENESIS_HASH, GENESIS_HASH, "compute",
+            &mut store,
+            &alice,
+            &bob,
+            1,
+            1,
+            GENESIS_HASH,
+            GENESIS_HASH,
+            "compute",
         );
         let alice_prev = store.get_head_hash(&alice.pubkey_hex()).unwrap();
         let carol_prev = GENESIS_HASH;
         add_interaction(
-            &mut store, &alice, &carol, 2, 1, &alice_prev, carol_prev, "compute",
+            &mut store,
+            &alice,
+            &carol,
+            2,
+            1,
+            &alice_prev,
+            carol_prev,
+            "compute",
         );
 
         let results = find_capable_agents(&store, "compute", 10);
@@ -221,7 +249,14 @@ mod tests {
         for i in 2..=6 {
             let peer = Identity::from_bytes(&[i as u8; 32]);
             let (_, _) = add_interaction(
-                &mut store, &base, &peer, (i - 1) as u64, 1, &prev, GENESIS_HASH, "compute",
+                &mut store,
+                &base,
+                &peer,
+                (i - 1) as u64,
+                1,
+                &prev,
+                GENESIS_HASH,
+                "compute",
             );
             prev = store.get_head_hash(&base.pubkey_hex()).unwrap();
         }
@@ -238,7 +273,12 @@ mod tests {
 
         // "capability" field should also match.
         let block = create_half_block(
-            &alice, 1, &bob.pubkey_hex(), 0, GENESIS_HASH, BlockType::Proposal,
+            &alice,
+            1,
+            &bob.pubkey_hex(),
+            0,
+            GENESIS_HASH,
+            BlockType::Proposal,
             serde_json::json!({"capability": "inference"}),
             Some(1000),
         );

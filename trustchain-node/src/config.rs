@@ -187,4 +187,3 @@ pub fn default_seed_nodes() -> Vec<String> {
         // "http://seed2.trustchain.network:8202".to_string(),
     ]
 }
-

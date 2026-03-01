@@ -164,7 +164,9 @@ async fn main() -> anyhow::Result<()> {
             println!("  Saved to:   {output}");
         }
 
-        Commands::Run { config: config_path } => {
+        Commands::Run {
+            config: config_path,
+        } => {
             let config = if std::path::Path::new(&config_path).exists() {
                 NodeConfig::load(&config_path)?
             } else {
@@ -175,9 +177,7 @@ async fn main() -> anyhow::Result<()> {
             // Set up tracing/logging.
             let filter = tracing_subscriber::EnvFilter::try_new(&config.log_level)
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .init();
+            tracing_subscriber::fmt().with_env_filter(filter).init();
 
             // Load or generate identity.
             let identity = if config.key_path.exists() {
@@ -219,12 +219,12 @@ async fn main() -> anyhow::Result<()> {
             let store = trustchain_core::SqliteBlockStore::open(&db_path)
                 .map_err(|e| anyhow::anyhow!("Failed to open database: {e}"))?;
             let protocol = trustchain_core::TrustChainProtocol::new(identity.clone(), store);
-            let discovery =
-                trustchain_transport::PeerDiscovery::new(identity.pubkey_hex(), vec![]);
+            let discovery = trustchain_transport::PeerDiscovery::new(identity.pubkey_hex(), vec![]);
 
             trustchain_transport::mcp::run_mcp_stdio(
                 std::sync::Arc::new(tokio::sync::Mutex::new(protocol)),
                 std::sync::Arc::new(discovery),
+                vec![], // stdio mode: no seed nodes configured (user passes via config)
             )
             .await?;
         }
@@ -252,9 +252,7 @@ async fn main() -> anyhow::Result<()> {
             // Set up tracing/logging.
             let filter = tracing_subscriber::EnvFilter::try_new(&log_level)
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .init();
+            tracing_subscriber::fmt().with_env_filter(filter).init();
 
             // Load or generate identity.
             let key_path = data_dir.join("identity.key");
@@ -330,9 +328,7 @@ async fn main() -> anyhow::Result<()> {
             // Set up tracing/logging.
             let filter = tracing_subscriber::EnvFilter::try_new(&log_level)
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .init();
+            tracing_subscriber::fmt().with_env_filter(filter).init();
 
             // Load or generate identity.
             let key_path = data_dir.join("identity.key");
@@ -422,7 +418,10 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Status { peer } => {
             let url = format!("{peer}/status");
-            let resp = reqwest::get(&url).await?.json::<serde_json::Value>().await?;
+            let resp = reqwest::get(&url)
+                .await?
+                .json::<serde_json::Value>()
+                .await?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
 

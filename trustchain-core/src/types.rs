@@ -4,8 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Hash of the imaginary block 0 — used as `previous_hash` for the first block in a chain.
-pub const GENESIS_HASH: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
+pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// First valid sequence number.
 pub const GENESIS_SEQ: u64 = 1;
@@ -139,12 +138,30 @@ mod tests {
 
     #[test]
     fn test_block_type_from_str_loose() {
-        assert_eq!(BlockType::from_str_loose("Proposal"), Some(BlockType::Proposal));
-        assert_eq!(BlockType::from_str_loose("AGREEMENT"), Some(BlockType::Agreement));
-        assert_eq!(BlockType::from_str_loose("checkpoint"), Some(BlockType::Checkpoint));
-        assert_eq!(BlockType::from_str_loose("Delegation"), Some(BlockType::Delegation));
-        assert_eq!(BlockType::from_str_loose("REVOCATION"), Some(BlockType::Revocation));
-        assert_eq!(BlockType::from_str_loose("succession"), Some(BlockType::Succession));
+        assert_eq!(
+            BlockType::from_str_loose("Proposal"),
+            Some(BlockType::Proposal)
+        );
+        assert_eq!(
+            BlockType::from_str_loose("AGREEMENT"),
+            Some(BlockType::Agreement)
+        );
+        assert_eq!(
+            BlockType::from_str_loose("checkpoint"),
+            Some(BlockType::Checkpoint)
+        );
+        assert_eq!(
+            BlockType::from_str_loose("Delegation"),
+            Some(BlockType::Delegation)
+        );
+        assert_eq!(
+            BlockType::from_str_loose("REVOCATION"),
+            Some(BlockType::Revocation)
+        );
+        assert_eq!(
+            BlockType::from_str_loose("succession"),
+            Some(BlockType::Succession)
+        );
         assert_eq!(BlockType::from_str_loose("invalid"), None);
     }
 

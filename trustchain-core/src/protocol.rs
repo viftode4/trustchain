@@ -8,9 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::blockstore::BlockStore;
 use crate::delegation::{DelegationRecord, DelegationStore, SuccessionRecord};
 use crate::error::{Result, TrustChainError};
-use crate::halfblock::{
-    create_half_block, validate_and_record, verify_block, HalfBlock,
-};
+use crate::halfblock::{create_half_block, validate_and_record, verify_block, HalfBlock};
 use crate::identity::Identity;
 use crate::types::{BlockType, ValidationResult, GENESIS_HASH};
 
@@ -60,6 +58,25 @@ impl<S: BlockStore> TrustChainProtocol<S> {
         transaction: serde_json::Value,
         timestamp: Option<u64>,
     ) -> Result<HalfBlock> {
+        // Validate counterparty pubkey format.
+        if counterparty_pubkey.len() != 64
+            || !counterparty_pubkey.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Err(TrustChainError::proposal(
+                self.pubkey(),
+                0,
+                "counterparty_pubkey must be 64 hex characters",
+            ));
+        }
+        // Cannot propose to yourself.
+        if counterparty_pubkey == self.pubkey() {
+            return Err(TrustChainError::proposal(
+                self.pubkey(),
+                0,
+                "cannot create proposal to yourself",
+            ));
+        }
+
         let seq = self.store.get_latest_seq(&self.pubkey())? + 1;
         let prev_hash = self.store.get_head_hash(&self.pubkey())?;
 
@@ -106,16 +123,12 @@ impl<S: BlockStore> TrustChainProtocol<S> {
 
         // Full tiered validation (invariants + chain context + fraud detection).
         let validation = validate_and_record(proposal, &mut self.store);
-        match &validation {
-            ValidationResult::Invalid(errors) => {
-                return Err(TrustChainError::proposal(
-                    &proposal.public_key,
-                    proposal.sequence_number,
-                    format!("validation failed: {}", errors.join("; ")),
-                ));
-            }
-            // Valid, Partial*, NoInfo — all acceptable for receiving a proposal.
-            _ => {}
+        if let ValidationResult::Invalid(errors) = &validation {
+            return Err(TrustChainError::proposal(
+                &proposal.public_key,
+                proposal.sequence_number,
+                format!("validation failed: {}", errors.join("; ")),
+            ));
         }
 
         // Store the proposal (idempotent — ignore duplicates).
@@ -158,7 +171,10 @@ impl<S: BlockStore> TrustChainProtocol<S> {
             return Err(TrustChainError::agreement(
                 &proposal.public_key,
                 proposal.sequence_number,
-                format!("cannot agree to non-proposal block type: {}", proposal.block_type),
+                format!(
+                    "cannot agree to non-proposal block type: {}",
+                    proposal.block_type
+                ),
             ));
         }
 
@@ -227,15 +243,12 @@ impl<S: BlockStore> TrustChainProtocol<S> {
 
         // Full tiered validation (invariants + chain context + fraud detection).
         let validation = validate_and_record(agreement, &mut self.store);
-        match &validation {
-            ValidationResult::Invalid(errors) => {
-                return Err(TrustChainError::agreement(
-                    &agreement.public_key,
-                    agreement.sequence_number,
-                    format!("validation failed: {}", errors.join("; ")),
-                ));
-            }
-            _ => {}
+        if let ValidationResult::Invalid(errors) = &validation {
+            return Err(TrustChainError::agreement(
+                &agreement.public_key,
+                agreement.sequence_number,
+                format!("validation failed: {}", errors.join("; ")),
+            ));
         }
 
         // The linked proposal must exist in our store.
@@ -250,6 +263,19 @@ impl<S: BlockStore> TrustChainProtocol<S> {
                     format!("no matching proposal at our seq {}", our_seq),
                 )
             })?;
+
+        // Agreement sender must be the intended counterparty of our proposal.
+        if agreement.public_key != proposal.link_public_key {
+            return Err(TrustChainError::agreement(
+                &agreement.public_key,
+                agreement.sequence_number,
+                format!(
+                    "agreement sender {} does not match proposal counterparty {}",
+                    &agreement.public_key[..std::cmp::min(16, agreement.public_key.len())],
+                    &proposal.link_public_key[..std::cmp::min(16, proposal.link_public_key.len())]
+                ),
+            ));
+        }
 
         // Linked block must be a proposal.
         if !proposal.is_proposal() {
@@ -348,7 +374,7 @@ impl<S: BlockStore> TrustChainProtocol<S> {
                 return Ok(i as f64 / total);
             }
 
-            if verify_block(block).unwrap_or(false) == false {
+            if !verify_block(block).unwrap_or(false) {
                 return Ok(i as f64 / total);
             }
         }
@@ -374,7 +400,7 @@ impl<S: BlockStore> TrustChainProtocol<S> {
     ) -> Result<HalfBlock> {
         if max_depth > 2 {
             return Err(TrustChainError::delegation(
-                &self.pubkey(),
+                self.pubkey(),
                 "max_depth cannot exceed 2",
             ));
         }
@@ -395,7 +421,7 @@ impl<S: BlockStore> TrustChainProtocol<S> {
             if let Some(my_delegation) = ds.get_delegation_by_delegate(&self.pubkey())? {
                 if max_depth >= my_delegation.max_depth {
                     return Err(TrustChainError::delegation(
-                        &self.pubkey(),
+                        self.pubkey(),
                         format!(
                             "Sub-delegation max_depth {} must be < parent's {}",
                             max_depth, my_delegation.max_depth
@@ -407,14 +433,14 @@ impl<S: BlockStore> TrustChainProtocol<S> {
                         my_delegation.scope.iter().map(|s| s.as_str()).collect();
                     if !scope.iter().all(|s| parent_scope.contains(s.as_str())) {
                         return Err(TrustChainError::delegation(
-                            &self.pubkey(),
+                            self.pubkey(),
                             "Sub-delegation scope must be subset of parent scope",
                         ));
                     }
                 }
                 if !my_delegation.is_active(now_ms) {
                     return Err(TrustChainError::delegation(
-                        &self.pubkey(),
+                        self.pubkey(),
                         "Cannot sub-delegate from expired/revoked delegation",
                     ));
                 }
@@ -459,14 +485,14 @@ impl<S: BlockStore> TrustChainProtocol<S> {
     ) -> Result<HalfBlock> {
         if delegation_proposal.block_type != BlockType::Delegation.to_string() {
             return Err(TrustChainError::delegation(
-                &self.pubkey(),
+                self.pubkey(),
                 "Not a delegation proposal",
             ));
         }
 
         if delegation_proposal.link_public_key != self.pubkey() {
             return Err(TrustChainError::delegation(
-                &self.pubkey(),
+                self.pubkey(),
                 "Delegation not addressed to us",
             ));
         }
@@ -481,15 +507,29 @@ impl<S: BlockStore> TrustChainProtocol<S> {
 
         let tx = &delegation_proposal.transaction;
 
+        // Validate required delegation fields.
+        let delegation_id = tx["delegation_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                TrustChainError::delegation(self.pubkey(), "missing or empty delegation_id")
+            })?;
+        let expires_at = tx["expires_at"]
+            .as_u64()
+            .ok_or_else(|| TrustChainError::delegation(self.pubkey(), "missing expires_at"))?;
+        let max_depth = tx["max_depth"]
+            .as_u64()
+            .ok_or_else(|| TrustChainError::delegation(self.pubkey(), "missing max_depth"))?
+            as u32;
+
         // Check TTL.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let expires_at = tx["expires_at"].as_u64().unwrap_or(0);
         if now_ms > expires_at {
             return Err(TrustChainError::delegation(
-                &self.pubkey(),
+                self.pubkey(),
                 "Delegation already expired",
             ));
         }
@@ -501,9 +541,9 @@ impl<S: BlockStore> TrustChainProtocol<S> {
             "interaction_type": "delegation",
             "outcome": "accepted",
             "scope": tx["scope"],
-            "max_depth": tx["max_depth"],
-            "expires_at": tx["expires_at"],
-            "delegation_id": tx["delegation_id"],
+            "max_depth": max_depth,
+            "expires_at": expires_at,
+            "delegation_id": delegation_id,
         });
 
         let agreement = create_half_block(
@@ -535,11 +575,11 @@ impl<S: BlockStore> TrustChainProtocol<S> {
             .unwrap_or_default();
 
         let record = DelegationRecord {
-            delegation_id: tx["delegation_id"].as_str().unwrap_or("").to_string(),
+            delegation_id: delegation_id.to_string(),
             delegator_pubkey: delegation_proposal.public_key.clone(),
             delegate_pubkey: self.pubkey(),
             scope,
-            max_depth: tx["max_depth"].as_u64().unwrap_or(0) as u32,
+            max_depth,
             issued_at: delegation_proposal.timestamp,
             expires_at,
             delegation_block_hash: delegation_proposal.block_hash.clone(),
@@ -563,21 +603,21 @@ impl<S: BlockStore> TrustChainProtocol<S> {
             .get_delegation(delegation_id)?
             .ok_or_else(|| {
                 TrustChainError::delegation(
-                    &self.pubkey(),
+                    self.pubkey(),
                     format!("Unknown delegation: {delegation_id}"),
                 )
             })?;
 
         if delegation.delegator_pubkey != self.pubkey() {
             return Err(TrustChainError::delegation(
-                &self.pubkey(),
+                self.pubkey(),
                 "Only the delegator can revoke",
             ));
         }
 
         if delegation.revoked {
             return Err(TrustChainError::delegation(
-                &self.pubkey(),
+                self.pubkey(),
                 "Already revoked",
             ));
         }
@@ -607,14 +647,11 @@ impl<S: BlockStore> TrustChainProtocol<S> {
     }
 
     /// Create a succession proposal to rotate to a new key.
-    pub fn create_succession(
-        &mut self,
-        new_identity: &Identity,
-    ) -> Result<HalfBlock> {
+    pub fn create_succession(&mut self, new_identity: &Identity) -> Result<HalfBlock> {
         if self.store.get_latest_seq(&self.pubkey())? == 0 {
             return Err(TrustChainError::succession(
-                &self.pubkey(),
-                &new_identity.pubkey_hex(),
+                self.pubkey(),
+                new_identity.pubkey_hex(),
                 "Cannot succeed from an empty chain",
             ));
         }
@@ -666,7 +703,7 @@ impl<S: BlockStore> TrustChainProtocol<S> {
         if succession_proposal.block_type != BlockType::Succession.to_string() {
             return Err(TrustChainError::succession(
                 &succession_proposal.public_key,
-                &self.pubkey(),
+                self.pubkey(),
                 "Not a succession proposal",
             ));
         }
@@ -674,7 +711,7 @@ impl<S: BlockStore> TrustChainProtocol<S> {
         if succession_proposal.link_public_key != self.pubkey() {
             return Err(TrustChainError::succession(
                 &succession_proposal.public_key,
-                &self.pubkey(),
+                self.pubkey(),
                 "Succession not addressed to us",
             ));
         }
@@ -730,7 +767,10 @@ mod tests {
     use crate::blockstore::MemoryBlockStore;
     use crate::delegation::MemoryDelegationStore;
 
-    fn make_protocol() -> (TrustChainProtocol<MemoryBlockStore>, TrustChainProtocol<MemoryBlockStore>) {
+    fn make_protocol() -> (
+        TrustChainProtocol<MemoryBlockStore>,
+        TrustChainProtocol<MemoryBlockStore>,
+    ) {
         let alice = Identity::from_bytes(&[1u8; 32]);
         let bob = Identity::from_bytes(&[2u8; 32]);
         let proto_a = TrustChainProtocol::new(alice, MemoryBlockStore::new());
@@ -744,7 +784,11 @@ mod tests {
         let bob_key = Identity::from_bytes(&[2u8; 32]).pubkey_hex();
 
         let proposal = alice
-            .create_proposal(&bob_key, serde_json::json!({"service": "compute"}), Some(1000))
+            .create_proposal(
+                &bob_key,
+                serde_json::json!({"service": "compute"}),
+                Some(1000),
+            )
             .unwrap();
 
         assert_eq!(proposal.sequence_number, 1);
@@ -799,7 +843,9 @@ mod tests {
                 .unwrap();
 
             bob.receive_proposal(&proposal).unwrap();
-            let agreement = bob.create_agreement(&proposal, Some(1001 + i as u64 * 2)).unwrap();
+            let agreement = bob
+                .create_agreement(&proposal, Some(1001 + i as u64 * 2))
+                .unwrap();
             alice.receive_agreement(&agreement).unwrap();
         }
 
@@ -831,10 +877,8 @@ mod tests {
     #[test]
     fn test_agreement_wrong_recipient() {
         let (mut alice, mut bob) = make_protocol();
-        let mut charlie = TrustChainProtocol::new(
-            Identity::from_bytes(&[3u8; 32]),
-            MemoryBlockStore::new(),
-        );
+        let mut charlie =
+            TrustChainProtocol::new(Identity::from_bytes(&[3u8; 32]), MemoryBlockStore::new());
 
         let proposal = alice
             .create_proposal(&bob.pubkey(), serde_json::json!({}), Some(1000))
@@ -861,10 +905,8 @@ mod tests {
         let agreement = bob.create_agreement(&proposal, Some(1001)).unwrap();
 
         // Create a fresh Alice that doesn't have the proposal in store.
-        let mut alice2 = TrustChainProtocol::new(
-            Identity::from_bytes(&[1u8; 32]),
-            MemoryBlockStore::new(),
-        );
+        let mut alice2 =
+            TrustChainProtocol::new(Identity::from_bytes(&[1u8; 32]), MemoryBlockStore::new());
         let result = alice2.receive_agreement(&agreement);
         assert!(result.is_err());
     }
@@ -905,10 +947,16 @@ mod tests {
 
         for i in 0..3 {
             let proposal = alice
-                .create_proposal(&bob.pubkey(), serde_json::json!({"i": i}), Some(1000 + i as u64))
+                .create_proposal(
+                    &bob.pubkey(),
+                    serde_json::json!({"i": i}),
+                    Some(1000 + i as u64),
+                )
                 .unwrap();
             bob.receive_proposal(&proposal).unwrap();
-            let agreement = bob.create_agreement(&proposal, Some(1001 + i as u64)).unwrap();
+            let agreement = bob
+                .create_agreement(&proposal, Some(1001 + i as u64))
+                .unwrap();
             alice.receive_agreement(&agreement).unwrap();
         }
 
@@ -942,12 +990,18 @@ mod tests {
 
         for i in 1..=3 {
             let proposal = alice
-                .create_proposal(&bob.pubkey(), serde_json::json!({"i": i}), Some(1000 + i as u64))
+                .create_proposal(
+                    &bob.pubkey(),
+                    serde_json::json!({"i": i}),
+                    Some(1000 + i as u64),
+                )
                 .unwrap();
             assert_eq!(proposal.sequence_number, i);
 
             bob.receive_proposal(&proposal).unwrap();
-            let agreement = bob.create_agreement(&proposal, Some(1001 + i as u64)).unwrap();
+            let agreement = bob
+                .create_agreement(&proposal, Some(1001 + i as u64))
+                .unwrap();
             assert_eq!(agreement.sequence_number, i);
 
             alice.receive_agreement(&agreement).unwrap();
@@ -999,7 +1053,10 @@ mod tests {
 
         // Delegation record was stored.
         assert_eq!(ds.delegation_count().unwrap(), 1);
-        let deleg = ds.get_delegation_by_delegate(&bob.pubkey()).unwrap().unwrap();
+        let deleg = ds
+            .get_delegation_by_delegate(&bob.pubkey())
+            .unwrap()
+            .unwrap();
         assert_eq!(deleg.delegator_pubkey, alice.pubkey());
         assert_eq!(deleg.scope, vec!["compute"]);
         assert_eq!(deleg.max_depth, 1);
@@ -1052,10 +1109,8 @@ mod tests {
     fn test_succession_roundtrip() {
         let (mut alice, mut bob) = make_protocol();
         let new_identity = Identity::from_bytes(&[3u8; 32]);
-        let mut new_proto = TrustChainProtocol::new(
-            Identity::from_bytes(&[3u8; 32]),
-            MemoryBlockStore::new(),
-        );
+        let mut new_proto =
+            TrustChainProtocol::new(Identity::from_bytes(&[3u8; 32]), MemoryBlockStore::new());
         let mut ds = MemoryDelegationStore::new();
 
         // Alice needs at least one block to succeed.
@@ -1086,5 +1141,282 @@ mod tests {
 
         let result = alice.create_succession(&new_identity);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_third_party_agreement_forgery() {
+        let (mut alice, mut bob) = make_protocol();
+        let charlie =
+            TrustChainProtocol::new(Identity::from_bytes(&[3u8; 32]), MemoryBlockStore::new());
+
+        // Alice creates proposal for Bob.
+        let proposal = alice
+            .create_proposal(&bob.pubkey(), serde_json::json!({}), Some(1000))
+            .unwrap();
+        bob.receive_proposal(&proposal).unwrap();
+
+        // Charlie tries to create an agreement for Alice's proposal.
+        // Charlie creates a block linking to Alice's proposal seq.
+        let charlie_agreement = crate::halfblock::create_half_block(
+            charlie.identity(),
+            1,
+            &alice.pubkey(),
+            proposal.sequence_number,
+            crate::types::GENESIS_HASH,
+            crate::types::BlockType::Agreement,
+            proposal.transaction.clone(),
+            Some(1001),
+        );
+
+        // Alice should reject: agreement sender is Charlie, not Bob.
+        let result = alice.receive_agreement(&charlie_agreement);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("does not match proposal counterparty")
+                || err_msg.contains("Public key mismatch"),
+            "expected counterparty/pubkey mismatch error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_create_proposal_pubkey_too_short() {
+        let (mut alice, _) = make_protocol();
+        let result = alice.create_proposal(&"a".repeat(63), serde_json::json!({}), Some(1000));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("64 hex characters"));
+    }
+
+    #[test]
+    fn test_create_proposal_pubkey_too_long() {
+        let (mut alice, _) = make_protocol();
+        let result = alice.create_proposal(&"a".repeat(65), serde_json::json!({}), Some(1000));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("64 hex characters"));
+    }
+
+    #[test]
+    fn test_create_proposal_pubkey_non_hex() {
+        let (mut alice, _) = make_protocol();
+        let result = alice.create_proposal(&"g".repeat(64), serde_json::json!({}), Some(1000));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("64 hex characters"));
+    }
+
+    #[test]
+    fn test_create_proposal_to_self_explicit() {
+        let (mut alice, _) = make_protocol();
+        let result = alice.create_proposal(&alice.pubkey(), serde_json::json!({}), Some(1000));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("cannot create proposal to yourself"));
+    }
+
+    #[test]
+    fn test_accept_delegation_missing_delegation_id() {
+        let (mut alice, mut bob) = make_protocol();
+        let mut ds = MemoryDelegationStore::new();
+
+        // Create a block that looks like a delegation but has no delegation_id.
+        let block = crate::halfblock::create_half_block(
+            alice.identity(),
+            1,
+            &bob.pubkey(),
+            0,
+            crate::types::GENESIS_HASH,
+            crate::types::BlockType::Delegation,
+            serde_json::json!({"expires_at": 999999999999u64, "max_depth": 1, "scope": []}),
+            Some(1000),
+        );
+        alice.store_mut().add_block(&block).unwrap();
+
+        let result = bob.accept_delegation(&block, &mut ds);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("missing or empty delegation_id"));
+    }
+
+    #[test]
+    fn test_accept_delegation_missing_expires_at() {
+        let (mut alice, mut bob) = make_protocol();
+        let mut ds = MemoryDelegationStore::new();
+
+        let block = crate::halfblock::create_half_block(
+            alice.identity(),
+            1,
+            &bob.pubkey(),
+            0,
+            crate::types::GENESIS_HASH,
+            crate::types::BlockType::Delegation,
+            serde_json::json!({"delegation_id": "test123", "max_depth": 1, "scope": []}),
+            Some(1000),
+        );
+        alice.store_mut().add_block(&block).unwrap();
+
+        let result = bob.accept_delegation(&block, &mut ds);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("missing expires_at"));
+    }
+
+    #[test]
+    fn test_accept_delegation_expired_ttl() {
+        let (mut alice, mut bob) = make_protocol();
+        let mut ds = MemoryDelegationStore::new();
+
+        // expires_at is in the past.
+        let block = crate::halfblock::create_half_block(
+            alice.identity(),
+            1,
+            &bob.pubkey(),
+            0,
+            crate::types::GENESIS_HASH,
+            crate::types::BlockType::Delegation,
+            serde_json::json!({
+                "delegation_id": "test123",
+                "expires_at": 1000u64,
+                "max_depth": 1,
+                "scope": []
+            }),
+            Some(500),
+        );
+        alice.store_mut().add_block(&block).unwrap();
+
+        let result = bob.accept_delegation(&block, &mut ds);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Delegation already expired"));
+    }
+
+    #[test]
+    fn test_accept_delegation_wrong_recipient() {
+        let (mut alice, _bob) = make_protocol();
+        let charlie = Identity::from_bytes(&[3u8; 32]);
+        let mut charlie_proto = TrustChainProtocol::new(charlie, MemoryBlockStore::new());
+        let mut ds = MemoryDelegationStore::new();
+
+        // Alice creates delegation for Bob, but Charlie tries to accept.
+        let proposal = alice
+            .create_delegation_proposal::<MemoryDelegationStore>(
+                &Identity::from_bytes(&[2u8; 32]).pubkey_hex(),
+                vec![],
+                1,
+                3_600_000,
+                None,
+            )
+            .unwrap();
+
+        let result = charlie_proto.accept_delegation(&proposal, &mut ds);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Delegation not addressed to us"));
+    }
+
+    #[test]
+    fn test_accept_delegation_invalid_signature() {
+        let (mut alice, mut bob) = make_protocol();
+        let mut ds = MemoryDelegationStore::new();
+
+        let mut proposal = alice
+            .create_delegation_proposal::<MemoryDelegationStore>(
+                &bob.pubkey(),
+                vec![],
+                1,
+                3_600_000,
+                None,
+            )
+            .unwrap();
+
+        // Tamper with the signature.
+        proposal.signature = "ff".repeat(64);
+
+        let result = bob.accept_delegation(&proposal, &mut ds);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid delegation proposal signature"));
+    }
+
+    #[test]
+    fn test_invariant_seq_zero_via_receive() {
+        let (_alice, mut bob) = make_protocol();
+
+        let fake_id = Identity::from_bytes(&[9u8; 32]);
+        let block = HalfBlock {
+            public_key: fake_id.pubkey_hex(),
+            sequence_number: 0,
+            link_public_key: bob.pubkey(),
+            link_sequence_number: 0,
+            previous_hash: crate::types::GENESIS_HASH.to_string(),
+            signature: "a".repeat(128),
+            block_type: "proposal".to_string(),
+            transaction: serde_json::json!({}),
+            block_hash: "c".repeat(64),
+            timestamp: 1000,
+        };
+
+        let result = bob.receive_proposal(&block);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("prior to genesis") || err_msg.contains("validation failed"),
+            "expected validation error for seq 0, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_sub_delegation_scope_enforcement() {
+        let (mut alice, mut bob) = make_protocol();
+        let charlie_id = Identity::from_bytes(&[3u8; 32]);
+        let mut ds = MemoryDelegationStore::new();
+
+        // Alice delegates ["compute"] to Bob.
+        let proposal = alice
+            .create_delegation_proposal::<MemoryDelegationStore>(
+                &bob.pubkey(),
+                vec!["compute".to_string()],
+                2,
+                3_600_000,
+                None,
+            )
+            .unwrap();
+        bob.accept_delegation(&proposal, &mut ds).unwrap();
+
+        // Bob tries to sub-delegate ["storage"] — not a subset of ["compute"].
+        let result = bob.create_delegation_proposal(
+            &charlie_id.pubkey_hex(),
+            vec!["storage".to_string()],
+            1,
+            1_800_000,
+            Some(&ds),
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("scope must be subset"),
+            "sub-delegation with out-of-scope should fail"
+        );
     }
 }

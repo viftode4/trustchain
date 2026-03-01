@@ -16,8 +16,7 @@
 //! Run with: cargo test --test stress4 -- --nocapture
 
 use trustchain_core::{
-    BlockStore, Identity, MemoryBlockStore, TrustChainProtocol,
-    netflow::NetFlowTrust,
+    netflow::NetFlowTrust, BlockStore, Identity, MemoryBlockStore, TrustChainProtocol,
 };
 
 /// Perform `n` bilateral interactions between two elements of the SAME Vec.
@@ -36,10 +35,7 @@ fn do_interactions_in_vec(
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 fn make_proto(seed: u8) -> TrustChainProtocol<MemoryBlockStore> {
-    TrustChainProtocol::new(
-        Identity::from_bytes(&[seed; 32]),
-        MemoryBlockStore::new(),
-    )
+    TrustChainProtocol::new(Identity::from_bytes(&[seed; 32]), MemoryBlockStore::new())
 }
 
 fn do_interactions(
@@ -49,7 +45,9 @@ fn do_interactions(
 ) {
     let b_pk = b.pubkey();
     for i in 0..n {
-        let p = a.create_proposal(&b_pk, serde_json::json!({"i": i}), None).unwrap();
+        let p = a
+            .create_proposal(&b_pk, serde_json::json!({"i": i}), None)
+            .unwrap();
         b.receive_proposal(&p).unwrap();
         let ag = b.create_agreement(&p, None).unwrap();
         a.receive_agreement(&ag).unwrap();
@@ -147,13 +145,16 @@ fn stress_sybil_inflation_invariant() {
     assert!(
         (gw_score_1 - gw_score_2).abs() < 1e-9,
         "gateway score changed after inflation: {:.6} → {:.6}",
-        gw_score_1, gw_score_2
+        gw_score_1,
+        gw_score_2
     );
     for i in 0..9 {
         assert!(
             (cluster_scores_1[i] - cluster_scores_2[i]).abs() < 1e-9,
             "cluster[{}] score changed after inflation: {:.6} → {:.6}",
-            i, cluster_scores_1[i], cluster_scores_2[i]
+            i,
+            cluster_scores_1[i],
+            cluster_scores_2[i]
         );
     }
 
@@ -162,13 +163,23 @@ fn stress_sybil_inflation_invariant() {
     assert!(
         honest_score > gw_score_2,
         "honest ({:.4}) must beat sybil gateway ({:.4})",
-        honest_score, gw_score_2
+        honest_score,
+        gw_score_2
     );
 
     println!("[stress_sybil_inflation_invariant] PASS");
-    println!("  Gateway  phase1={:.4} phase2={:.4} (unchanged)", gw_score_1, gw_score_2);
-    println!("  Cluster  phase1={:.4} phase2={:.4} (unchanged)", cluster_scores_1[0], cluster_scores_2[0]);
-    println!("  Honest   score={:.4} > gateway={:.4}", honest_score, gw_score_2);
+    println!(
+        "  Gateway  phase1={:.4} phase2={:.4} (unchanged)",
+        gw_score_1, gw_score_2
+    );
+    println!(
+        "  Cluster  phase1={:.4} phase2={:.4} (unchanged)",
+        cluster_scores_1[0], cluster_scores_2[0]
+    );
+    println!(
+        "  Honest   score={:.4} > gateway={:.4}",
+        honest_score, gw_score_2
+    );
 }
 
 // ─── Test 20: Gateway bounded — all cluster scores ≤ gateway ─────────────────
@@ -215,16 +226,25 @@ fn stress_sybil_cluster_gateway_bounded() {
         assert!(
             score <= gw_score + 1e-9,
             "cluster[{}] score {:.6} exceeds gateway score {:.6} — bottleneck violated!",
-            i, score, gw_score
+            i,
+            score,
+            gw_score
         );
     }
 
     // Quantitative: with 3 gateway interactions, gateway score ≈ 3/(3+seed_other_outflow).
     // Regardless of 20 agents × 20 rounds = 400 internal interactions.
     println!("[stress_sybil_cluster_gateway_bounded] PASS");
-    println!("  Gateway score = {:.4} (bounded by 3 seed interactions)", gw_score);
-    println!("  Cluster max   = {:.4} (≤ gateway, all {} agents checked)",
-        cluster.iter().map(|s| netflow(&master, &seed_pks, &s.pubkey())).fold(0.0f64, f64::max),
+    println!(
+        "  Gateway score = {:.4} (bounded by 3 seed interactions)",
+        gw_score
+    );
+    println!(
+        "  Cluster max   = {:.4} (≤ gateway, all {} agents checked)",
+        cluster
+            .iter()
+            .map(|s| netflow(&master, &seed_pks, &s.pubkey()))
+            .fold(0.0f64, f64::max),
         cluster.len()
     );
 }
@@ -271,13 +291,20 @@ fn stress_sybil_world_sim_connected() {
     let mut master = MemoryBlockStore::new();
     merge_into(seed_a.store(), &mut master);
     merge_into(seed_b.store(), &mut master);
-    for h in &honest { merge_into(h.store(), &mut master); }
-    for s in &sybil { merge_into(s.store(), &mut master); }
+    for h in &honest {
+        merge_into(h.store(), &mut master);
+    }
+    for s in &sybil {
+        merge_into(s.store(), &mut master);
+    }
 
     for i in 0..10 {
         let score = netflow(&master, &seed_pks, &sybil[i].pubkey());
-        assert_eq!(score, 0.0,
-            "isolated Sybil agent {} must score 0.0, got {}", i, score);
+        assert_eq!(
+            score, 0.0,
+            "isolated Sybil agent {} must score 0.0, got {}",
+            i, score
+        );
     }
 
     // ── Connect: sybil[0] (gateway) does 1 interaction with seed_a ───────
@@ -286,25 +313,39 @@ fn stress_sybil_world_sim_connected() {
     let mut master2 = MemoryBlockStore::new();
     merge_into(seed_a.store(), &mut master2);
     merge_into(seed_b.store(), &mut master2);
-    for h in &honest { merge_into(h.store(), &mut master2); }
-    for s in &sybil { merge_into(s.store(), &mut master2); }
+    for h in &honest {
+        merge_into(h.store(), &mut master2);
+    }
+    for s in &sybil {
+        merge_into(s.store(), &mut master2);
+    }
 
     let gw_score_1conn = netflow(&master2, &seed_pks, &sybil[0].pubkey());
-    assert!(gw_score_1conn > 0.0,
-        "gateway Sybil must score positively after 1 seed connection");
+    assert!(
+        gw_score_1conn > 0.0,
+        "gateway Sybil must score positively after 1 seed connection"
+    );
 
     // All non-gateway Sybils score ≤ gateway (bottleneck).
     for i in 1..10 {
         let score = netflow(&master2, &seed_pks, &sybil[i].pubkey());
-        assert!(score <= gw_score_1conn + 1e-9,
-            "sybil[{}] score {:.6} exceeds gateway {:.6}", i, score, gw_score_1conn);
+        assert!(
+            score <= gw_score_1conn + 1e-9,
+            "sybil[{}] score {:.6} exceeds gateway {:.6}",
+            i,
+            score,
+            gw_score_1conn
+        );
     }
 
     // Honest agents score much higher than Sybil gateway (5 direct vs 1).
     let honest_score = netflow(&master2, &seed_pks, &honest[0].pubkey());
-    assert!(honest_score > gw_score_1conn,
+    assert!(
+        honest_score > gw_score_1conn,
         "honest ({:.4}) must beat connected Sybil gateway ({:.4})",
-        honest_score, gw_score_1conn);
+        honest_score,
+        gw_score_1conn
+    );
 
     // ── Inflation: add heavy internal Sybil rounds after connection ──────
     // This simulates the attacker trying to boost scores via internal activity.
@@ -317,14 +358,19 @@ fn stress_sybil_world_sim_connected() {
     let mut master3 = MemoryBlockStore::new();
     merge_into(seed_a.store(), &mut master3);
     merge_into(seed_b.store(), &mut master3);
-    for h in &honest { merge_into(h.store(), &mut master3); }
-    for s in &sybil { merge_into(s.store(), &mut master3); }
+    for h in &honest {
+        merge_into(h.store(), &mut master3);
+    }
+    for s in &sybil {
+        merge_into(s.store(), &mut master3);
+    }
 
     let gw_score_inflated = netflow(&master3, &seed_pks, &sybil[0].pubkey());
     assert!(
         (gw_score_1conn - gw_score_inflated).abs() < 1e-9,
         "inflation must not change gateway score: {:.6} → {:.6}",
-        gw_score_1conn, gw_score_inflated
+        gw_score_1conn,
+        gw_score_inflated
     );
 
     // ── Connect more: sybil[0] does 10 total interactions with seed_a ────
@@ -334,26 +380,41 @@ fn stress_sybil_world_sim_connected() {
     let mut master4 = MemoryBlockStore::new();
     merge_into(seed_a.store(), &mut master4);
     merge_into(seed_b.store(), &mut master4);
-    for h in &honest { merge_into(h.store(), &mut master4); }
-    for s in &sybil { merge_into(s.store(), &mut master4); }
+    for h in &honest {
+        merge_into(h.store(), &mut master4);
+    }
+    for s in &sybil {
+        merge_into(s.store(), &mut master4);
+    }
 
     let gw_score_10conn = netflow(&master4, &seed_pks, &sybil[0].pubkey());
     // More real interactions = higher score (linear with honest interactions).
-    assert!(gw_score_10conn > gw_score_1conn,
+    assert!(
+        gw_score_10conn > gw_score_1conn,
         "10 seed interactions must score higher than 1 ({:.4} vs {:.4})",
-        gw_score_10conn, gw_score_1conn);
+        gw_score_10conn,
+        gw_score_1conn
+    );
 
     // But 10× the honest agent's 5 interactions means Sybil gateway (10) vs honest (5):
     // Sybil gateway should still score roughly proportionally.
     let ratio = gw_score_10conn / gw_score_1conn;
-    assert!(ratio > 1.5,
-        "10 connections should significantly improve score over 1 connection (ratio={:.2})", ratio);
+    assert!(
+        ratio > 1.5,
+        "10 connections should significantly improve score over 1 connection (ratio={:.2})",
+        ratio
+    );
 
     println!("[stress_sybil_world_sim_connected] PASS");
-    println!("  Sybil gateway: isolated=0.000, 1-conn={:.4}, 10-conn={:.4}",
-        gw_score_1conn, gw_score_10conn);
+    println!(
+        "  Sybil gateway: isolated=0.000, 1-conn={:.4}, 10-conn={:.4}",
+        gw_score_1conn, gw_score_10conn
+    );
     println!("  Honest (5 seed interactions): score={:.4}", honest_score);
-    println!("  Inflation invariant: {:.6} → {:.6} (unchanged)", gw_score_1conn, gw_score_inflated);
+    println!(
+        "  Inflation invariant: {:.6} → {:.6} (unchanged)",
+        gw_score_1conn, gw_score_inflated
+    );
 }
 
 // ─── Test 22: Sybil multi-gateway — honest with more total interactions wins ──
@@ -395,12 +456,17 @@ fn stress_sybil_multi_gateway_no_advantage() {
     let mut master = MemoryBlockStore::new();
     merge_into(seed.store(), &mut master);
     merge_into(honest.store(), &mut master);
-    for gw in &gateways { merge_into(gw.store(), &mut master); }
-    for s in &sybil_cluster { merge_into(s.store(), &mut master); }
+    for gw in &gateways {
+        merge_into(gw.store(), &mut master);
+    }
+    for s in &sybil_cluster {
+        merge_into(s.store(), &mut master);
+    }
 
     let seed_pks = vec![seed.pubkey()];
     let honest_score = netflow(&master, &seed_pks, &honest.pubkey());
-    let max_sybil_score = sybil_cluster.iter()
+    let max_sybil_score = sybil_cluster
+        .iter()
         .map(|s| netflow(&master, &seed_pks, &s.pubkey()))
         .fold(0.0f64, f64::max);
 
@@ -410,16 +476,23 @@ fn stress_sybil_multi_gateway_no_advantage() {
         honest_score, max_sybil_score);
 
     // Individual gateways score ≤ their proportional capacity (1/total each).
-    let max_gw_score = gateways.iter()
+    let max_gw_score = gateways
+        .iter()
         .map(|gw| netflow(&master, &seed_pks, &gw.pubkey()))
         .fold(0.0f64, f64::max);
-    assert!(honest_score > max_gw_score,
+    assert!(
+        honest_score > max_gw_score,
         "honest must beat any single gateway: honest={:.4} max_gw={:.4}",
-        honest_score, max_gw_score);
+        honest_score,
+        max_gw_score
+    );
 
     println!("[stress_sybil_multi_gateway_no_advantage] PASS");
     println!("  Honest (12 direct): {:.4}", honest_score);
-    println!("  Max Sybil agent (5 gateways×1, cluster aggregates all): {:.4}", max_sybil_score);
+    println!(
+        "  Max Sybil agent (5 gateways×1, cluster aggregates all): {:.4}",
+        max_sybil_score
+    );
     println!("  Max gateway (1 direct each): {:.4}", max_gw_score);
     println!("  Honest strictly dominates even optimally-connected Sybil cluster");
 }

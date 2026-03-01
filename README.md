@@ -309,8 +309,8 @@ Extension for AI agents: transparent sidecar model, trust-gated services, MCP ga
 
 ## Related Projects
 
-- [trustchain-sdk](https://github.com/levvlad/trustchain-sdk) — Python SDK: zero-config `trustchain.init()`, full protocol bindings, QUIC/gRPC extras
-- [trustchain-agent-os](https://github.com/levvlad/trustchain-agent-os) — Agent framework adapters for LangGraph, CrewAI, AutoGen, OpenAI Agents, Google ADK, ElizaOS
+- [trustchain-py](https://github.com/viftode4/trustchain-py) — Python SDK: zero-config `trustchain.init()`, full protocol bindings, QUIC/gRPC extras
+- [trustchain-agent-os](https://github.com/viftode4/trustchain-agent-os) — Agent framework adapters for 12 frameworks (LangGraph, CrewAI, AutoGen, OpenAI Agents, Google ADK, ElizaOS, Claude, Smolagents, PydanticAI, Semantic Kernel, Agno, LlamaIndex)
 
 ## License
 

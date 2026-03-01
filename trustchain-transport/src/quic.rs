@@ -364,8 +364,7 @@ impl QuicTransport {
 
     /// Shut down the QUIC endpoint.
     pub fn shutdown(&self) {
-        self.endpoint
-            .close(quinn::VarInt::from_u32(0), b"shutdown");
+        self.endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
     }
 
     /// Get our public key.
@@ -375,8 +374,8 @@ impl QuicTransport {
 }
 
 fn make_server_config(pubkey: &str) -> Result<quinn::ServerConfig, TransportError> {
-    let tls_config = tls::build_server_config(pubkey)
-        .map_err(|e| TransportError::Tls(e.to_string()))?;
+    let tls_config =
+        tls::build_server_config(pubkey).map_err(|e| TransportError::Tls(e.to_string()))?;
 
     let quic_server_config = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
         .map_err(|e| TransportError::Tls(e.to_string()))?;
@@ -463,17 +462,15 @@ mod tests {
     /// The handshake must succeed when the certs match.
     #[tokio::test]
     async fn test_pinned_connection_succeeds_when_pubkeys_match() {
-        let server_pubkey = hex::encode(
-            trustchain_core::identity::Identity::generate().pubkey_bytes(),
-        );
+        let server_pubkey =
+            hex::encode(trustchain_core::identity::Identity::generate().pubkey_bytes());
         let (server, server_addr) = make_server(&server_pubkey).await;
         let _handle = start_echo_server(server);
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let client_pubkey = hex::encode(
-            trustchain_core::identity::Identity::generate().pubkey_bytes(),
-        );
+        let client_pubkey =
+            hex::encode(trustchain_core::identity::Identity::generate().pubkey_bytes());
         let client = QuicTransport::bind("127.0.0.1:0".parse().unwrap(), &client_pubkey)
             .await
             .unwrap();
@@ -491,25 +488,22 @@ mod tests {
     /// Pubkey pinning: client expects a wrong pubkey — the handshake MUST fail.
     #[tokio::test]
     async fn test_pinned_connection_fails_when_pubkeys_differ() {
-        let server_pubkey = hex::encode(
-            trustchain_core::identity::Identity::generate().pubkey_bytes(),
-        );
+        let server_pubkey =
+            hex::encode(trustchain_core::identity::Identity::generate().pubkey_bytes());
         let (server, server_addr) = make_server(&server_pubkey).await;
         let _handle = start_echo_server(server);
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let client_pubkey = hex::encode(
-            trustchain_core::identity::Identity::generate().pubkey_bytes(),
-        );
+        let client_pubkey =
+            hex::encode(trustchain_core::identity::Identity::generate().pubkey_bytes());
         let client = QuicTransport::bind("127.0.0.1:0".parse().unwrap(), &client_pubkey)
             .await
             .unwrap();
 
         // Use a completely different (wrong) expected pubkey.
-        let wrong_pubkey = hex::encode(
-            trustchain_core::identity::Identity::generate().pubkey_bytes(),
-        );
+        let wrong_pubkey =
+            hex::encode(trustchain_core::identity::Identity::generate().pubkey_bytes());
 
         let result = client
             .send_message_pinned(server_addr, b"should fail", &wrong_pubkey)
@@ -530,17 +524,15 @@ mod tests {
     /// Bootstrap mode (None pubkey): must still work — connects to any server.
     #[tokio::test]
     async fn test_bootstrap_mode_accepts_any_cert() {
-        let server_pubkey = hex::encode(
-            trustchain_core::identity::Identity::generate().pubkey_bytes(),
-        );
+        let server_pubkey =
+            hex::encode(trustchain_core::identity::Identity::generate().pubkey_bytes());
         let (server, server_addr) = make_server(&server_pubkey).await;
         let _handle = start_echo_server(server);
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let client_pubkey = hex::encode(
-            trustchain_core::identity::Identity::generate().pubkey_bytes(),
-        );
+        let client_pubkey =
+            hex::encode(trustchain_core::identity::Identity::generate().pubkey_bytes());
         let client = QuicTransport::bind("127.0.0.1:0".parse().unwrap(), &client_pubkey)
             .await
             .unwrap();

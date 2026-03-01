@@ -13,10 +13,10 @@
 
 use std::collections::HashMap;
 use trustchain_core::{
-    BlockStore, CHECOConsensus, Identity, MemoryBlockStore, TrustEngine,
     halfblock::{create_half_block, validate_and_record, validate_block},
     netflow::NetFlowTrust,
-    types::{BlockType, GENESIS_HASH, ValidationResult},
+    types::{BlockType, ValidationResult, GENESIS_HASH},
+    BlockStore, CHECOConsensus, Identity, MemoryBlockStore, TrustEngine,
 };
 
 // ─── Test 9: Full CHECO 5-node consensus round ────────────────────────────────
@@ -70,11 +70,17 @@ fn stress_checo_5node_consensus_round() {
         .iter()
         .position(|pk| *pk == facilitator_pk)
         .expect("facilitator must be one of the 5 agents");
-    println!("CHECO: facilitator is agent {fac_idx} ({}...)", &facilitator_pk[..8]);
+    println!(
+        "CHECO: facilitator is agent {fac_idx} ({}...)",
+        &facilitator_pk[..8]
+    );
 
     // Facilitator proposes a checkpoint.
     let checkpoint = engines[fac_idx].propose_checkpoint().unwrap();
-    assert!(checkpoint.is_checkpoint(), "proposed block must have checkpoint type");
+    assert!(
+        checkpoint.is_checkpoint(),
+        "proposed block must have checkpoint type"
+    );
 
     // Collect 3 co-signatures from non-facilitator agents.
     let mut sigs: HashMap<String, String> = HashMap::new();
@@ -90,7 +96,11 @@ fn stress_checo_5node_consensus_round() {
             break;
         }
     }
-    assert_eq!(sigs.len(), 3, "should collect exactly 3 co-signatures (threshold)");
+    assert_eq!(
+        sigs.len(),
+        3,
+        "should collect exactly 3 co-signatures (threshold)"
+    );
 
     // Facilitator finalizes the checkpoint with the collected co-signatures.
     let finalized = engines[fac_idx]
@@ -204,26 +214,19 @@ fn stress_double_countersign_detected() {
     println!("double-countersign: detected and recorded ✓");
 }
 
-// ─── Test 11: Trust score exact math — weight formula and redistribution ───────
+// ─── Test 11: Trust score exact math — integrity and no-seed path ──────────────
 //
 // Verifies two concrete formula applications (§5):
 //
 //   A) Empty agent:
-//      integrity=1.0, statistical=0.0, no netflow
-//      → no-netflow redistribution: (0.3/0.6)*1.0 + (0.3/0.6)*0.0 = 0.5
+//      integrity=1.0 (empty chain has no blocks to fail), no seeds → trust = 1.0.
 //
-//   B) 20 proposals, 1 counterparty, same timestamp, no agreements:
-//      count_score   = 20/20 = 1.0
-//      unique_score  =  1/5  = 0.2
-//      completion_rate = 0.0   (no linked agreements in store)
-//      age_score     = 0.0   (all same timestamp → age_ms=0)
-//      entropy_score = 0.0   (1 counterparty → no diversity)
-//      statistical   = 0.25×1.0 + 0.20×0.2 + 0.25×0.0 + 0.10×0.0 + 0.20×0.0 = 0.29
-//      trust (no nf) = 0.5×integrity + 0.5×statistical = 0.5×1.0 + 0.5×0.29 = 0.645
+//   B) 20 proposals, perfect hash chain:
+//      integrity=1.0, no seeds → trust = integrity = 1.0
 
 #[test]
 fn stress_trust_exact_math_no_netflow() {
-    // Case A: empty chain → exactly 0.5
+    // Case A: empty chain → integrity=1.0 (no blocks to fail), no seeds → trust=1.0.
     {
         let store = MemoryBlockStore::new();
         let engine = TrustEngine::new(&store, None, None, None);
@@ -231,12 +234,12 @@ fn stress_trust_exact_math_no_netflow() {
             .compute_trust(&Identity::from_bytes(&[1; 32]).pubkey_hex())
             .unwrap();
         assert!(
-            (score - 0.5).abs() < 1e-9,
-            "empty agent must score exactly 0.5 (half-trust baseline), got {score}"
+            (score - 1.0).abs() < 1e-9,
+            "empty agent must score exactly 1.0 (empty chain integrity=1.0, no seeds), got {score}"
         );
     }
 
-    // Case B: 20 proposals to 1 counterparty, same timestamp, no agreements.
+    // Case B: 20 proposals forming a perfect hash chain.
     {
         let alice = Identity::from_bytes(&[1; 32]);
         let peer = Identity::from_bytes(&[2; 32]);
@@ -251,19 +254,14 @@ fn stress_trust_exact_math_no_netflow() {
                 &prev,
                 BlockType::Proposal,
                 serde_json::json!({"i": i}),
-                Some(5000), // all same timestamp → age_ms = 0
+                Some(5000 + i * 1000),
             );
             prev = b.block_hash.clone();
             store.add_block(&b).unwrap();
         }
 
         let engine = TrustEngine::new(&store, None, None, None);
-        let integrity = engine
-            .compute_chain_integrity(&alice.pubkey_hex())
-            .unwrap();
-        let statistical = engine
-            .compute_statistical_score(&alice.pubkey_hex())
-            .unwrap();
+        let integrity = engine.compute_chain_integrity(&alice.pubkey_hex()).unwrap();
         let trust = engine.compute_trust(&alice.pubkey_hex()).unwrap();
 
         assert!(
@@ -271,23 +269,13 @@ fn stress_trust_exact_math_no_netflow() {
             "perfect chain must have integrity=1.0, got {integrity}"
         );
 
-        // statistical = 0.25×1.0 + 0.20×0.2 + 0.25×0.0 + 0.10×0.0 + 0.20×0.0
-        let expected_stat: f64 = 0.25 * 1.0 + 0.20 * 0.2 + 0.25 * 0.0 + 0.10 * 0.0 + 0.20 * 0.0;
+        // No seeds configured → trust = integrity directly.
         assert!(
-            (statistical - expected_stat).abs() < 1e-6,
-            "statistical should be ≈{expected_stat:.4}, got {statistical:.6}"
+            (trust - integrity).abs() < 1e-9,
+            "without seeds trust must equal integrity ({integrity:.6}), got {trust:.6}"
         );
 
-        // No netflow → redistribute: (0.3/0.6)×integrity + (0.3/0.6)×statistical
-        let expected_trust = 0.5 * integrity + 0.5 * statistical;
-        assert!(
-            (trust - expected_trust).abs() < 1e-6,
-            "trust formula mismatch: expected {expected_trust:.6}, got {trust:.6}"
-        );
-
-        println!(
-            "exact math: integrity={integrity:.4} stat={statistical:.4} trust={trust:.4} ✓"
-        );
+        println!("exact math: integrity={integrity:.4} trust={trust:.4} ✓");
     }
 }
 
@@ -305,29 +293,59 @@ fn stress_chain_integrity_broken_link() {
 
     // Blocks 1–3 form a correct chain.
     let b1 = create_half_block(
-        &alice, 1, &peer.pubkey_hex(), 0, GENESIS_HASH,
-        BlockType::Proposal, serde_json::json!({}), Some(1000),
+        &alice,
+        1,
+        &peer.pubkey_hex(),
+        0,
+        GENESIS_HASH,
+        BlockType::Proposal,
+        serde_json::json!({}),
+        Some(1000),
     );
     let b2 = create_half_block(
-        &alice, 2, &peer.pubkey_hex(), 0, &b1.block_hash,
-        BlockType::Proposal, serde_json::json!({}), Some(2000),
+        &alice,
+        2,
+        &peer.pubkey_hex(),
+        0,
+        &b1.block_hash,
+        BlockType::Proposal,
+        serde_json::json!({}),
+        Some(2000),
     );
     let b3 = create_half_block(
-        &alice, 3, &peer.pubkey_hex(), 0, &b2.block_hash,
-        BlockType::Proposal, serde_json::json!({}), Some(3000),
+        &alice,
+        3,
+        &peer.pubkey_hex(),
+        0,
+        &b2.block_hash,
+        BlockType::Proposal,
+        serde_json::json!({}),
+        Some(3000),
     );
 
     // Block 4 deliberately anchors to GENESIS_HASH instead of b3 — valid signature,
     // broken chain link.  This simulates a tampered or gap-filled block.
     let b4_broken = create_half_block(
-        &alice, 4, &peer.pubkey_hex(), 0, GENESIS_HASH, // WRONG prev — should be b3.block_hash
-        BlockType::Proposal, serde_json::json!({}), Some(4000),
+        &alice,
+        4,
+        &peer.pubkey_hex(),
+        0,
+        GENESIS_HASH, // WRONG prev — should be b3.block_hash
+        BlockType::Proposal,
+        serde_json::json!({}),
+        Some(4000),
     );
 
     // Block 5 continues from the broken block (valid local chain from b4 onwards).
     let b5 = create_half_block(
-        &alice, 5, &peer.pubkey_hex(), 0, &b4_broken.block_hash,
-        BlockType::Proposal, serde_json::json!({}), Some(5000),
+        &alice,
+        5,
+        &peer.pubkey_hex(),
+        0,
+        &b4_broken.block_hash,
+        BlockType::Proposal,
+        serde_json::json!({}),
+        Some(5000),
     );
 
     for b in [&b1, &b2, &b3, &b4_broken, &b5] {
@@ -335,9 +353,7 @@ fn stress_chain_integrity_broken_link() {
     }
 
     let engine = TrustEngine::new(&store, None, None, None);
-    let integrity = engine
-        .compute_chain_integrity(&alice.pubkey_hex())
-        .unwrap();
+    let integrity = engine.compute_chain_integrity(&alice.pubkey_hex()).unwrap();
 
     // Scanner stops at i=3 (seq=4) where expected_prev=b3.hash ≠ actual=GENESIS_HASH.
     // Returns 3.0 / 5.0 = 0.6.
@@ -387,20 +403,22 @@ fn stress_trust_monotonicity() {
 
     println!("trust monotonicity: t0={t0:.4}  t5={t5:.4}  t20={t20:.4}");
 
+    // No seeds → trust = integrity. Empty chain has integrity=1.0.
+    // Adding interactions keeps integrity=1.0 as long as the chain is valid.
     assert!(
-        (t0 - 0.5).abs() < 1e-9,
-        "empty agent must score exactly 0.5, got {t0}"
+        (t0 - 1.0).abs() < 1e-9,
+        "empty agent must score exactly 1.0 (no seeds, empty chain integrity=1.0), got {t0}"
     );
     assert!(
-        t5 > t0,
-        "5 interactions should raise trust above baseline ({t5:.4} > {t0:.4})"
+        (t5 - 1.0).abs() < 1e-9,
+        "5-interaction perfect chain must score 1.0 (no seeds, integrity=1.0), got {t5}"
     );
     assert!(
-        t20 > t5,
-        "20 interactions should raise trust above 5 ({t20:.4} > {t5:.4})"
+        (t20 - 1.0).abs() < 1e-9,
+        "20-interaction perfect chain must score 1.0 (no seeds, integrity=1.0), got {t20}"
     );
     assert!(t20 <= 1.0, "trust must be capped at 1.0");
-    println!("trust monotonicity: t0 < t5 < t20 ≤ 1.0 ✓");
+    println!("trust monotonicity: t0=t5=t20=1.0 (no seeds, perfect chains) ✓");
 }
 
 // ─── Test 14: NetFlow with multiple seed nodes (§4.1) ─────────────────────────
@@ -420,32 +438,62 @@ fn stress_netflow_multi_seed() {
 
     // Honest ↔ seed1 interaction.
     let p1 = create_half_block(
-        &seed1, 1, &honest.pubkey_hex(), 0, GENESIS_HASH,
-        BlockType::Proposal, serde_json::json!({}), Some(1000),
+        &seed1,
+        1,
+        &honest.pubkey_hex(),
+        0,
+        GENESIS_HASH,
+        BlockType::Proposal,
+        serde_json::json!({}),
+        Some(1000),
     );
     let a1 = create_half_block(
-        &honest, 1, &seed1.pubkey_hex(), 1, GENESIS_HASH,
-        BlockType::Agreement, serde_json::json!({}), Some(1001),
+        &honest,
+        1,
+        &seed1.pubkey_hex(),
+        1,
+        GENESIS_HASH,
+        BlockType::Agreement,
+        serde_json::json!({}),
+        Some(1001),
     );
     store.add_block(&p1).unwrap();
     store.add_block(&a1).unwrap();
 
     // Honest ↔ seed2 interaction.
     let p2 = create_half_block(
-        &seed2, 1, &honest.pubkey_hex(), 0, GENESIS_HASH,
-        BlockType::Proposal, serde_json::json!({}), Some(2000),
+        &seed2,
+        1,
+        &honest.pubkey_hex(),
+        0,
+        GENESIS_HASH,
+        BlockType::Proposal,
+        serde_json::json!({}),
+        Some(2000),
     );
     let a2 = create_half_block(
-        &honest, 2, &seed2.pubkey_hex(), 1, &a1.block_hash,
-        BlockType::Agreement, serde_json::json!({}), Some(2001),
+        &honest,
+        2,
+        &seed2.pubkey_hex(),
+        1,
+        &a1.block_hash,
+        BlockType::Agreement,
+        serde_json::json!({}),
+        Some(2001),
     );
     store.add_block(&p2).unwrap();
     store.add_block(&a2).unwrap();
 
     // Alien activity: proposal only, no seed connections.
     let alien_p = create_half_block(
-        &alien, 1, &honest.pubkey_hex(), 0, GENESIS_HASH,
-        BlockType::Proposal, serde_json::json!({}), Some(3000),
+        &alien,
+        1,
+        &honest.pubkey_hex(),
+        0,
+        GENESIS_HASH,
+        BlockType::Proposal,
+        serde_json::json!({}),
+        Some(3000),
     );
     store.add_block(&alien_p).unwrap();
 
@@ -454,8 +502,7 @@ fn stress_netflow_multi_seed() {
     let score_1seed = engine1.compute_trust(&honest.pubkey_hex()).unwrap();
 
     // Multi-seed engine (seed1 + seed2).
-    let engine2 =
-        NetFlowTrust::new(&store, vec![seed1.pubkey_hex(), seed2.pubkey_hex()]).unwrap();
+    let engine2 = NetFlowTrust::new(&store, vec![seed1.pubkey_hex(), seed2.pubkey_hex()]).unwrap();
     let score_2seed = engine2.compute_trust(&honest.pubkey_hex()).unwrap();
     let alien_score = engine2.compute_trust(&alien.pubkey_hex()).unwrap();
 

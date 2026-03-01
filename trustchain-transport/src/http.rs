@@ -4,25 +4,30 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
+    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use trustchain_core::{BlockStore, Checkpoint, DelegationStore, HalfBlock, TrustChainProtocol, TrustEngine};
+use trustchain_core::{
+    BlockStore, Checkpoint, DelegationStore, HalfBlock, TrustChainProtocol, TrustEngine,
+};
 
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::discover::{self, CapabilityQuery, DiscoveredAgent};
 use crate::discovery::PeerDiscovery;
-use crate::message::{MessageType, TransportMessage, block_to_bytes, bytes_to_block};
+use crate::message::{block_to_bytes, bytes_to_block, MessageType, TransportMessage};
 use crate::quic::QuicTransport;
 
 /// Shared application state for HTTP handlers, generic over BlockStore and DelegationStore.
-pub struct AppState<S: BlockStore + 'static, D: DelegationStore + 'static = trustchain_core::MemoryDelegationStore> {
+pub struct AppState<
+    S: BlockStore + 'static,
+    D: DelegationStore + 'static = trustchain_core::MemoryDelegationStore,
+> {
     pub protocol: Arc<Mutex<TrustChainProtocol<S>>>,
     pub discovery: Arc<PeerDiscovery>,
     /// QUIC transport for P2P communication (optional — None in tests).
@@ -295,7 +300,10 @@ pub fn build_router<S: BlockStore + Send + 'static, D: DelegationStore + Send + 
         .route("/chain/{pubkey}", get(handle_get_chain::<S, D>))
         .route("/block/{pubkey}/{seq}", get(handle_get_block::<S, D>))
         .route("/crawl/{pubkey}", get(handle_crawl::<S, D>))
-        .route("/peers", get(handle_get_peers::<S, D>).post(handle_register_peer::<S, D>))
+        .route(
+            "/peers",
+            get(handle_get_peers::<S, D>).post(handle_register_peer::<S, D>),
+        )
         .route("/trust/{pubkey}", get(handle_trust_score::<S, D>))
         .route("/discover", get(handle_discover::<S, D>))
         .route("/delegate", post(handle_delegate::<S, D>))
@@ -310,7 +318,10 @@ pub fn build_router<S: BlockStore + Send + 'static, D: DelegationStore + Send + 
 }
 
 /// Start the HTTP server.
-pub async fn start_http_server<S: BlockStore + Send + 'static, D: DelegationStore + Send + 'static>(
+pub async fn start_http_server<
+    S: BlockStore + Send + 'static,
+    D: DelegationStore + Send + 'static,
+>(
     addr: SocketAddr,
     state: AppState<S, D>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -354,8 +365,16 @@ async fn handle_propose<S: BlockStore + 'static, D: DelegationStore + Send + 'st
     // Step 1: Create proposal locally.
     let proposal = {
         let mut proto = state.protocol.lock().await;
-        proto.create_proposal(&req.counterparty_pubkey, req.transaction, None)
-            .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e.to_string() })))?
+        proto
+            .create_proposal(&req.counterparty_pubkey, req.transaction, None)
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: e.to_string(),
+                    }),
+                )
+            })?
     };
 
     // Step 2: Look up the counterparty's address and send via QUIC P2P.
@@ -384,10 +403,14 @@ async fn handle_propose<S: BlockStore + 'static, D: DelegationStore + Send + 'st
             match tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 quic.send_message(addr, &msg_bytes),
-            ).await {
+            )
+            .await
+            {
                 Ok(Ok(response_bytes)) => {
                     // Try to parse the response as a TransportMessage containing an agreement.
-                    if let Ok(resp_msg) = serde_json::from_slice::<TransportMessage>(&response_bytes) {
+                    if let Ok(resp_msg) =
+                        serde_json::from_slice::<TransportMessage>(&response_bytes)
+                    {
                         if resp_msg.message_type == MessageType::Agreement {
                             if let Ok(agreement) = bytes_to_block(&resp_msg.payload) {
                                 // Store the agreement locally.
@@ -408,7 +431,9 @@ async fn handle_propose<S: BlockStore + 'static, D: DelegationStore + Send + 'st
                         }
                     }
                     // Response wasn't a valid agreement — check if it's an error.
-                    if let Ok(err_resp) = serde_json::from_slice::<serde_json::Value>(&response_bytes) {
+                    if let Ok(err_resp) =
+                        serde_json::from_slice::<serde_json::Value>(&response_bytes)
+                    {
                         if let Some(err_msg) = err_resp.get("error").and_then(|v| v.as_str()) {
                             log::warn!("peer rejected proposal: {err_msg}");
                         }
@@ -435,11 +460,11 @@ async fn handle_propose<S: BlockStore + 'static, D: DelegationStore + Send + 'st
 /// Derive the QUIC address from a peer's HTTP address.
 /// Peers store HTTP addresses like "127.0.0.1:8202" — QUIC is on port - QUIC_PORT_OFFSET.
 pub(crate) fn peer_quic_addr(http_addr: &str) -> Result<std::net::SocketAddr, String> {
-    let addr = http_addr
-        .strip_prefix("http://")
-        .unwrap_or(http_addr);
+    let addr = http_addr.strip_prefix("http://").unwrap_or(http_addr);
     addr.parse::<std::net::SocketAddr>()
-        .map(|a| std::net::SocketAddr::new(a.ip(), a.port().saturating_sub(crate::QUIC_PORT_OFFSET)))
+        .map(|a| {
+            std::net::SocketAddr::new(a.ip(), a.port().saturating_sub(crate::QUIC_PORT_OFFSET))
+        })
         .map_err(|e| format!("invalid peer address: {e}"))
 }
 
@@ -677,7 +702,10 @@ async fn handle_register_peer<S: BlockStore + 'static, D: DelegationStore + Send
 }
 
 /// Build a DelegationContext from a concrete DelegationStore (no dyn dispatch in caller).
-fn build_delegation_ctx<D: DelegationStore>(ds: &D, pubkey: &str) -> Option<trustchain_core::DelegationContext> {
+fn build_delegation_ctx<D: DelegationStore>(
+    ds: &D,
+    pubkey: &str,
+) -> Option<trustchain_core::DelegationContext> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -690,23 +718,28 @@ fn build_delegation_ctx<D: DelegationStore>(ds: &D, pubkey: &str) -> Option<trus
 
     let was_delegate = ds.is_delegate(pubkey).unwrap_or(false);
 
-    let (root_pubkey, root_active_delegation_count) = if let Some(ref delegation) = active_delegation {
-        let mut root = delegation.delegator_pubkey.clone();
-        let mut current = delegation.clone();
-        while let Some(ref parent_id) = current.parent_delegation_id {
-            if let Ok(Some(parent)) = ds.get_delegation(parent_id) {
-                root = parent.delegator_pubkey.clone();
-                current = parent;
-            } else {
-                break;
+    let (root_pubkey, root_active_delegation_count) =
+        if let Some(ref delegation) = active_delegation {
+            let mut root = delegation.delegator_pubkey.clone();
+            let mut current = delegation.clone();
+            while let Some(ref parent_id) = current.parent_delegation_id {
+                if let Ok(Some(parent)) = ds.get_delegation(parent_id) {
+                    root = parent.delegator_pubkey.clone();
+                    current = parent;
+                } else {
+                    break;
+                }
             }
-        }
-        let all_delegations = ds.get_delegations_by_delegator(&root).unwrap_or_default();
-        let active_count = all_delegations.iter().filter(|d| d.is_active(now_ms)).count().max(1);
-        (Some(root), active_count)
-    } else {
-        (None, 0)
-    };
+            let all_delegations = ds.get_delegations_by_delegator(&root).unwrap_or_default();
+            let active_count = all_delegations
+                .iter()
+                .filter(|d| d.is_active(now_ms))
+                .count()
+                .max(1);
+            (Some(root), active_count)
+        } else {
+            (None, 0)
+        };
 
     let delegations_as_delegator = ds.get_delegations_by_delegator(pubkey).unwrap_or_default();
 
@@ -803,8 +836,7 @@ async fn handle_discover<S: BlockStore + 'static, D: DelegationStore + Send + 's
             let peer_addr = peer.address.clone();
 
             handles.push(tokio::spawn(async move {
-                let quic_addr = peer_quic_addr(&peer_addr)
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                let quic_addr = peer_quic_addr(&peer_addr).map_err(|e| anyhow::anyhow!(e))?;
                 let msg = TransportMessage::new(
                     MessageType::CapabilityRequest,
                     String::new(),
@@ -915,7 +947,11 @@ async fn handle_healthz<S: BlockStore + 'static, D: DelegationStore + Send + 'st
 
 async fn handle_metrics<S: BlockStore + 'static, D: DelegationStore + Send + 'static>(
     State(state): State<AppState<S, D>>,
-) -> (StatusCode, [(axum::http::HeaderName, &'static str); 1], String) {
+) -> (
+    StatusCode,
+    [(axum::http::HeaderName, &'static str); 1],
+    String,
+) {
     let proto = state.protocol.lock().await;
     let pubkey = proto.pubkey();
     let block_count = proto.store().get_block_count().unwrap_or(0);
@@ -945,7 +981,10 @@ async fn handle_metrics<S: BlockStore + 'static, D: DelegationStore + Send + 'st
 
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
         metrics,
     )
 }
@@ -965,7 +1004,14 @@ async fn handle_accept_delegation<S: BlockStore + 'static, D: DelegationStore + 
     // Validate and accept the delegation proposal.
     let agreement = proto
         .accept_delegation(&req.proposal_block, &mut *ds)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e.to_string() })))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        })?;
 
     let delegation_id = req.proposal_block.transaction["delegation_id"]
         .as_str()
@@ -975,10 +1021,22 @@ async fn handle_accept_delegation<S: BlockStore + 'static, D: DelegationStore + 
     // Fetch the stored delegation record.
     let record = ds
         .get_delegation(&delegation_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })))?
-        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-            error: "Delegation record not found after acceptance".to_string(),
-        })))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Delegation record not found after acceptance".to_string(),
+                }),
+            )
+        })?;
 
     Ok(Json(AcceptDelegationResponse {
         agreement,
@@ -996,7 +1054,14 @@ async fn handle_accept_succession<S: BlockStore + 'static, D: DelegationStore + 
 
     let agreement = proto
         .accept_succession(&req.proposal_block, Some(&mut *ds))
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e.to_string() })))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        })?;
 
     let succession_id = req.proposal_block.transaction["succession_id"]
         .as_str()
@@ -1039,7 +1104,14 @@ async fn handle_delegate<S: BlockStore + 'static, D: DelegationStore + Send + 's
             req.ttl_seconds * 1000, // convert seconds to ms
             Some(&*ds_guard),
         )
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e.to_string() })))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        })?;
 
     let delegation_id = block.transaction["delegation_id"]
         .as_str()
@@ -1060,7 +1132,14 @@ async fn handle_revoke<S: BlockStore + 'static, D: DelegationStore + Send + 'sta
 
     let block = proto
         .create_revocation(&req.delegation_id, &mut *ds)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e.to_string() })))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        })?;
 
     Ok(Json(DelegationResponse {
         block,
@@ -1086,8 +1165,22 @@ async fn handle_get_delegation<S: BlockStore + 'static, D: DelegationStore + Sen
     let ds = state.delegation_store.lock().await;
     let delegation = ds
         .get_delegation(&id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(ErrorResponse { error: "Delegation not found".to_string() })))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "Delegation not found".to_string(),
+                }),
+            )
+        })?;
     Ok(Json(delegation))
 }
 
@@ -1209,7 +1302,9 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let trust_resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(trust_resp.get("trust_score").is_some());
         assert!(trust_resp.get("interaction_count").is_some());
@@ -1241,7 +1336,9 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(status["agent_endpoint"], "http://localhost:9002");
     }
@@ -1287,7 +1384,8 @@ mod tests {
         address: &str,
         timestamp: u64,
     ) -> serde_json::Value {
-        let payload = canonical_peer_registration_payload(&identity.pubkey_hex(), address, timestamp);
+        let payload =
+            canonical_peer_registration_payload(&identity.pubkey_hex(), address, timestamp);
         let sig_hex = identity.sign_hex(&payload);
         serde_json::json!({
             "pubkey": identity.pubkey_hex(),
@@ -1333,7 +1431,10 @@ mod tests {
 
         // Peer must appear in the discovery table.
         let peer = state.discovery.get_peer(&peer_identity.pubkey_hex()).await;
-        assert!(peer.is_some(), "peer must be registered after successful verification");
+        assert!(
+            peer.is_some(),
+            "peer must be registered after successful verification"
+        );
     }
 
     /// An incorrect signature (signed by a different key) must be rejected with HTTP 401.
@@ -1374,7 +1475,10 @@ mod tests {
 
         // Peer must NOT appear in the discovery table.
         let peer = state.discovery.get_peer(&peer_identity.pubkey_hex()).await;
-        assert!(peer.is_none(), "peer must not be registered when signature is invalid");
+        assert!(
+            peer.is_none(),
+            "peer must not be registered when signature is invalid"
+        );
     }
 
     /// A request with no signature field must still be accepted (backward compatibility)
@@ -1409,7 +1513,10 @@ mod tests {
 
         // Peer must appear in the discovery table.
         let peer = state.discovery.get_peer(&peer_identity.pubkey_hex()).await;
-        assert!(peer.is_some(), "peer must be registered even without a signature");
+        assert!(
+            peer.is_some(),
+            "peer must be registered even without a signature"
+        );
     }
 
     /// A signed request with a timestamp older than MAX_PEER_REG_AGE_MS must be rejected
@@ -1442,7 +1549,10 @@ mod tests {
 
         // Peer must NOT be registered.
         let peer = state.discovery.get_peer(&peer_identity.pubkey_hex()).await;
-        assert!(peer.is_none(), "peer must not be registered when timestamp is stale");
+        assert!(
+            peer.is_none(),
+            "peer must not be registered when timestamp is stale"
+        );
     }
 
     /// A signed request that omits `timestamp` must be rejected with HTTP 422.

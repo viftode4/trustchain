@@ -29,7 +29,7 @@ pub async fn discover_public_addr(stun_server: &str) -> Result<SocketAddr, Strin
     let mut request = [0u8; 20];
     request[0] = 0x00; // Type high byte
     request[1] = 0x01; // Type low byte (Binding Request)
-    // Length = 0 (no attributes)
+                       // Length = 0 (no attributes)
     request[2] = 0x00;
     request[3] = 0x00;
     // Magic cookie
@@ -45,13 +45,10 @@ pub async fn discover_public_addr(stun_server: &str) -> Result<SocketAddr, Strin
         .map_err(|e| format!("send failed: {e}"))?;
 
     let mut buf = [0u8; 512];
-    let n = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        socket.recv(&mut buf),
-    )
-    .await
-    .map_err(|_| "STUN timeout".to_string())?
-    .map_err(|e| format!("recv failed: {e}"))?;
+    let n = tokio::time::timeout(std::time::Duration::from_secs(3), socket.recv(&mut buf))
+        .await
+        .map_err(|_| "STUN timeout".to_string())?
+        .map_err(|e| format!("recv failed: {e}"))?;
 
     if n < 20 {
         return Err("STUN response too short".to_string());
@@ -75,7 +72,11 @@ pub async fn discover_public_addr(stun_server: &str) -> Result<SocketAddr, Strin
 }
 
 /// Parse STUN response attributes, looking for XOR-MAPPED-ADDRESS or MAPPED-ADDRESS.
-pub fn parse_stun_response(attrs: &[u8], magic: &[u8], tx_id: &[u8; 12]) -> Result<SocketAddr, String> {
+pub fn parse_stun_response(
+    attrs: &[u8],
+    magic: &[u8],
+    tx_id: &[u8; 12],
+) -> Result<SocketAddr, String> {
     let mut offset = 0;
     while offset + 4 <= attrs.len() {
         let attr_type = u16::from_be_bytes([attrs[offset], attrs[offset + 1]]);
@@ -102,7 +103,11 @@ pub fn parse_stun_response(attrs: &[u8], magic: &[u8], tx_id: &[u8; 12]) -> Resu
     Err("no MAPPED-ADDRESS found in STUN response".to_string())
 }
 
-fn parse_xor_mapped_address(value: &[u8], magic: &[u8], tx_id: &[u8; 12]) -> Result<SocketAddr, String> {
+fn parse_xor_mapped_address(
+    value: &[u8],
+    magic: &[u8],
+    tx_id: &[u8; 12],
+) -> Result<SocketAddr, String> {
     if value.len() < 8 {
         return Err("XOR-MAPPED-ADDRESS too short".to_string());
     }
@@ -192,14 +197,19 @@ mod tests {
         attr.extend_from_slice(&xor_ip);
 
         let result = parse_stun_response(&attr, &magic, &tx_id).unwrap();
-        assert_eq!(result.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 42)));
+        assert_eq!(
+            result.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 42))
+        );
         assert_eq!(result.port(), 12345);
     }
 
     #[test]
     fn test_stun_parse_xor_mapped_address_ipv6() {
         let magic = MAGIC_COOKIE.to_be_bytes();
-        let tx_id: [u8; 12] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C];
+        let tx_id: [u8; 12] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
+        ];
 
         // Target IPv6: 2001:db8::1 = [0x20,0x01,0x0d,0xb8, 0,0,0,0, 0,0,0,0, 0,0,0,1]
         let ip_bytes: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
@@ -223,7 +233,10 @@ mod tests {
         attr.extend_from_slice(&xor_ip);
 
         let result = parse_stun_response(&attr, &magic, &tx_id).unwrap();
-        assert_eq!(result.ip(), std::net::IpAddr::V6("2001:db8::1".parse().unwrap()));
+        assert_eq!(
+            result.ip(),
+            std::net::IpAddr::V6("2001:db8::1".parse().unwrap())
+        );
         assert_eq!(result.port(), 9000);
     }
 
@@ -241,7 +254,10 @@ mod tests {
         attr.extend_from_slice(&[192, 168, 1, 1]);
 
         let result = parse_stun_response(&attr, &magic, &tx_id).unwrap();
-        assert_eq!(result.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(
+            result.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1))
+        );
         assert_eq!(result.port(), 8080);
     }
 }

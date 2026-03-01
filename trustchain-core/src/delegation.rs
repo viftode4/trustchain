@@ -28,7 +28,7 @@ pub struct DelegationRecord {
 impl DelegationRecord {
     /// Whether this delegation is currently active (not expired, not revoked).
     pub fn is_active(&self, now_ms: u64) -> bool {
-        !self.revoked && now_ms < self.expires_at
+        !self.revoked && now_ms >= self.issued_at && now_ms < self.expires_at
     }
 }
 
@@ -49,16 +49,19 @@ pub trait DelegationStore: Send + Sync {
     fn get_delegation(&self, delegation_id: &str) -> Result<Option<DelegationRecord>>;
 
     /// Get the delegation where the given pubkey is the delegate.
-    fn get_delegation_by_delegate(&self, delegate_pubkey: &str) -> Result<Option<DelegationRecord>>;
+    fn get_delegation_by_delegate(&self, delegate_pubkey: &str)
+        -> Result<Option<DelegationRecord>>;
 
     /// List all active delegations where the given pubkey is the delegator.
-    fn get_delegations_by_delegator(&self, delegator_pubkey: &str) -> Result<Vec<DelegationRecord>>;
+    fn get_delegations_by_delegator(&self, delegator_pubkey: &str)
+        -> Result<Vec<DelegationRecord>>;
 
     /// List all delegations (active and revoked) involving a pubkey (as delegator or delegate).
     fn get_delegations_for_pubkey(&self, pubkey: &str) -> Result<Vec<DelegationRecord>>;
 
     /// Revoke a delegation by ID.
-    fn revoke_delegation(&mut self, delegation_id: &str, revocation_block_hash: &str) -> Result<()>;
+    fn revoke_delegation(&mut self, delegation_id: &str, revocation_block_hash: &str)
+        -> Result<()>;
 
     /// Check if a delegation has been revoked.
     fn is_revoked(&self, delegation_id: &str) -> Result<bool>;
@@ -95,7 +98,8 @@ impl MemoryDelegationStore {
 
 impl DelegationStore for MemoryDelegationStore {
     fn add_delegation(&mut self, record: DelegationRecord) -> Result<()> {
-        self.delegations.insert(record.delegation_id.clone(), record);
+        self.delegations
+            .insert(record.delegation_id.clone(), record);
         Ok(())
     }
 
@@ -103,7 +107,10 @@ impl DelegationStore for MemoryDelegationStore {
         Ok(self.delegations.get(delegation_id).cloned())
     }
 
-    fn get_delegation_by_delegate(&self, delegate_pubkey: &str) -> Result<Option<DelegationRecord>> {
+    fn get_delegation_by_delegate(
+        &self,
+        delegate_pubkey: &str,
+    ) -> Result<Option<DelegationRecord>> {
         Ok(self
             .delegations
             .values()
@@ -111,7 +118,10 @@ impl DelegationStore for MemoryDelegationStore {
             .cloned())
     }
 
-    fn get_delegations_by_delegator(&self, delegator_pubkey: &str) -> Result<Vec<DelegationRecord>> {
+    fn get_delegations_by_delegator(
+        &self,
+        delegator_pubkey: &str,
+    ) -> Result<Vec<DelegationRecord>> {
         Ok(self
             .delegations
             .values()
@@ -129,20 +139,30 @@ impl DelegationStore for MemoryDelegationStore {
             .collect())
     }
 
-    fn revoke_delegation(&mut self, delegation_id: &str, revocation_block_hash: &str) -> Result<()> {
+    fn revoke_delegation(
+        &mut self,
+        delegation_id: &str,
+        revocation_block_hash: &str,
+    ) -> Result<()> {
         if let Some(d) = self.delegations.get_mut(delegation_id) {
             d.revoked = true;
             d.revocation_block_hash = Some(revocation_block_hash.to_string());
             Ok(())
         } else {
-            Err(TrustChainError::delegation("", format!("Unknown delegation: {delegation_id}")))
+            Err(TrustChainError::delegation(
+                "",
+                format!("Unknown delegation: {delegation_id}"),
+            ))
         }
     }
 
     fn is_revoked(&self, delegation_id: &str) -> Result<bool> {
         match self.delegations.get(delegation_id) {
             Some(d) => Ok(d.revoked),
-            None => Err(TrustChainError::delegation("", format!("Unknown delegation: {delegation_id}"))),
+            None => Err(TrustChainError::delegation(
+                "",
+                format!("Unknown delegation: {delegation_id}"),
+            )),
         }
     }
 
@@ -168,7 +188,10 @@ impl DelegationStore for MemoryDelegationStore {
     }
 
     fn is_delegate(&self, pubkey: &str) -> Result<bool> {
-        Ok(self.delegations.values().any(|d| d.delegate_pubkey == pubkey))
+        Ok(self
+            .delegations
+            .values()
+            .any(|d| d.delegate_pubkey == pubkey))
     }
 
     fn delegation_count(&self) -> Result<usize> {
@@ -208,7 +231,10 @@ impl SqliteDelegationStore {
     }
 
     fn init_schema(&self) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS delegations (
@@ -243,7 +269,10 @@ impl SqliteDelegationStore {
 
 impl DelegationStore for SqliteDelegationStore {
     fn add_delegation(&mut self, record: DelegationRecord) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         let scope_json = serde_json::to_string(&record.scope)?;
         conn.execute(
             "INSERT OR REPLACE INTO delegations
@@ -270,7 +299,10 @@ impl DelegationStore for SqliteDelegationStore {
     }
 
     fn get_delegation(&self, delegation_id: &str) -> Result<Option<DelegationRecord>> {
-        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         let mut stmt = conn.prepare(
             "SELECT delegation_id, delegator_pubkey, delegate_pubkey, scope, max_depth,
                     issued_at, expires_at, delegation_block_hash, agreement_block_hash,
@@ -284,8 +316,14 @@ impl DelegationStore for SqliteDelegationStore {
         }
     }
 
-    fn get_delegation_by_delegate(&self, delegate_pubkey: &str) -> Result<Option<DelegationRecord>> {
-        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
+    fn get_delegation_by_delegate(
+        &self,
+        delegate_pubkey: &str,
+    ) -> Result<Option<DelegationRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         let mut stmt = conn.prepare(
             "SELECT delegation_id, delegator_pubkey, delegate_pubkey, scope, max_depth,
                     issued_at, expires_at, delegation_block_hash, agreement_block_hash,
@@ -300,15 +338,21 @@ impl DelegationStore for SqliteDelegationStore {
         }
     }
 
-    fn get_delegations_by_delegator(&self, delegator_pubkey: &str) -> Result<Vec<DelegationRecord>> {
-        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
+    fn get_delegations_by_delegator(
+        &self,
+        delegator_pubkey: &str,
+    ) -> Result<Vec<DelegationRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         let mut stmt = conn.prepare(
             "SELECT delegation_id, delegator_pubkey, delegate_pubkey, scope, max_depth,
                     issued_at, expires_at, delegation_block_hash, agreement_block_hash,
                     parent_delegation_id, revoked, revocation_block_hash
              FROM delegations WHERE delegator_pubkey = ?1",
         )?;
-        let rows = stmt.query_map(rusqlite::params![delegator_pubkey], |row| row_to_delegation(row))?;
+        let rows = stmt.query_map(rusqlite::params![delegator_pubkey], row_to_delegation)?;
         let mut result = Vec::new();
         for row in rows {
             result.push(row.map_err(|e| TrustChainError::Storage(e.to_string()))?);
@@ -317,14 +361,17 @@ impl DelegationStore for SqliteDelegationStore {
     }
 
     fn get_delegations_for_pubkey(&self, pubkey: &str) -> Result<Vec<DelegationRecord>> {
-        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         let mut stmt = conn.prepare(
             "SELECT delegation_id, delegator_pubkey, delegate_pubkey, scope, max_depth,
                     issued_at, expires_at, delegation_block_hash, agreement_block_hash,
                     parent_delegation_id, revoked, revocation_block_hash
              FROM delegations WHERE delegator_pubkey = ?1 OR delegate_pubkey = ?1",
         )?;
-        let rows = stmt.query_map(rusqlite::params![pubkey], |row| row_to_delegation(row))?;
+        let rows = stmt.query_map(rusqlite::params![pubkey], row_to_delegation)?;
         let mut result = Vec::new();
         for row in rows {
             result.push(row.map_err(|e| TrustChainError::Storage(e.to_string()))?);
@@ -332,20 +379,33 @@ impl DelegationStore for SqliteDelegationStore {
         Ok(result)
     }
 
-    fn revoke_delegation(&mut self, delegation_id: &str, revocation_block_hash: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
+    fn revoke_delegation(
+        &mut self,
+        delegation_id: &str,
+        revocation_block_hash: &str,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         let updated = conn.execute(
             "UPDATE delegations SET revoked = 1, revocation_block_hash = ?2 WHERE delegation_id = ?1",
             rusqlite::params![delegation_id, revocation_block_hash],
         )?;
         if updated == 0 {
-            return Err(TrustChainError::delegation("", format!("Unknown delegation: {delegation_id}")));
+            return Err(TrustChainError::delegation(
+                "",
+                format!("Unknown delegation: {delegation_id}"),
+            ));
         }
         Ok(())
     }
 
     fn is_revoked(&self, delegation_id: &str) -> Result<bool> {
-        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         let revoked: bool = conn
             .query_row(
                 "SELECT revoked FROM delegations WHERE delegation_id = ?1",
@@ -362,17 +422,27 @@ impl DelegationStore for SqliteDelegationStore {
     }
 
     fn add_succession(&mut self, record: SuccessionRecord) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         conn.execute(
             "INSERT OR REPLACE INTO successions (old_pubkey, new_pubkey, succession_block_hash)
              VALUES (?1, ?2, ?3)",
-            rusqlite::params![record.old_pubkey, record.new_pubkey, record.succession_block_hash],
+            rusqlite::params![
+                record.old_pubkey,
+                record.new_pubkey,
+                record.succession_block_hash
+            ],
         )?;
         Ok(())
     }
 
     fn resolve_identity(&self, pubkey: &str) -> Result<String> {
-        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
         let mut current = pubkey.to_string();
         let mut seen = std::collections::HashSet::new();
         loop {
@@ -395,26 +465,36 @@ impl DelegationStore for SqliteDelegationStore {
     }
 
     fn is_delegate(&self, pubkey: &str) -> Result<bool> {
-        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("lock poisoned".to_string()))?;
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM delegations WHERE delegate_pubkey = ?1",
-            rusqlite::params![pubkey],
-            |row| row.get(0),
-        ).unwrap_or(0);
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| TrustChainError::Storage("lock poisoned".to_string()))?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM delegations WHERE delegate_pubkey = ?1",
+                rusqlite::params![pubkey],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
         Ok(count > 0)
     }
 
     fn delegation_count(&self) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM delegations", [], |row| row.get(0))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| TrustChainError::Storage("delegation store lock poisoned".to_string()))?;
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM delegations", [], |row| row.get(0))?;
         Ok(count as usize)
     }
 }
 
 fn row_to_delegation(row: &rusqlite::Row<'_>) -> rusqlite::Result<DelegationRecord> {
     let scope_json: String = row.get(3)?;
-    let scope: Vec<String> =
-        serde_json::from_str(&scope_json).unwrap_or_default();
+    let scope: Vec<String> = serde_json::from_str(&scope_json).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let revoked_int: i32 = row.get(10)?;
     Ok(DelegationRecord {
         delegation_id: row.get(0)?,
@@ -541,5 +621,157 @@ mod tests {
 
         assert_eq!(store.resolve_identity("key1").unwrap(), "key2");
         assert_eq!(store.resolve_identity("key2").unwrap(), "key2");
+    }
+
+    #[test]
+    fn test_is_active_at_exact_issued_at() {
+        let record = DelegationRecord {
+            delegation_id: "test".to_string(),
+            delegator_pubkey: "aa".repeat(32),
+            delegate_pubkey: "bb".repeat(32),
+            scope: vec![],
+            max_depth: 1,
+            issued_at: 5000,
+            expires_at: 10000,
+            delegation_block_hash: "cc".repeat(32),
+            agreement_block_hash: None,
+            parent_delegation_id: None,
+            revoked: false,
+            revocation_block_hash: None,
+        };
+        // Exactly at issued_at should be active (inclusive start).
+        assert!(record.is_active(5000));
+    }
+
+    #[test]
+    fn test_is_active_at_exact_expires_at() {
+        let record = DelegationRecord {
+            delegation_id: "test".to_string(),
+            delegator_pubkey: "aa".repeat(32),
+            delegate_pubkey: "bb".repeat(32),
+            scope: vec![],
+            max_depth: 1,
+            issued_at: 5000,
+            expires_at: 10000,
+            delegation_block_hash: "cc".repeat(32),
+            agreement_block_hash: None,
+            parent_delegation_id: None,
+            revoked: false,
+            revocation_block_hash: None,
+        };
+        // Exactly at expires_at should NOT be active (exclusive end).
+        assert!(!record.is_active(10000));
+    }
+
+    #[test]
+    fn test_is_active_revoked_overrides_time() {
+        let record = DelegationRecord {
+            delegation_id: "test".to_string(),
+            delegator_pubkey: "aa".repeat(32),
+            delegate_pubkey: "bb".repeat(32),
+            scope: vec![],
+            max_depth: 1,
+            issued_at: 5000,
+            expires_at: 10000,
+            delegation_block_hash: "cc".repeat(32),
+            agreement_block_hash: None,
+            parent_delegation_id: None,
+            revoked: true,
+            revocation_block_hash: Some("dd".repeat(32)),
+        };
+        // Revoked overrides valid time window.
+        assert!(!record.is_active(7000));
+    }
+
+    #[test]
+    fn test_is_active_invalid_ttl() {
+        let record = DelegationRecord {
+            delegation_id: "test".to_string(),
+            delegator_pubkey: "aa".repeat(32),
+            delegate_pubkey: "bb".repeat(32),
+            scope: vec![],
+            max_depth: 1,
+            issued_at: 10000,
+            expires_at: 5000, // expires before issued
+            delegation_block_hash: "cc".repeat(32),
+            agreement_block_hash: None,
+            parent_delegation_id: None,
+            revoked: false,
+            revocation_block_hash: None,
+        };
+        // Invalid TTL (issued > expires) should never be active.
+        assert!(!record.is_active(7000));
+        assert!(!record.is_active(3000));
+        assert!(!record.is_active(12000));
+    }
+
+    #[test]
+    fn test_succession_cycle_detection() {
+        // A→B→A cycle: resolve_identity should terminate (not loop forever).
+        let mut store = MemoryDelegationStore::new();
+        store
+            .add_succession(SuccessionRecord {
+                old_pubkey: "aa".repeat(32),
+                new_pubkey: "bb".repeat(32),
+                succession_block_hash: "cc".repeat(32),
+            })
+            .unwrap();
+        store
+            .add_succession(SuccessionRecord {
+                old_pubkey: "bb".repeat(32),
+                new_pubkey: "aa".repeat(32),
+                succession_block_hash: "dd".repeat(32),
+            })
+            .unwrap();
+
+        // Should terminate, returning one of the two pubkeys (not infinite loop).
+        let resolved = store.resolve_identity(&"aa".repeat(32)).unwrap();
+        // The function follows the chain: aa→bb→aa → detects cycle or hits max hops.
+        // Either way, it should return without hanging.
+        assert!(!resolved.is_empty());
+    }
+
+    #[test]
+    fn test_multiple_delegations_same_delegate() {
+        // Two delegations from different delegators to the same delegate.
+        let mut store = MemoryDelegationStore::new();
+        let delegate_pk = "bb".repeat(32);
+
+        let r1 = DelegationRecord {
+            delegation_id: "deleg1".to_string(),
+            delegator_pubkey: "aa".repeat(32),
+            delegate_pubkey: delegate_pk.clone(),
+            scope: vec!["compute".to_string()],
+            max_depth: 1,
+            issued_at: 1000,
+            expires_at: 100000,
+            delegation_block_hash: "cc".repeat(32),
+            agreement_block_hash: None,
+            parent_delegation_id: None,
+            revoked: false,
+            revocation_block_hash: None,
+        };
+        let r2 = DelegationRecord {
+            delegation_id: "deleg2".to_string(),
+            delegator_pubkey: "dd".repeat(32),
+            delegate_pubkey: delegate_pk.clone(),
+            scope: vec!["storage".to_string()],
+            max_depth: 1,
+            issued_at: 2000,
+            expires_at: 200000,
+            delegation_block_hash: "ee".repeat(32),
+            agreement_block_hash: None,
+            parent_delegation_id: None,
+            revoked: false,
+            revocation_block_hash: None,
+        };
+
+        store.add_delegation(r1).unwrap();
+        store.add_delegation(r2).unwrap();
+
+        // get_delegation_by_delegate returns one record (latest or first), should not panic.
+        let result = store.get_delegation_by_delegate(&delegate_pk).unwrap();
+        assert!(result.is_some());
+        assert_eq!(store.delegation_count().unwrap(), 2);
     }
 }
