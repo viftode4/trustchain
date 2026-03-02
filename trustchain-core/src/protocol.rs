@@ -428,7 +428,15 @@ impl<S: BlockStore> TrustChainProtocol<S> {
                         ),
                     ));
                 }
-                if !my_delegation.scope.is_empty() && !scope.is_empty() {
+                if !my_delegation.scope.is_empty() {
+                    if scope.is_empty() {
+                        // Empty scope = unrestricted, which is a superset of
+                        // the parent's restricted scope — this is escalation.
+                        return Err(TrustChainError::delegation(
+                            self.pubkey(),
+                            "Sub-delegation scope must not be unrestricted when parent scope is restricted",
+                        ));
+                    }
                     let parent_scope: std::collections::HashSet<&str> =
                         my_delegation.scope.iter().map(|s| s.as_str()).collect();
                     if !scope.iter().all(|s| parent_scope.contains(s.as_str())) {
@@ -1411,6 +1419,42 @@ mod tests {
                 .to_string()
                 .contains("scope must be subset"),
             "sub-delegation with out-of-scope should fail"
+        );
+    }
+
+    #[test]
+    fn test_sub_delegation_empty_scope_escalation_rejected() {
+        let (mut alice, mut bob) = make_protocol();
+        let charlie_id = Identity::from_bytes(&[3u8; 32]);
+        let mut ds = MemoryDelegationStore::new();
+
+        // Alice delegates with restricted scope ["compute"] to Bob.
+        let proposal = alice
+            .create_delegation_proposal::<MemoryDelegationStore>(
+                &bob.pubkey(),
+                vec!["compute".to_string()],
+                2,
+                3_600_000,
+                None,
+            )
+            .unwrap();
+        bob.accept_delegation(&proposal, &mut ds).unwrap();
+
+        // Bob tries to sub-delegate with empty scope (unrestricted) — escalation.
+        let result = bob.create_delegation_proposal(
+            &charlie_id.pubkey_hex(),
+            vec![],
+            1,
+            1_800_000,
+            Some(&ds),
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unrestricted"),
+            "empty scope under restricted parent should be rejected as escalation"
         );
     }
 }
