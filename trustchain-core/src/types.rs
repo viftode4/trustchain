@@ -12,6 +12,12 @@ pub const GENESIS_SEQ: u64 = 1;
 /// Unknown/unlinked sequence number (used in proposals before the responder replies).
 pub const UNKNOWN_SEQ: u64 = 0;
 
+/// Maximum allowed TTL for a delegation proposal: 30 days in milliseconds.
+///
+/// Enforced at the core protocol level in `create_delegation_proposal()` so that
+/// direct library callers cannot bypass the cap (not just the HTTP API layer).
+pub const MAX_DELEGATION_TTL_MS: u64 = 30 * 24 * 3600 * 1000;
+
 // ---------------------------------------------------------------------------
 // ValidationResult — tiered validation matching py-ipv8
 // ---------------------------------------------------------------------------

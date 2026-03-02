@@ -43,4 +43,6 @@ pub use identity::Identity;
 pub use netflow::{CachedNetFlow, NetFlowTrust};
 pub use protocol::TrustChainProtocol;
 pub use trust::{DelegationContext, TrustEngine, TrustWeights};
-pub use types::{BlockType, ValidationResult, GENESIS_HASH, GENESIS_SEQ, UNKNOWN_SEQ};
+pub use types::{
+    BlockType, ValidationResult, GENESIS_HASH, GENESIS_SEQ, MAX_DELEGATION_TTL_MS, UNKNOWN_SEQ,
+};

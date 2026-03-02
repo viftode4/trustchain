@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 
 use trustchain_core::{
     BlockStore, Checkpoint, DelegationStore, HalfBlock, TrustChainProtocol, TrustEngine,
+    MAX_DELEGATION_TTL_MS,
 };
 
 use tower_http::limit::RequestBodyLimitLayer;
@@ -217,8 +218,9 @@ fn default_ttl_seconds() -> u64 {
     3600
 }
 
-/// Maximum allowed TTL for a delegation: 30 days.
-const MAX_DELEGATION_TTL_SECS: u64 = 30 * 24 * 3600;
+/// Maximum allowed TTL for a delegation in seconds, derived from the core constant.
+/// Kept here as defense-in-depth: rejects oversized requests before they reach the protocol.
+const MAX_DELEGATION_TTL_SECS: u64 = MAX_DELEGATION_TTL_MS / 1000;
 
 /// Request for revocation endpoint.
 #[derive(Deserialize)]

@@ -10,7 +10,7 @@ use crate::delegation::{DelegationRecord, DelegationStore, SuccessionRecord};
 use crate::error::{Result, TrustChainError};
 use crate::halfblock::{create_half_block, validate_and_record, verify_block, HalfBlock};
 use crate::identity::Identity;
-use crate::types::{BlockType, ValidationResult, GENESIS_HASH};
+use crate::types::{BlockType, ValidationResult, GENESIS_HASH, MAX_DELEGATION_TTL_MS};
 
 /// The TrustChain protocol engine. Manages proposal/agreement lifecycle for one agent.
 pub struct TrustChainProtocol<S: BlockStore> {
@@ -402,6 +402,16 @@ impl<S: BlockStore> TrustChainProtocol<S> {
             return Err(TrustChainError::delegation(
                 self.pubkey(),
                 "max_depth cannot exceed 2",
+            ));
+        }
+
+        if ttl_ms > MAX_DELEGATION_TTL_MS {
+            return Err(TrustChainError::delegation(
+                self.pubkey(),
+                format!(
+                    "ttl_ms {} exceeds maximum of {} ms (30 days)",
+                    ttl_ms, MAX_DELEGATION_TTL_MS
+                ),
             ));
         }
 
@@ -1077,6 +1087,37 @@ mod tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_delegation_ttl_cap() {
+        let (mut alice, _bob) = make_protocol();
+        let bob_key = Identity::from_bytes(&[2u8; 32]).pubkey_hex();
+
+        // Exactly at the limit should succeed.
+        let ok = alice.create_delegation_proposal::<MemoryDelegationStore>(
+            &bob_key,
+            vec![],
+            0,
+            MAX_DELEGATION_TTL_MS,
+            None,
+        );
+        assert!(ok.is_ok(), "TTL at limit should be accepted");
+
+        // One millisecond over the limit must be rejected.
+        let err = alice.create_delegation_proposal::<MemoryDelegationStore>(
+            &bob_key,
+            vec![],
+            0,
+            MAX_DELEGATION_TTL_MS + 1,
+            None,
+        );
+        assert!(err.is_err(), "TTL exceeding 30 days must be rejected");
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("ttl_ms") && msg.contains("exceeds maximum"),
+            "Error message should mention ttl_ms and exceeds maximum, got: {msg}"
+        );
     }
 
     #[test]
