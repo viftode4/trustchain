@@ -203,8 +203,62 @@ async fn proxy_handler<S: BlockStore + 'static, D: DelegationStore + 'static>(
         }
     }
 
-    // 4. Forward the original call and return the response.
-    forward_request(state.client, req, &target_url).await
+    // 4. Compute trust info for response headers (best-effort).
+    let trust_headers = if let Some(ref peer) = peer {
+        compute_trust_headers(&state, peer).await
+    } else {
+        None
+    };
+
+    // 5. Forward the original call and return the response with trust headers.
+    let mut response = forward_request(state.client, req, &target_url).await;
+
+    if let Some(headers) = trust_headers {
+        let resp_headers = response.headers_mut();
+        for (name, value) in headers {
+            if let (Ok(n), Ok(v)) = (
+                axum::http::HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(&value),
+            ) {
+                resp_headers.insert(n, v);
+            }
+        }
+    }
+
+    response
+}
+
+/// Compute X-TrustChain-* headers for a peer (best-effort).
+async fn compute_trust_headers<S: BlockStore + 'static, D: DelegationStore + 'static>(
+    state: &ProxyState<S, D>,
+    peer: &PeerRecord,
+) -> Option<Vec<(String, String)>> {
+    let mut headers = Vec::new();
+
+    // Always include the peer's pubkey
+    headers.push(("X-TrustChain-Pubkey".to_string(), peer.pubkey.clone()));
+
+    // Try to get trust info from the chain
+    let proto = state.protocol.lock().await;
+    if let Ok(chain) = proto.store().get_chain(&peer.pubkey) {
+        headers.push((
+            "X-TrustChain-Interactions".to_string(),
+            chain.len().to_string(),
+        ));
+
+        // Compute trust score using completion rate
+        let total = chain.len();
+        let agreements = chain
+            .iter()
+            .filter(|b| b.block_type == "Agreement")
+            .count();
+        if total > 0 {
+            let score = agreements as f64 / total as f64;
+            headers.push(("X-TrustChain-Score".to_string(), format!("{score:.3}")));
+        }
+    }
+
+    Some(headers)
 }
 
 // ---------------------------------------------------------------------------

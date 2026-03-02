@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TrustChain Dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,-apple-system,sans-serif;background:#0a0e17;color:#e0e6ed;padding:24px;max-width:960px;margin:0 auto}
+h1{font-size:1.5rem;margin-bottom:4px;color:#7dd3fc}
+.subtitle{color:#64748b;font-size:.85rem;margin-bottom:24px}
+.card{background:#151b2b;border:1px solid #1e293b;border-radius:8px;padding:16px;margin-bottom:16px}
+.card h2{font-size:1rem;color:#94a3b8;margin-bottom:12px;text-transform:uppercase;letter-spacing:.05em;font-size:.75rem}
+.identity{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+.identity .pubkey{font-family:monospace;font-size:.85rem;color:#7dd3fc;word-break:break-all}
+.stat{display:inline-flex;flex-direction:column;align-items:center;padding:8px 16px}
+.stat .value{font-size:1.5rem;font-weight:700;color:#7dd3fc}
+.stat .label{font-size:.7rem;color:#64748b;text-transform:uppercase}
+.stats{display:flex;gap:8px;flex-wrap:wrap}
+table{width:100%;border-collapse:collapse;font-size:.85rem}
+th{text-align:left;padding:8px 12px;color:#64748b;border-bottom:1px solid #1e293b;font-weight:500;font-size:.75rem;text-transform:uppercase}
+td{padding:8px 12px;border-bottom:1px solid #1e293b}
+td.pubkey{font-family:monospace;color:#7dd3fc;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.trust-bar{display:inline-block;height:6px;border-radius:3px;background:#1e293b;width:80px;position:relative;vertical-align:middle}
+.trust-bar .fill{height:100%;border-radius:3px;position:absolute;left:0;top:0}
+.trust-high{background:#22c55e}
+.trust-med{background:#eab308}
+.trust-low{background:#ef4444}
+.trust-none{background:#334155}
+.status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.online{background:#22c55e}
+.offline{background:#ef4444}
+.empty{color:#475569;text-align:center;padding:24px}
+#error{color:#f87171;font-size:.85rem;padding:8px;display:none}
+</style>
+</head>
+<body>
+<h1>TrustChain Dashboard</h1>
+<div class="subtitle">Decentralized trust — live view</div>
+<div id="error"></div>
+
+<div class="card">
+  <h2>Identity</h2>
+  <div class="identity">
+    <div>
+      <div style="color:#64748b;font-size:.7rem;margin-bottom:2px">PUBLIC KEY</div>
+      <div class="pubkey" id="pubkey">loading...</div>
+    </div>
+    <div class="stats" id="stats"></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Peers</h2>
+  <table>
+    <thead><tr><th>Peer</th><th>Address</th><th>Trust</th><th>Interactions</th></tr></thead>
+    <tbody id="peers"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody>
+  </table>
+</div>
+
+<script>
+const BASE = location.origin;
+let pollTimer;
+
+async function fetchJSON(path) {
+  const r = await fetch(BASE + path);
+  if (!r.ok) throw new Error(`${path}: ${r.status}`);
+  return r.json();
+}
+
+function trustColor(score) {
+  if (score >= 0.7) return 'trust-high';
+  if (score >= 0.3) return 'trust-med';
+  if (score > 0)    return 'trust-low';
+  return 'trust-none';
+}
+
+function shortKey(k) {
+  return k ? k.slice(0, 8) + '...' + k.slice(-4) : '?';
+}
+
+async function refresh() {
+  try {
+    const status = await fetchJSON('/status');
+    document.getElementById('pubkey').textContent = status.public_key || 'unknown';
+    document.getElementById('stats').innerHTML = `
+      <div class="stat"><span class="value">${status.block_count ?? 0}</span><span class="label">Blocks</span></div>
+      <div class="stat"><span class="value">${status.peer_count ?? 0}</span><span class="label">Peers</span></div>
+      <div class="stat"><span class="value">${status.name || '-'}</span><span class="label">Name</span></div>
+    `;
+
+    const peers = await fetchJSON('/peers');
+    const tbody = document.getElementById('peers');
+
+    if (!peers.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">No peers discovered yet</td></tr>';
+    } else {
+      const rows = [];
+      for (const p of peers) {
+        let score = 0;
+        try {
+          const t = await fetchJSON('/trust/' + p.pubkey);
+          score = typeof t === 'number' ? t : (t.trust_score ?? t.score ?? 0);
+        } catch {}
+        const cls = trustColor(score);
+        rows.push(`<tr>
+          <td class="pubkey" title="${p.pubkey}">${shortKey(p.pubkey)}</td>
+          <td>${p.address || '-'}</td>
+          <td>
+            <span class="trust-bar"><span class="fill ${cls}" style="width:${Math.round(score*100)}%"></span></span>
+            ${score.toFixed(3)}
+          </td>
+          <td>${p.latest_seq ?? '-'}</td>
+        </tr>`);
+      }
+      tbody.innerHTML = rows.join('');
+    }
+
+    document.getElementById('error').style.display = 'none';
+  } catch (e) {
+    const el = document.getElementById('error');
+    el.textContent = 'Connection error: ' + e.message;
+    el.style.display = 'block';
+  }
+}
+
+refresh();
+pollTimer = setInterval(refresh, 5000);
+</script>
+</body>
+</html>

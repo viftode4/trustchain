@@ -315,6 +315,7 @@ pub fn build_router<S: BlockStore + Send + 'static, D: DelegationStore + Send + 
         .route("/delegation/{id}", get(handle_get_delegation::<S, D>))
         .route("/identity/{pubkey}", get(handle_identity::<S, D>))
         .route("/accept_succession", post(handle_accept_succession::<S, D>))
+        .route("/dashboard", get(handle_dashboard))
         .layer(RequestBodyLimitLayer::new(1024 * 1024)) // 1 MiB max request body
         .with_state(state)
 }
@@ -945,6 +946,20 @@ async fn handle_healthz<S: BlockStore + 'static, D: DelegationStore + Send + 'st
         status: "ok".to_string(),
         public_key: pubkey,
     }))
+}
+
+/// Serve the embedded dashboard HTML.
+async fn handle_dashboard() -> (
+    StatusCode,
+    [(axum::http::HeaderName, &'static str); 1],
+    &'static str,
+) {
+    static DASHBOARD_HTML: &str = include_str!("dashboard.html");
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        DASHBOARD_HTML,
+    )
 }
 
 async fn handle_metrics<S: BlockStore + 'static, D: DelegationStore + Send + 'static>(
