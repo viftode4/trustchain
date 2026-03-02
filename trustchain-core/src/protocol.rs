@@ -1491,10 +1491,7 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("unrestricted"),
+            result.unwrap_err().to_string().contains("unrestricted"),
             "empty scope under restricted parent should be rejected as escalation"
         );
     }

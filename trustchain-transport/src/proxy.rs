@@ -248,10 +248,7 @@ async fn compute_trust_headers<S: BlockStore + 'static, D: DelegationStore + 'st
 
         // Compute trust score using completion rate
         let total = chain.len();
-        let agreements = chain
-            .iter()
-            .filter(|b| b.block_type == "Agreement")
-            .count();
+        let agreements = chain.iter().filter(|b| b.block_type == "Agreement").count();
         if total > 0 {
             let score = agreements as f64 / total as f64;
             headers.push(("X-TrustChain-Score".to_string(), format!("{score:.3}")));
