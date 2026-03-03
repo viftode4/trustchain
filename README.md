@@ -61,11 +61,11 @@ trustchain-node launch --name my-agent -- python my_agent.py
 - **NetFlow Sybil resistance** — max-flow from seed nodes; fake identities can't manufacture trust
 - **QUIC P2P transport** — TLS 1.3 mutual auth, STUN NAT traversal
 - **Live dashboard** — embedded HTML dashboard at `GET /dashboard`
-- **Trust headers** — `X-TrustChain-Score`, `X-TrustChain-Pubkey` injected into proxied responses
+- **Trust headers** — `X-TrustChain-Score`, `X-TrustChain-Pubkey`, `X-TrustChain-Interactions` injected into proxied responses
 - **SQLite storage** — WAL mode, survives restarts
 - **Delegation protocol** — identity succession and capability delegation with revocation
 - **MCP server** — expose trust tools to Claude Desktop, Cursor, VS Code Copilot
-- **296 tests** across the workspace
+- **280 tests** across the workspace
 
 ## Architecture
 
@@ -74,6 +74,7 @@ graph TD
     Agent["Agent Process\n(any framework)"]
     Proxy["Transparent Proxy\n:8203"]
     HTTP["HTTP REST API\n:8202"]
+    GRPC["gRPC API\n:8201"]
     QUIC["QUIC P2P\n:8200"]
     Dashboard["Dashboard\n/dashboard"]
     MCP["MCP Server\n/mcp or stdio"]
@@ -83,6 +84,7 @@ graph TD
     Agent -->|HTTP_PROXY=:8203| Proxy
     Proxy --> Core
     HTTP --> Core
+    GRPC --> Core
     Dashboard --> HTTP
     MCP --> Core
     Core --> Store
@@ -94,7 +96,7 @@ graph TD
 | Crate | Description |
 |-------|-------------|
 | [`trustchain-core`](trustchain-core/) | Identity, half-blocks, block storage, trust engine, NetFlow, CHECO consensus, delegation |
-| [`trustchain-transport`](trustchain-transport/) | QUIC P2P, HTTP REST, transparent proxy, dashboard, peer discovery, MCP server |
+| [`trustchain-transport`](trustchain-transport/) | QUIC P2P, gRPC, HTTP REST, transparent proxy, dashboard, peer discovery, MCP server |
 | [`trustchain-node`](trustchain-node/) | CLI binary — sidecar, launch wrapper, keygen, MCP stdio |
 | [`trustchain-wasm`](trustchain-wasm/) | WASM bindings for browser/edge (experimental) |
 
@@ -103,6 +105,7 @@ graph TD
 | Port | Protocol | Purpose |
 |------|----------|---------|
 | 8200 | QUIC/UDP | P2P transport |
+| 8201 | gRPC/TCP | Protobuf API |
 | 8202 | HTTP/TCP | REST API + dashboard + MCP |
 | 8203 | HTTP/TCP | Transparent proxy |
 
@@ -122,14 +125,20 @@ All ports shift with `--port-base`.
 | `GET` | `/discover` | Discover peers by capability |
 | `POST` | `/delegate` | Create delegation |
 | `POST` | `/revoke` | Revoke delegation |
+| `GET` | `/chain/{pubkey}` | Full chain for a peer |
+| `GET` | `/block/{pubkey}/{seq}` | Single block by sequence |
+| `GET` | `/crawl/{pubkey}` | Crawl peer's chain |
+| `GET` | `/delegations/{pubkey}` | List delegations |
+| `GET` | `/identity/{pubkey}` | Resolve identity |
+| `POST` | `/accept_delegation` | Accept inbound delegation |
+| `POST` | `/accept_succession` | Accept identity succession |
 
 ## Trust Scoring
 
 | Component | Weight | What it measures |
 |-----------|--------|-----------------|
-| **Chain Integrity** | 30% | Hash links, sequence continuity, Ed25519 signatures |
-| **NetFlow** | 40% | Max-flow from seed nodes — Sybil resistance |
-| **Statistical** | 30% | Volume, completion rate, diversity, age |
+| **Chain Integrity** | 50% | Hash links, sequence continuity, Ed25519 signatures |
+| **NetFlow** | 50% | Max-flow from seed nodes — Sybil resistance |
 
 Proven fraud → permanent hard-zero trust score.
 
@@ -156,7 +165,7 @@ Alice's chain:              Bob's chain:
 git clone https://github.com/viftode4/trustchain.git
 cd trustchain
 cargo build --release
-cargo test --workspace   # 296 tests
+cargo test --workspace   # 280 tests
 ```
 
 ## Research
