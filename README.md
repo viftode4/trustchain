@@ -65,7 +65,7 @@ trustchain-node launch --name my-agent -- python my_agent.py
 - **SQLite storage** — WAL mode, survives restarts
 - **Delegation protocol** — identity succession and capability delegation with revocation
 - **MCP server** — expose trust tools to Claude Desktop, Cursor, VS Code Copilot
-- **280 tests** across the workspace
+- **296 tests** across the workspace
 
 ## Architecture
 
@@ -165,12 +165,16 @@ Alice's chain:              Bob's chain:
 git clone https://github.com/viftode4/trustchain.git
 cd trustchain
 cargo build --release
-cargo test --workspace   # 280 tests
+cargo test --workspace   # 296 tests
 ```
 
 ## Research
 
 **Core paper**: Otte, de Vos, Pouwelse — [TrustChain: A Sybil-resistant scalable blockchain](https://doi.org/10.1016/j.future.2017.08.048) (Future Generation Computer Systems, 2020)
+
+**IETF drafts**:
+- [draft-pouwelse-trustchain-01](https://datatracker.ietf.org/doc/draft-pouwelse-trustchain/) — base bilateral ledger protocol (Pouwelse, TU Delft, 2018)
+- draft-viftode-trustchain-trust-00 — trust computation, NetFlow Sybil resistance, delegation, succession (filed March 2026)
 
 ## Related Projects
 
