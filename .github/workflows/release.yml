@@ -29,6 +29,10 @@ jobs:
             os: ubuntu-latest
             artifact: trustchain-node-linux-x64
             archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: trustchain-node-linux-arm64
+            archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-latest
             artifact: trustchain-node-macos-x64
@@ -52,8 +56,12 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install protobuf compiler
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.target == 'x86_64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install protobuf compiler + cross toolchain (Linux arm64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler gcc-aarch64-linux-gnu
 
       - name: Install protobuf compiler (macOS)
         if: runner.os == 'macOS'
@@ -99,6 +107,7 @@ jobs:
         with:
           files: |
             trustchain-node-linux-x64.tar.gz
+            trustchain-node-linux-arm64.tar.gz
             trustchain-node-macos-x64.tar.gz
             trustchain-node-macos-arm64.tar.gz
             trustchain-node-windows-x64.zip
