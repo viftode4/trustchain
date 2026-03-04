@@ -185,7 +185,7 @@ A public seed node is running at `http://5.161.255.238:8202` (pubkey: `2ab9b393.
 ## Related Projects
 
 - [trustchain-py](https://github.com/viftode4/trustchain-py) — Python SDK: `pip install trustchain-py`, `@with_trust` decorator
-- [trustchain-js](https://github.com/viftode4/trustchain-js) — TypeScript SDK
+- [trustchain-js](https://github.com/viftode4/trustchain-js) — TypeScript SDK: `npm install @trustchain/sdk`
 - [trustchain-agent-os](https://github.com/viftode4/trustchain-agent-os) — Agent framework adapters (12 frameworks)
 
 ## License
