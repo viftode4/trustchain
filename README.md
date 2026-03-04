@@ -176,6 +176,12 @@ cargo test --workspace   # 296 tests
 - [draft-pouwelse-trustchain-01](https://datatracker.ietf.org/doc/draft-pouwelse-trustchain/) — base bilateral ledger protocol (Pouwelse, TU Delft, 2018)
 - draft-viftode-trustchain-trust-00 — trust computation, NetFlow Sybil resistance, delegation, succession (filed March 2026)
 
+## Public Seed Node
+
+A public seed node is running at `http://5.161.255.238:8202` (pubkey: `2ab9b393...`). It is the default bootstrap peer in all SDKs — new agents connect automatically without any configuration.
+
+> Early-access: running on modest hardware, not production-scale yet. Will be replaced with a domain and additional nodes as the network grows.
+
 ## Related Projects
 
 - [trustchain-py](https://github.com/viftode4/trustchain-py) — Python SDK: `pip install trustchain-py`, `@with_trust` decorator

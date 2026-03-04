@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "auggie": {
+      "type": "stdio",
+      "command": "auggie",
+      "args": ["--mcp", "--workspace-root", "G:\\Projects\\blockchains\\trustchain"]
+    }
+  }
+}

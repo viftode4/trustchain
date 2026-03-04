@@ -180,10 +180,12 @@ fn default_log_level() -> String {
 
 /// Built-in seed nodes for initial network bootstrap.
 /// Used when `bootstrap_nodes` config is empty.
+///
+/// NOTE: This is an early-access seed node running on modest hardware.
+/// It is not production-scale. Expect it to be replaced with a domain
+/// and additional nodes as the network grows.
 pub fn default_seed_nodes() -> Vec<String> {
     vec![
-        // Placeholder — replace with real seed nodes when deployed.
-        // "http://seed1.trustchain.network:8202".to_string(),
-        // "http://seed2.trustchain.network:8202".to_string(),
+        "http://5.161.255.238:8202".to_string(),
     ]
 }
