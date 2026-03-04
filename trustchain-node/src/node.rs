@@ -228,6 +228,7 @@ impl Node {
             delegation_store: self.delegation_store.clone(),
             latest_checkpoint: self.latest_checkpoint.clone(),
             seed_nodes: self.config.effective_bootstrap_nodes(),
+            agent_name: self.config.agent_name.clone(),
         };
 
         #[cfg(feature = "mcp")]

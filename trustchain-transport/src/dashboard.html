@@ -87,6 +87,7 @@ async function refresh() {
       <div class="stat"><span class="value">${status.block_count ?? 0}</span><span class="label">Blocks</span></div>
       <div class="stat"><span class="value">${status.peer_count ?? 0}</span><span class="label">Peers</span></div>
       <div class="stat"><span class="value">${status.name || '-'}</span><span class="label">Name</span></div>
+      <div class="stat"><span class="value">${status.version || '-'}</span><span class="label">Version</span></div>
     `;
 
     const peers = await fetchJSON('/peers');

@@ -43,6 +43,8 @@ pub struct AppState<
     /// An empty Vec disables NetFlow, which reduces Sybil resistance; production
     /// deployments MUST populate this from the node configuration.
     pub seed_nodes: Vec<String>,
+    /// Agent name (set by sidecar mode via --name).
+    pub agent_name: Option<String>,
 }
 
 // Manual Clone impl — Arc handles the cloning, S/D don't need Clone.
@@ -56,6 +58,7 @@ impl<S: BlockStore + 'static, D: DelegationStore + 'static> Clone for AppState<S
             delegation_store: self.delegation_store.clone(),
             latest_checkpoint: self.latest_checkpoint.clone(),
             seed_nodes: self.seed_nodes.clone(),
+            agent_name: self.agent_name.clone(),
         }
     }
 }
@@ -69,6 +72,9 @@ pub struct StatusResponse {
     pub peer_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub version: &'static str,
 }
 
 /// Request for proposal endpoint.
@@ -358,6 +364,8 @@ async fn handle_status<S: BlockStore + 'static, D: DelegationStore + Send + 'sta
         block_count,
         peer_count,
         agent_endpoint: state.agent_endpoint.clone(),
+        name: state.agent_name.clone(),
+        version: env!("CARGO_PKG_VERSION"),
     }))
 }
 
@@ -1238,6 +1246,7 @@ mod tests {
             delegation_store: Arc::new(Mutex::new(MemoryDelegationStore::new())),
             latest_checkpoint: Arc::new(Mutex::new(None)),
             seed_nodes: vec![],
+            agent_name: None,
         }
     }
 
@@ -1342,6 +1351,7 @@ mod tests {
             delegation_store: Arc::new(Mutex::new(MemoryDelegationStore::new())),
             latest_checkpoint: Arc::new(Mutex::new(None)),
             seed_nodes: vec![],
+            agent_name: None,
         };
         let app = build_router(state);
 
