@@ -389,9 +389,15 @@ fn stress_sybil_one_seed_connection_bounded() {
     let engine = NetFlowTrust::new(&store, vec![seed.pubkey_hex()]).unwrap();
 
     let honest_score = engine.compute_path_diversity(&honest.pubkey_hex()).unwrap();
-    let sybil0_score = engine.compute_path_diversity(&sybils[0].pubkey_hex()).unwrap();
-    let sybil5_score = engine.compute_path_diversity(&sybils[5].pubkey_hex()).unwrap();
-    let sybil10_score = engine.compute_path_diversity(&sybils[10].pubkey_hex()).unwrap();
+    let sybil0_score = engine
+        .compute_path_diversity(&sybils[0].pubkey_hex())
+        .unwrap();
+    let sybil5_score = engine
+        .compute_path_diversity(&sybils[5].pubkey_hex())
+        .unwrap();
+    let sybil10_score = engine
+        .compute_path_diversity(&sybils[10].pubkey_hex())
+        .unwrap();
 
     println!(
         "sybil-1-seed: honest={honest_score:.4}  sybil[0]={sybil0_score:.4}  \

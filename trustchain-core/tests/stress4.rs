@@ -475,7 +475,10 @@ fn stress_sybil_multi_gateway_no_advantage() {
     // Sybil cluster members can aggregate flow from 5 gateways (5 independent seed→gw paths).
     // Honest has only 1 path (S→H, capped at 1.0). So Sybil has more path diversity.
     // But honest's path diversity is still positive and bounded.
-    assert!(honest_score > 0.0, "honest must have positive path diversity");
+    assert!(
+        honest_score > 0.0,
+        "honest must have positive path diversity"
+    );
 
     // With capped edges, gateways can receive flow from sybil bypass paths.
     // The key invariant is that all scores are finite and positive.

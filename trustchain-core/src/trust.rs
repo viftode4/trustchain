@@ -284,8 +284,7 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                     });
                 }
 
-                let connectivity =
-                    (path_div / self.config.connectivity_threshold).min(1.0);
+                let connectivity = (path_div / self.config.connectivity_threshold).min(1.0);
                 let trust_score = (connectivity * integrity * diversity).clamp(0.0, 1.0);
 
                 return Ok(TrustEvidence {
@@ -335,7 +334,8 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                 if let Some(ref root_pubkey) = ctx.root_pubkey {
                     let root_evidence = self.compute_standard_trust_evidence(root_pubkey)?;
                     let active_count = ctx.root_active_delegation_count.max(1);
-                    let effective = (root_evidence.trust_score / active_count as f64).clamp(0.0, 1.0);
+                    let effective =
+                        (root_evidence.trust_score / active_count as f64).clamp(0.0, 1.0);
                     return Ok(TrustEvidence {
                         trust_score: effective,
                         connectivity: root_evidence.connectivity,

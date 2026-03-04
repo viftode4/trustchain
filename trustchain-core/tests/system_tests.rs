@@ -82,7 +82,9 @@ impl NetworkSim {
         let master = self.master_store();
         let seed_keys: Vec<String> = seeds.iter().map(|&i| self.pubkey(i)).collect();
         match NetFlowTrust::new(&master, seed_keys) {
-            Ok(nf) => nf.compute_path_diversity(&self.pubkey(target)).unwrap_or(0.0),
+            Ok(nf) => nf
+                .compute_path_diversity(&self.pubkey(target))
+                .unwrap_or(0.0),
             Err(_) => 0.0,
         }
     }

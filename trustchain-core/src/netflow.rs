@@ -555,7 +555,10 @@ mod tests {
         let seed = Identity::from_bytes(&[1u8; 32]);
         let engine = NetFlowTrust::new(&store, vec![seed.pubkey_hex()]).unwrap();
 
-        assert_eq!(engine.compute_path_diversity(&seed.pubkey_hex()).unwrap(), f64::INFINITY);
+        assert_eq!(
+            engine.compute_path_diversity(&seed.pubkey_hex()).unwrap(),
+            f64::INFINITY
+        );
     }
 
     #[test]
@@ -641,7 +644,10 @@ mod tests {
             sybil_score < honest_score,
             "sybil ({sybil_score}) should have lower path diversity than honest ({honest_score})"
         );
-        assert_eq!(sybil_score, 0.0, "disconnected sybil should have 0 path diversity");
+        assert_eq!(
+            sybil_score, 0.0,
+            "disconnected sybil should have 0 path diversity"
+        );
     }
 
     #[test]

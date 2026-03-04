@@ -240,7 +240,10 @@ fn test_netflow_hand_calculated() {
     // A→C: 1 interaction → 0.5.
     // Raw max-flow to C: Super→S(1.0+1.0=2.0 cap)→A(1.0)→C(0.5) = 0.5.
     let path_div_c = nf.compute_path_diversity(&agent_c.pubkey_hex()).unwrap();
-    assert!((path_div_c - 0.5).abs() < 1e-10, "expected 0.5, got {path_div_c}");
+    assert!(
+        (path_div_c - 0.5).abs() < 1e-10,
+        "expected 0.5, got {path_div_c}"
+    );
 }
 
 // ---------------------------------------------------------------------------
