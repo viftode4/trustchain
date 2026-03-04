@@ -185,7 +185,5 @@ fn default_log_level() -> String {
 /// It is not production-scale. Expect it to be replaced with a domain
 /// and additional nodes as the network grows.
 pub fn default_seed_nodes() -> Vec<String> {
-    vec![
-        "http://5.161.255.238:8202".to_string(),
-    ]
+    vec!["http://5.161.255.238:8202".to_string()]
 }
