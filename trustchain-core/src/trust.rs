@@ -4,34 +4,67 @@
 //! into a single score, with configurable weights.
 //! Delegation-aware: delegated identities inherit trust from their root principal.
 
+use std::collections::HashSet;
+
 use crate::blockstore::BlockStore;
 use crate::delegation::{DelegationRecord, DelegationStore};
 use crate::error::Result;
 use crate::netflow::{CachedNetFlow, NetFlowTrust};
 use crate::types::GENESIS_HASH;
 
-/// Default weights for the two trust components.
-pub const DEFAULT_INTEGRITY_WEIGHT: f64 = 0.5;
-pub const DEFAULT_NETFLOW_WEIGHT: f64 = 0.5;
+/// Default connectivity threshold K: path_diversity / K, capped at 1.0.
+pub const DEFAULT_CONNECTIVITY_THRESHOLD: f64 = 3.0;
 
-/// Configuration weights for trust components.
+/// Default diversity threshold M: unique_peers / M, capped at 1.0.
+pub const DEFAULT_DIVERSITY_THRESHOLD: f64 = 5.0;
+
+/// Configuration for the multiplicative trust model.
 ///
-/// Only two components remain, both paper-defined:
-/// - **integrity**: chain validity (hash linkage, signatures, sequence numbers)
-/// - **netflow**: Sybil-resistant max-flow from seed nodes
+/// Trust = connectivity × integrity × diversity
+/// - **connectivity** = min(path_diversity / K, 1.0)
+/// - **integrity** = chain_integrity (fraction of valid blocks)
+/// - **diversity** = min(unique_peers / M, 1.0)
 #[derive(Debug, Clone)]
-pub struct TrustWeights {
-    pub integrity: f64,
-    pub netflow: f64,
+pub struct TrustConfig {
+    /// K: number of independent paths needed for full connectivity score.
+    pub connectivity_threshold: f64,
+    /// M: number of unique peers needed for full diversity score.
+    pub diversity_threshold: f64,
 }
 
-impl Default for TrustWeights {
+impl Default for TrustConfig {
     fn default() -> Self {
         Self {
-            integrity: DEFAULT_INTEGRITY_WEIGHT,
-            netflow: DEFAULT_NETFLOW_WEIGHT,
+            connectivity_threshold: DEFAULT_CONNECTIVITY_THRESHOLD,
+            diversity_threshold: DEFAULT_DIVERSITY_THRESHOLD,
         }
     }
+}
+
+/// Backward-compatible alias — maps to TrustConfig.
+pub type TrustWeights = TrustConfig;
+
+/// Evidence bundle returned alongside the trust score.
+///
+/// Provides interpretable factors explaining *why* a score is what it is.
+#[derive(Debug, Clone)]
+pub struct TrustEvidence {
+    /// The final trust score in [0.0, 1.0].
+    pub trust_score: f64,
+    /// connectivity = min(path_diversity / K, 1.0).
+    pub connectivity: f64,
+    /// Chain integrity (fraction of valid hash-linked blocks).
+    pub integrity: f64,
+    /// diversity = min(unique_peers / M, 1.0).
+    pub diversity: f64,
+    /// Number of distinct peers in the target's chain.
+    pub unique_peers: usize,
+    /// Total interactions (blocks) in the target's chain.
+    pub interactions: usize,
+    /// Whether the target has committed fraud.
+    pub fraud: bool,
+    /// Raw max-flow value from seed super-source to target.
+    pub path_diversity: f64,
 }
 
 /// Pre-captured delegation context for trust computation.
@@ -109,7 +142,7 @@ impl DelegationContext {
 pub struct TrustEngine<'a, S: BlockStore> {
     store: &'a S,
     seed_nodes: Option<Vec<String>>,
-    weights: TrustWeights,
+    config: TrustConfig,
     delegation_ctx: Option<DelegationContext>,
     /// Optional finalized checkpoint for verification acceleration.
     checkpoint: Option<crate::consensus::Checkpoint>,
@@ -119,13 +152,13 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
     pub fn new(
         store: &'a S,
         seed_nodes: Option<Vec<String>>,
-        weights: Option<TrustWeights>,
+        config: Option<TrustConfig>,
         delegation_ctx: Option<DelegationContext>,
     ) -> Self {
         Self {
             store,
             seed_nodes,
-            weights: weights.unwrap_or_default(),
+            config: config.unwrap_or_default(),
             delegation_ctx,
             checkpoint: None,
         }
@@ -187,35 +220,168 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
 
     /// Standard trust computation (non-delegated path).
     ///
-    /// Score = `w_integrity * integrity + w_netflow * netflow`.
-    /// When seed nodes are configured, NetFlow acts as a Sybil-resistance gate:
-    /// if there is no path from any seed to the target, the score is zero.
-    /// When no seeds are configured, only integrity is used.
+    /// Trust = connectivity × integrity × diversity (multiplicative model).
+    /// When seed nodes are configured, path_diversity (max-flow) is used for
+    /// the connectivity factor. When no seeds are configured, connectivity=1.0.
     fn compute_standard_trust(&self, pubkey: &str) -> Result<f64> {
+        let evidence = self.compute_standard_trust_evidence(pubkey)?;
+        Ok(evidence.trust_score)
+    }
+
+    /// Compute trust with full evidence bundle for the standard (non-delegated) path.
+    fn compute_standard_trust_evidence(&self, pubkey: &str) -> Result<TrustEvidence> {
         // Hard zero for proven fraud.
         let frauds = self.store.get_double_spends(pubkey)?;
         if !frauds.is_empty() {
-            return Ok(0.0);
+            let chain = self.store.get_chain(pubkey)?;
+            return Ok(TrustEvidence {
+                trust_score: 0.0,
+                connectivity: 0.0,
+                integrity: 0.0,
+                diversity: 0.0,
+                unique_peers: self.count_unique_peers(&chain),
+                interactions: chain.len(),
+                fraud: true,
+                path_diversity: 0.0,
+            });
         }
 
+        let chain = self.store.get_chain(pubkey)?;
         let integrity = self.compute_chain_integrity(pubkey)?;
+        let unique_peers = self.count_unique_peers(&chain);
+        let interactions = chain.len();
+        let diversity = (unique_peers as f64 / self.config.diversity_threshold).min(1.0);
 
         if let Some(ref seeds) = self.seed_nodes {
             if !seeds.is_empty() {
-                let netflow = self.compute_netflow_score(pubkey)?;
-
-                // Sybil gate: no path from seeds → zero trust.
-                if netflow < 1e-10 {
-                    return Ok(0.0);
+                // Seed nodes get trust = 1.0.
+                if seeds.contains(&pubkey.to_string()) {
+                    return Ok(TrustEvidence {
+                        trust_score: 1.0,
+                        connectivity: 1.0,
+                        integrity: 1.0,
+                        diversity: 1.0,
+                        unique_peers,
+                        interactions,
+                        fraud: false,
+                        path_diversity: f64::INFINITY,
+                    });
                 }
 
-                let score = self.weights.integrity * integrity + self.weights.netflow * netflow;
-                return Ok(score.clamp(0.0, 1.0));
+                let path_div = self.compute_path_diversity_score(pubkey)?;
+
+                // Sybil gate: no path from seeds → zero trust.
+                if path_div < 1e-10 {
+                    return Ok(TrustEvidence {
+                        trust_score: 0.0,
+                        connectivity: 0.0,
+                        integrity,
+                        diversity,
+                        unique_peers,
+                        interactions,
+                        fraud: false,
+                        path_diversity: path_div,
+                    });
+                }
+
+                let connectivity =
+                    (path_div / self.config.connectivity_threshold).min(1.0);
+                let trust_score = (connectivity * integrity * diversity).clamp(0.0, 1.0);
+
+                return Ok(TrustEvidence {
+                    trust_score,
+                    connectivity,
+                    integrity,
+                    diversity,
+                    unique_peers,
+                    interactions,
+                    fraud: false,
+                    path_diversity: path_div,
+                });
             }
         }
 
-        // No seeds configured — integrity only.
-        Ok(integrity)
+        // No seeds configured — no Sybil resistance, use integrity only.
+        // Connectivity and diversity default to 1.0 since there's no topology to measure.
+        Ok(TrustEvidence {
+            trust_score: integrity,
+            connectivity: 1.0,
+            integrity,
+            diversity: 1.0,
+            unique_peers,
+            interactions,
+            fraud: false,
+            path_diversity: 0.0,
+        })
+    }
+
+    /// Count unique peers (distinct link_public_keys) in a chain.
+    fn count_unique_peers(&self, chain: &[crate::halfblock::HalfBlock]) -> usize {
+        let mut peers: HashSet<&str> = HashSet::new();
+        for block in chain {
+            if block.public_key != block.link_public_key {
+                peers.insert(&block.link_public_key);
+            }
+        }
+        peers.len()
+    }
+
+    /// Compute trust with full evidence bundle (delegation-aware).
+    pub fn compute_trust_with_evidence(&self, pubkey: &str) -> Result<TrustEvidence> {
+        // Check delegation context
+        if let Some(ref ctx) = self.delegation_ctx {
+            // Is this an active delegated identity?
+            if let Some(ref _delegation) = ctx.active_delegation {
+                if let Some(ref root_pubkey) = ctx.root_pubkey {
+                    let root_evidence = self.compute_standard_trust_evidence(root_pubkey)?;
+                    let active_count = ctx.root_active_delegation_count.max(1);
+                    let effective = (root_evidence.trust_score / active_count as f64).clamp(0.0, 1.0);
+                    return Ok(TrustEvidence {
+                        trust_score: effective,
+                        connectivity: root_evidence.connectivity,
+                        integrity: root_evidence.integrity,
+                        diversity: root_evidence.diversity,
+                        unique_peers: root_evidence.unique_peers,
+                        interactions: root_evidence.interactions,
+                        fraud: false,
+                        path_diversity: root_evidence.path_diversity,
+                    });
+                }
+            }
+
+            // Was a delegate whose delegation is no longer active -> 0
+            if ctx.was_delegate && ctx.active_delegation.is_none() {
+                return Ok(TrustEvidence {
+                    trust_score: 0.0,
+                    connectivity: 0.0,
+                    integrity: 0.0,
+                    diversity: 0.0,
+                    unique_peers: 0,
+                    interactions: 0,
+                    fraud: false,
+                    path_diversity: 0.0,
+                });
+            }
+
+            // Check if any delegate committed fraud
+            for d in &ctx.delegations_as_delegator {
+                let delegate_frauds = self.store.get_double_spends(&d.delegate_pubkey)?;
+                if !delegate_frauds.is_empty() {
+                    return Ok(TrustEvidence {
+                        trust_score: 0.0,
+                        connectivity: 0.0,
+                        integrity: 0.0,
+                        diversity: 0.0,
+                        unique_peers: 0,
+                        interactions: 0,
+                        fraud: true,
+                        path_diversity: 0.0,
+                    });
+                }
+            }
+        }
+
+        self.compute_standard_trust_evidence(pubkey)
     }
 
     /// Compute chain integrity score (fraction of valid blocks from start).
@@ -267,27 +433,27 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
         Ok(1.0)
     }
 
-    /// Compute the netflow (Sybil-resistance) score.
-    pub fn compute_netflow_score(&self, pubkey: &str) -> Result<f64> {
+    /// Compute the raw path diversity (max-flow) for Sybil resistance.
+    pub fn compute_path_diversity_score(&self, pubkey: &str) -> Result<f64> {
         match &self.seed_nodes {
             Some(seeds) if !seeds.is_empty() => {
                 let nf = NetFlowTrust::new(self.store, seeds.clone())?;
-                nf.compute_trust(pubkey)
+                nf.compute_path_diversity(pubkey)
             }
             _ => Ok(0.0),
         }
     }
 
-    /// Compute the netflow score using an external `CachedNetFlow` instance.
+    /// Compute the path diversity using an external `CachedNetFlow` instance.
     ///
     /// This amortizes graph construction cost across multiple trust queries.
     /// The caller is responsible for providing a `CachedNetFlow` with a compatible store.
-    pub fn compute_netflow_score_cached<CS: BlockStore>(
+    pub fn compute_path_diversity_cached<CS: BlockStore>(
         &self,
         cached: &mut CachedNetFlow<CS>,
         pubkey: &str,
     ) -> Result<f64> {
-        cached.compute_trust(pubkey)
+        cached.compute_path_diversity(pubkey)
     }
 }
 
@@ -882,15 +1048,15 @@ mod tests {
     }
 
     #[test]
-    fn test_all_weights_zero() {
+    fn test_trust_with_evidence() {
         let mut store = MemoryBlockStore::new();
-        let agent = Identity::from_bytes(&[1u8; 32]);
-        let peer = Identity::from_bytes(&[2u8; 32]);
+        let seed = Identity::from_bytes(&[1u8; 32]);
+        let agent = Identity::from_bytes(&[2u8; 32]);
 
         create_interaction(
             &mut store,
+            &seed,
             &agent,
-            &peer,
             1,
             1,
             GENESIS_HASH,
@@ -898,16 +1064,17 @@ mod tests {
             1000,
         );
 
-        let weights = TrustWeights {
-            integrity: 0.0,
-            netflow: 0.0,
-        };
-
-        let engine = TrustEngine::new(&store, None, Some(weights), None);
-        let trust = engine.compute_trust(&agent.pubkey_hex()).unwrap();
-        // No seeds configured → integrity only, but weights don't matter
-        // since integrity is returned directly when no seeds are set.
-        assert!((0.0..=1.0).contains(&trust));
+        let engine = TrustEngine::new(&store, Some(vec![seed.pubkey_hex()]), None, None);
+        let evidence = engine
+            .compute_trust_with_evidence(&agent.pubkey_hex())
+            .unwrap();
+        assert!(evidence.trust_score > 0.0);
+        assert!(evidence.connectivity > 0.0);
+        assert!((evidence.integrity - 1.0).abs() < 1e-10);
+        assert!(evidence.diversity > 0.0);
+        assert!(evidence.unique_peers >= 1);
+        assert!(!evidence.fraud);
+        assert!(evidence.path_diversity > 0.0);
     }
 
     #[test]

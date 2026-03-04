@@ -66,6 +66,8 @@ pub struct ProxyState<
     pub peer_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// Optional delegation store for enriching proxy transactions with delegation context.
     pub delegation_store: Option<Arc<Mutex<D>>>,
+    /// Seed nodes for TrustEngine (empty = no NetFlow).
+    pub seed_nodes: Vec<String>,
 }
 
 impl<S: BlockStore + 'static, D: DelegationStore + 'static> Clone for ProxyState<S, D> {
@@ -77,6 +79,7 @@ impl<S: BlockStore + 'static, D: DelegationStore + 'static> Clone for ProxyState
             client: self.client.clone(),
             peer_locks: self.peer_locks.clone(),
             delegation_store: self.delegation_store.clone(),
+            seed_nodes: self.seed_nodes.clone(),
         }
     }
 }
@@ -238,21 +241,24 @@ async fn compute_trust_headers<S: BlockStore + 'static, D: DelegationStore + 'st
     // Always include the peer's pubkey
     headers.push(("X-TrustChain-Pubkey".to_string(), peer.pubkey.clone()));
 
-    // Try to get trust info from the chain
+    // Compute proper trust score via TrustEngine
     let proto = state.protocol.lock().await;
-    if let Ok(chain) = proto.store().get_chain(&peer.pubkey) {
+    let store = proto.store();
+    let seed_nodes = if state.seed_nodes.is_empty() {
+        None
+    } else {
+        Some(state.seed_nodes.clone())
+    };
+    let engine = trustchain_core::TrustEngine::new(store, seed_nodes, None, None);
+    if let Ok(evidence) = engine.compute_trust_with_evidence(&peer.pubkey) {
         headers.push((
             "X-TrustChain-Interactions".to_string(),
-            chain.len().to_string(),
+            evidence.interactions.to_string(),
         ));
-
-        // Compute trust score using completion rate
-        let total = chain.len();
-        let agreements = chain.iter().filter(|b| b.block_type == "Agreement").count();
-        if total > 0 {
-            let score = agreements as f64 / total as f64;
-            headers.push(("X-TrustChain-Score".to_string(), format!("{score:.3}")));
-        }
+        headers.push((
+            "X-TrustChain-Score".to_string(),
+            format!("{:.3}", evidence.trust_score),
+        ));
     }
 
     Some(headers)

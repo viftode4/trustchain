@@ -205,13 +205,13 @@ fn stress_netflow_transitive_3hop() {
 
     let engine = NetFlowTrust::new(&master, vec![seed_p.pubkey()]).unwrap();
 
-    let alice_score = engine.compute_trust(&alice_p.pubkey()).unwrap();
-    let bob_score = engine.compute_trust(&bob_p.pubkey()).unwrap();
-    let carol_score = engine.compute_trust(&carol_p.pubkey()).unwrap();
+    let alice_score = engine.compute_path_diversity(&alice_p.pubkey()).unwrap();
+    let bob_score = engine.compute_path_diversity(&bob_p.pubkey()).unwrap();
+    let carol_score = engine.compute_path_diversity(&carol_p.pubkey()).unwrap();
 
     // An agent that never appears in the graph scores exactly 0.
     let isolated = Identity::from_bytes(&[99; 32]).pubkey_hex();
-    let isolated_score = engine.compute_trust(&isolated).unwrap();
+    let isolated_score = engine.compute_path_diversity(&isolated).unwrap();
 
     println!(
         "3-hop transitive: alice={alice_score:.4}  bob={bob_score:.4}  \
@@ -388,10 +388,10 @@ fn stress_sybil_one_seed_connection_bounded() {
     // ── NetFlow scores ────────────────────────────────────────────────────────
     let engine = NetFlowTrust::new(&store, vec![seed.pubkey_hex()]).unwrap();
 
-    let honest_score = engine.compute_trust(&honest.pubkey_hex()).unwrap();
-    let sybil0_score = engine.compute_trust(&sybils[0].pubkey_hex()).unwrap();
-    let sybil5_score = engine.compute_trust(&sybils[5].pubkey_hex()).unwrap();
-    let sybil10_score = engine.compute_trust(&sybils[10].pubkey_hex()).unwrap();
+    let honest_score = engine.compute_path_diversity(&honest.pubkey_hex()).unwrap();
+    let sybil0_score = engine.compute_path_diversity(&sybils[0].pubkey_hex()).unwrap();
+    let sybil5_score = engine.compute_path_diversity(&sybils[5].pubkey_hex()).unwrap();
+    let sybil10_score = engine.compute_path_diversity(&sybils[10].pubkey_hex()).unwrap();
 
     println!(
         "sybil-1-seed: honest={honest_score:.4}  sybil[0]={sybil0_score:.4}  \

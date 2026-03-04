@@ -42,7 +42,10 @@ pub use halfblock::{
 pub use identity::Identity;
 pub use netflow::{CachedNetFlow, NetFlowTrust};
 pub use protocol::TrustChainProtocol;
-pub use trust::{DelegationContext, TrustEngine, TrustWeights};
+pub use trust::{
+    DelegationContext, TrustConfig, TrustEngine, TrustEvidence, TrustWeights,
+    DEFAULT_CONNECTIVITY_THRESHOLD, DEFAULT_DIVERSITY_THRESHOLD,
+};
 pub use types::{
     BlockType, ValidationResult, GENESIS_HASH, GENESIS_SEQ, MAX_DELEGATION_TTL_MS, UNKNOWN_SEQ,
 };

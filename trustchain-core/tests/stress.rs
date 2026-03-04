@@ -329,8 +329,8 @@ fn stress_netflow_sybil_resistance_at_scale() {
     }
 
     let engine = NetFlowTrust::new(&store, vec![seed.pubkey_hex()]).unwrap();
-    let honest_score = engine.compute_trust(&honest.pubkey_hex()).unwrap();
-    let sybil_score = engine.compute_trust(&sybils[0].pubkey_hex()).unwrap();
+    let honest_score = engine.compute_path_diversity(&honest.pubkey_hex()).unwrap();
+    let sybil_score = engine.compute_path_diversity(&sybils[0].pubkey_hex()).unwrap();
 
     println!("honest score: {honest_score:.4}  sybil score: {sybil_score:.4}");
 

@@ -280,6 +280,7 @@ impl Node {
                 std::collections::HashMap::new(),
             )),
             delegation_store: Some(self.delegation_store.clone()),
+            seed_nodes: self.config.effective_bootstrap_nodes(),
         };
         let proxy_handle = tokio::spawn(async move {
             if let Err(e) = start_proxy_server(proxy_addr, proxy_state).await {

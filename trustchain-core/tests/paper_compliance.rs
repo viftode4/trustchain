@@ -235,10 +235,12 @@ fn test_netflow_hand_calculated() {
     let seeds = vec![seed.pubkey_hex()];
     let nf = NetFlowTrust::new(&store, seeds).unwrap();
 
-    // S's total outflow: S→A=3.0, S→B=2.0. Total=5.0.
-    // C's trust = max_flow(super→C) / 5.0 = 1.0/5.0 = 0.2.
-    let trust_c = nf.compute_trust(&agent_c.pubkey_hex()).unwrap();
-    assert!((trust_c - 0.2).abs() < 1e-10, "expected 0.2, got {trust_c}");
+    // With edge capping at 1.0 per peer pair:
+    // S→A: 3 interactions → capped at 1.0.  S→B: 2 interactions → capped at 1.0.
+    // A→C: 1 interaction → 0.5.
+    // Raw max-flow to C: Super→S(1.0+1.0=2.0 cap)→A(1.0)→C(0.5) = 0.5.
+    let path_div_c = nf.compute_path_diversity(&agent_c.pubkey_hex()).unwrap();
+    assert!((path_div_c - 0.5).abs() < 1e-10, "expected 0.5, got {path_div_c}");
 }
 
 // ---------------------------------------------------------------------------
@@ -264,10 +266,10 @@ fn test_netflow_seed_always_one() {
 
     let seeds = vec![seed.pubkey_hex()];
     let nf = NetFlowTrust::new(&store, seeds).unwrap();
-    let trust = nf.compute_trust(&seed.pubkey_hex()).unwrap();
+    let path_div = nf.compute_path_diversity(&seed.pubkey_hex()).unwrap();
     assert!(
-        (trust - 1.0).abs() < 1e-10,
-        "seed node trust must be 1.0, got {trust}"
+        path_div.is_infinite(),
+        "seed node path diversity must be infinite, got {path_div}"
     );
 }
 
@@ -465,8 +467,8 @@ fn test_contribution_graph_half_block_weight() {
     let graph2 = nf2.build_contribution_graph().unwrap();
     let a_to_b_3 = graph2[&alice.pubkey_hex()][&bob.pubkey_hex()];
     assert!(
-        (a_to_b_3 - 1.5).abs() < 1e-10,
-        "A→B should be 1.5 (3 proposals × 0.5), got {a_to_b_3}"
+        (a_to_b_3 - 1.0).abs() < 1e-10,
+        "A→B should be 1.0 (capped at 1.0 per peer pair), got {a_to_b_3}"
     );
 }
 
@@ -521,16 +523,16 @@ fn test_netflow_normalization_formula() {
 
     let seeds = vec![seed1.pubkey_hex(), seed2.pubkey_hex()];
     let nf = NetFlowTrust::new(&store, seeds).unwrap();
-    let trust = nf.compute_trust(&target.pubkey_hex()).unwrap();
+    let path_div = nf.compute_path_diversity(&target.pubkey_hex()).unwrap();
 
-    // Super→S1 capacity = S1's total outflow = 1.0 (S1→T).
-    // Super→S2 capacity = S2's total outflow = 2.0 (S2→T).
-    // Total seed outflow = 3.0.
-    // Max flow (super→target): S1→T=1.0, S2→T=2.0, total=3.0.
-    // Trust = 3.0 / 3.0 = 1.0.
+    // With edge capping at 1.0 per peer pair:
+    // S1→T: 2 interactions → capped at 1.0.
+    // S2→T: 4 interactions → capped at 1.0.
+    // Super→S1 capacity = 1.0, Super→S2 capacity = 1.0.
+    // Raw max-flow = 1.0 + 1.0 = 2.0 (two independent paths from seeds to target).
     assert!(
-        (trust - 1.0).abs() < 1e-10,
-        "direct seed connections should give trust 1.0, got {trust}"
+        (path_div - 2.0).abs() < 1e-10,
+        "direct seed connections should give path diversity 2.0, got {path_div}"
     );
 }
 
@@ -599,9 +601,9 @@ fn test_sybil_resistance_no_seed_connection() {
     let nf = NetFlowTrust::new(&store, seeds).unwrap();
 
     // All sybils should have zero trust — no path from super_source to them.
-    let trust_a = nf.compute_trust(&sybil_a.pubkey_hex()).unwrap();
-    let trust_b = nf.compute_trust(&sybil_b.pubkey_hex()).unwrap();
-    let trust_c = nf.compute_trust(&sybil_c.pubkey_hex()).unwrap();
+    let trust_a = nf.compute_path_diversity(&sybil_a.pubkey_hex()).unwrap();
+    let trust_b = nf.compute_path_diversity(&sybil_b.pubkey_hex()).unwrap();
+    let trust_c = nf.compute_path_diversity(&sybil_c.pubkey_hex()).unwrap();
 
     assert!(
         trust_a.abs() < 1e-10,
@@ -664,27 +666,24 @@ fn test_netflow_multi_hop_propagation() {
     let seeds = vec![seed.pubkey_hex()];
     let nf = NetFlowTrust::new(&store, seeds).unwrap();
 
-    // Graph edges (proposal direction):
+    // Graph edges (proposal direction), each 1 interaction:
     // S→A: 0.5, A→S: 0.5 (agreement)
     // A→B: 0.5, B→A: 0.5
     // B→C: 0.5, C→B: 0.5
     //
-    // Seed total outflow = S→A = 0.5.
-    // Super→S capacity = 0.5.
-    // Max flow to C: Super→S(0.5)→A→B→C.
-    //   S→A: 0.5, A→B: 0.5, B→C: 0.5 → bottleneck = 0.5.
-    // Trust(C) = 0.5 / 0.5 = 1.0.
-    let trust_c = nf.compute_trust(&c.pubkey_hex()).unwrap();
+    // Super→S capacity = S's outflow = 0.5.
+    // Raw max-flow to C: Super→S(0.5)→A(0.5)→B(0.5)→C = 0.5.
+    let path_div_c = nf.compute_path_diversity(&c.pubkey_hex()).unwrap();
     assert!(
-        (trust_c - 1.0).abs() < 1e-10,
-        "3-hop trust should be 1.0 (no bottleneck), got {trust_c}"
+        (path_div_c - 0.5).abs() < 1e-10,
+        "3-hop path diversity should be 0.5, got {path_div_c}"
     );
 
-    // B should also be 1.0 (same path, shorter).
-    let trust_b = nf.compute_trust(&b.pubkey_hex()).unwrap();
+    // B should also be 0.5 (same bottleneck at S→A).
+    let path_div_b = nf.compute_path_diversity(&b.pubkey_hex()).unwrap();
     assert!(
-        (trust_b - 1.0).abs() < 1e-10,
-        "2-hop trust should be 1.0, got {trust_b}"
+        (path_div_b - 0.5).abs() < 1e-10,
+        "2-hop path diversity should be 0.5, got {path_div_b}"
     );
 }
 
@@ -725,20 +724,20 @@ fn test_netflow_bottleneck_limits_trust() {
     let seeds = vec![seed.pubkey_hex()];
     let nf = NetFlowTrust::new(&store, seeds).unwrap();
 
-    // Seed total outflow = S→A = 2.5 (5 × 0.5).
-    // Max flow to B: Super→S(2.5)→A(min(2.5, 0.5))→B = 0.5.
-    // Trust(B) = 0.5 / 2.5 = 0.2.
-    let trust_b = nf.compute_trust(&b.pubkey_hex()).unwrap();
+    // With edge capping: S→A = 5 interactions → capped at 1.0.
+    // A→B = 1 interaction → 0.5. Super→S capacity = 1.0.
+    // Raw max-flow to B: Super→S(1.0)→A(min(1.0, 0.5))→B = 0.5.
+    let path_div_b = nf.compute_path_diversity(&b.pubkey_hex()).unwrap();
     assert!(
-        (trust_b - 0.2).abs() < 1e-10,
-        "bottlenecked trust should be 0.2, got {trust_b}"
+        (path_div_b - 0.5).abs() < 1e-10,
+        "bottlenecked path diversity should be 0.5, got {path_div_b}"
     );
 
-    // A's trust = 2.5 / 2.5 = 1.0 (direct to seed).
-    let trust_a = nf.compute_trust(&a.pubkey_hex()).unwrap();
+    // A's path diversity = 1.0 (S→A capped at 1.0, direct path).
+    let path_div_a = nf.compute_path_diversity(&a.pubkey_hex()).unwrap();
     assert!(
-        (trust_a - 1.0).abs() < 1e-10,
-        "direct seed connection trust should be 1.0, got {trust_a}"
+        (path_div_a - 1.0).abs() < 1e-10,
+        "direct seed connection path diversity should be 1.0, got {path_div_a}"
     );
 }
 
@@ -767,12 +766,12 @@ fn test_netflow_unknown_node_zero() {
     let nf = NetFlowTrust::new(&store, seeds).unwrap();
 
     // Node not in the graph at all.
-    let trust = nf
-        .compute_trust("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+    let path_div = nf
+        .compute_path_diversity("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
         .unwrap();
     assert!(
-        trust.abs() < 1e-10,
-        "unknown node must have 0 trust, got {trust}"
+        path_div.abs() < 1e-10,
+        "unknown node must have 0 path diversity, got {path_div}"
     );
 }
 

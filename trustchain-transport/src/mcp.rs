@@ -119,9 +119,8 @@ impl<S: BlockStore + 'static> TrustChainMcpServer<S> {
     /// Check the trust score and component breakdown for a peer.
     #[tool(
         name = "trustchain_check_trust",
-        description = "Check the trust score for a peer. Returns an overall trust score (0.0-1.0) \
-                        plus component scores: chain integrity, netflow (Sybil-resistant), \
-                        and statistical behaviour analysis."
+        description = "Check the trust score for a peer. Returns trust = connectivity × integrity × diversity, \
+                        plus full evidence: path_diversity, unique_peers, fraud status."
     )]
     async fn check_trust(
         &self,
@@ -131,24 +130,21 @@ impl<S: BlockStore + 'static> TrustChainMcpServer<S> {
         let store = proto.store();
         let engine = self.make_engine(store);
 
-        let overall = engine
-            .compute_trust(&params.0.peer)
+        let evidence = engine
+            .compute_trust_with_evidence(&params.0.peer)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        let integrity = engine
-            .compute_chain_integrity(&params.0.peer)
-            .unwrap_or(0.0);
-        let netflow = engine.compute_netflow_score(&params.0.peer).unwrap_or(0.0);
-
-        let chain = store.get_chain(&params.0.peer).unwrap_or_default();
 
         let result = serde_json::json!({
             "peer": params.0.peer,
-            "trust_score": overall,
-            "interaction_count": chain.len(),
-            "components": {
-                "chain_integrity": integrity,
-                "netflow": netflow,
-            }
+            "trust_score": evidence.trust_score,
+            "connectivity": evidence.connectivity,
+            "integrity": evidence.integrity,
+            "diversity": evidence.diversity,
+            "unique_peers": evidence.unique_peers,
+            "interactions": evidence.interactions,
+            "interaction_count": evidence.interactions,
+            "fraud": evidence.fraud,
+            "path_diversity": if evidence.path_diversity.is_infinite() { 0.0 } else { evidence.path_diversity },
         });
 
         Ok(CallToolResult::success(vec![Content::text(

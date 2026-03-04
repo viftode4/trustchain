@@ -203,6 +203,13 @@ pub struct ErrorResponse {
 pub struct TrustScoreResponse {
     pub pubkey: String,
     pub trust_score: f64,
+    pub connectivity: f64,
+    pub integrity: f64,
+    pub diversity: f64,
+    pub unique_peers: usize,
+    pub interactions: usize,
+    pub fraud: bool,
+    pub path_diversity: f64,
     pub interaction_count: usize,
     pub block_count: usize,
 }
@@ -790,7 +797,7 @@ async fn handle_trust_score<S: BlockStore + 'static, D: DelegationStore + Send +
     if let Some(cp) = checkpoint {
         engine = engine.with_checkpoint(cp);
     }
-    let trust_score = engine.compute_trust(&pubkey).map_err(|e| {
+    let evidence = engine.compute_trust_with_evidence(&pubkey).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -799,14 +806,23 @@ async fn handle_trust_score<S: BlockStore + 'static, D: DelegationStore + Send +
         )
     })?;
 
-    let chain = store.get_chain(&pubkey).unwrap_or_default();
-    let interaction_count = chain.len();
     let block_count = store.get_block_count().unwrap_or(0);
 
     Ok(Json(TrustScoreResponse {
         pubkey,
-        trust_score,
-        interaction_count,
+        trust_score: evidence.trust_score,
+        connectivity: evidence.connectivity,
+        integrity: evidence.integrity,
+        diversity: evidence.diversity,
+        unique_peers: evidence.unique_peers,
+        interactions: evidence.interactions,
+        fraud: evidence.fraud,
+        path_diversity: if evidence.path_diversity.is_infinite() {
+            0.0 // Seed nodes: serialize as 0 (infinite is not JSON-safe)
+        } else {
+            evidence.path_diversity
+        },
+        interaction_count: evidence.interactions,
         block_count,
     }))
 }
@@ -1333,6 +1349,11 @@ mod tests {
             .unwrap();
         let trust_resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(trust_resp.get("trust_score").is_some());
+        assert!(trust_resp.get("connectivity").is_some());
+        assert!(trust_resp.get("integrity").is_some());
+        assert!(trust_resp.get("diversity").is_some());
+        assert!(trust_resp.get("unique_peers").is_some());
+        assert!(trust_resp.get("fraud").is_some());
         assert!(trust_resp.get("interaction_count").is_some());
     }
 

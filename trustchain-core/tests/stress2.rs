@@ -499,12 +499,12 @@ fn stress_netflow_multi_seed() {
 
     // Single-seed engine (only seed1).
     let engine1 = NetFlowTrust::new(&store, vec![seed1.pubkey_hex()]).unwrap();
-    let score_1seed = engine1.compute_trust(&honest.pubkey_hex()).unwrap();
+    let score_1seed = engine1.compute_path_diversity(&honest.pubkey_hex()).unwrap();
 
     // Multi-seed engine (seed1 + seed2).
     let engine2 = NetFlowTrust::new(&store, vec![seed1.pubkey_hex(), seed2.pubkey_hex()]).unwrap();
-    let score_2seed = engine2.compute_trust(&honest.pubkey_hex()).unwrap();
-    let alien_score = engine2.compute_trust(&alien.pubkey_hex()).unwrap();
+    let score_2seed = engine2.compute_path_diversity(&honest.pubkey_hex()).unwrap();
+    let alien_score = engine2.compute_path_diversity(&alien.pubkey_hex()).unwrap();
 
     println!(
         "netflow multi-seed: 1-seed={score_1seed:.4}  2-seed={score_2seed:.4}  alien={alien_score:.4}"

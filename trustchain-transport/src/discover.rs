@@ -42,6 +42,12 @@ pub struct DiscoveredAgent {
     /// Trust score (computed locally by the querying node, if available).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_score: Option<f64>,
+    /// Connectivity factor (if computed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connectivity: Option<f64>,
+    /// Diversity factor (if computed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diversity: Option<f64>,
 }
 
 /// Scan the local blockstore for agents that have interacted with the given capability.
@@ -78,6 +84,8 @@ pub fn find_capable_agents<S: BlockStore>(
                 capability: capability.to_string(),
                 interaction_count: count as u64,
                 trust_score: None,
+                connectivity: None,
+                diversity: None,
             });
         }
     }

@@ -210,10 +210,10 @@ proptest! {
 
         let seeds = vec![seed_id.pubkey_hex()];
         let nf = NetFlowTrust::new(&store, seeds).unwrap();
-        let trust = nf.compute_trust(&seed_id.pubkey_hex()).unwrap();
+        let path_div = nf.compute_path_diversity(&seed_id.pubkey_hex()).unwrap();
         prop_assert!(
-            (trust - 1.0).abs() < 1e-10,
-            "seed node trust must be 1.0, got {trust}"
+            path_div.is_infinite(),
+            "seed node path diversity must be infinite, got {path_div}"
         );
     }
 }

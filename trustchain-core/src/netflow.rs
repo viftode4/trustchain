@@ -28,8 +28,10 @@ impl<'a, S: BlockStore> NetFlowTrust<'a, S> {
 
     /// Build the contribution graph from blockchain state.
     ///
-    /// Returns `{source: {target: weight}}` where weight is the total contribution
-    /// volume. Each half-block (proposal or agreement) contributes 0.5 units.
+    /// Returns `{source: {target: weight}}` where weight is the contribution
+    /// volume per peer pair, **capped at 1.0**. Each half-block contributes 0.5
+    /// units before capping. The cap ensures max-flow measures topology
+    /// (independent paths), not interaction volume.
     pub fn build_contribution_graph(&self) -> Result<HashMap<String, HashMap<String, f64>>> {
         let mut graph: HashMap<String, HashMap<String, f64>> = HashMap::new();
         let pubkeys = self.store.get_all_pubkeys()?;
@@ -47,22 +49,26 @@ impl<'a, S: BlockStore> NetFlowTrust<'a, S> {
                     .or_default()
                     .entry(block.link_public_key.clone())
                     .or_insert(0.0);
-                *entry += 0.5;
+                *entry = (*entry + 0.5).min(1.0);
             }
         }
 
         Ok(graph)
     }
 
-    /// Compute the trust score for a target agent.
+    /// Compute the path diversity (raw max-flow) for a target agent.
     ///
-    /// Returns a value in `[0.0, 1.0]`:
-    /// - Seed nodes always return 1.0
-    /// - Others get `max_flow(super_source → target) / max_possible_outflow`
-    pub fn compute_trust(&self, target_pubkey: &str) -> Result<f64> {
-        // Seed nodes are always trusted.
+    /// Returns the raw max-flow value from the super-source to the target:
+    /// - Seed nodes return `f64::INFINITY` (the TrustEngine handles the 1.0 bypass)
+    /// - Others get the raw max-flow value (not normalized)
+    /// - Unknown nodes return 0.0
+    ///
+    /// Edge weights are capped at 1.0 per peer pair, so max-flow measures
+    /// the number of independent paths (topology), not interaction volume.
+    pub fn compute_path_diversity(&self, target_pubkey: &str) -> Result<f64> {
+        // Seed nodes always have infinite path diversity.
         if self.seed_nodes.contains(&target_pubkey.to_string()) {
-            return Ok(1.0);
+            return Ok(f64::INFINITY);
         }
 
         let graph = self.build_contribution_graph()?;
@@ -84,12 +90,14 @@ impl<'a, S: BlockStore> NetFlowTrust<'a, S> {
         let super_source = "__super_source__";
         let mut capacity: HashMap<&str, HashMap<&str, f64>> = HashMap::new();
 
-        // Super-source → seed edges.
-        let mut total_seed_outflow = 0.0f64;
+        // Super-source → seed edges with capacity = seed's total outflow.
+        let mut has_seed_outflow = false;
         for seed in &self.seed_nodes {
             if let Some(edges) = graph.get(seed.as_str()) {
                 let seed_outflow: f64 = edges.values().sum();
-                total_seed_outflow += seed_outflow;
+                if seed_outflow > 0.0 {
+                    has_seed_outflow = true;
+                }
                 capacity
                     .entry(super_source)
                     .or_default()
@@ -97,7 +105,7 @@ impl<'a, S: BlockStore> NetFlowTrust<'a, S> {
             }
         }
 
-        if total_seed_outflow == 0.0 {
+        if !has_seed_outflow {
             return Ok(0.0);
         }
 
@@ -114,14 +122,15 @@ impl<'a, S: BlockStore> NetFlowTrust<'a, S> {
         // Edmonds-Karp max-flow from super_source to target.
         let max_flow = edmonds_karp(&mut capacity, super_source, target_pubkey);
 
-        Ok((max_flow / total_seed_outflow).min(1.0))
+        Ok(max_flow)
     }
 
-    /// Compute trust scores for all known agents.
+    /// Compute raw path diversity (max-flow) for all known agents.
     ///
     /// Optimized: builds the contribution graph and super-source once,
     /// then clones the residual capacity for each per-target max-flow run.
-    pub fn compute_all_scores(&self) -> Result<HashMap<String, f64>> {
+    /// Seeds return `f64::INFINITY`.
+    pub fn compute_all_path_diversities(&self) -> Result<HashMap<String, f64>> {
         let pubkeys = self.store.get_all_pubkeys()?;
         let mut scores = HashMap::new();
 
@@ -140,11 +149,13 @@ impl<'a, S: BlockStore> NetFlowTrust<'a, S> {
         let super_source = "__super_source__";
         let mut base_capacity: HashMap<&str, HashMap<&str, f64>> = HashMap::new();
 
-        let mut total_seed_outflow = 0.0f64;
+        let mut has_seed_outflow = false;
         for seed in &self.seed_nodes {
             if let Some(edges) = graph.get(seed.as_str()) {
                 let seed_outflow: f64 = edges.values().sum();
-                total_seed_outflow += seed_outflow;
+                if seed_outflow > 0.0 {
+                    has_seed_outflow = true;
+                }
                 base_capacity
                     .entry(super_source)
                     .or_default()
@@ -164,16 +175,11 @@ impl<'a, S: BlockStore> NetFlowTrust<'a, S> {
 
         for pubkey in &pubkeys {
             if self.seed_nodes.contains(pubkey) {
-                scores.insert(pubkey.clone(), 1.0);
+                scores.insert(pubkey.clone(), f64::INFINITY);
                 continue;
             }
 
-            if !all_nodes.contains(pubkey.as_str()) {
-                scores.insert(pubkey.clone(), 0.0);
-                continue;
-            }
-
-            if total_seed_outflow == 0.0 {
+            if !all_nodes.contains(pubkey.as_str()) || !has_seed_outflow {
                 scores.insert(pubkey.clone(), 0.0);
                 continue;
             }
@@ -181,12 +187,12 @@ impl<'a, S: BlockStore> NetFlowTrust<'a, S> {
             // Clone the base capacity for this target's max-flow run.
             let mut capacity = base_capacity.clone();
             let max_flow = edmonds_karp(&mut capacity, super_source, pubkey);
-            scores.insert(pubkey.clone(), (max_flow / total_seed_outflow).min(1.0));
+            scores.insert(pubkey.clone(), max_flow);
         }
 
         // Include seed nodes even if they have no blocks.
         for seed in &self.seed_nodes {
-            scores.entry(seed.clone()).or_insert(1.0);
+            scores.entry(seed.clone()).or_insert(f64::INFINITY);
         }
 
         Ok(scores)
@@ -352,7 +358,7 @@ impl<S: BlockStore> CachedNetFlow<S> {
                         .or_default()
                         .entry(block.link_public_key.clone())
                         .or_insert(0.0);
-                    *entry += 0.5;
+                    *entry = (*entry + 0.5).min(1.0);
                 }
                 self.known_seqs.insert(pk.clone(), current_seq);
             }
@@ -375,10 +381,12 @@ impl<S: BlockStore> CachedNetFlow<S> {
         Ok(())
     }
 
-    /// Compute the trust score for a target agent, using the cached graph.
-    pub fn compute_trust(&mut self, target_pubkey: &str) -> Result<f64> {
+    /// Compute the raw path diversity (max-flow) for a target agent, using the cached graph.
+    ///
+    /// Seeds return `f64::INFINITY`. Unknown nodes return 0.0.
+    pub fn compute_path_diversity(&mut self, target_pubkey: &str) -> Result<f64> {
         if self.seed_nodes.contains(&target_pubkey.to_string()) {
-            return Ok(1.0);
+            return Ok(f64::INFINITY);
         }
 
         self.ensure_graph()?;
@@ -401,11 +409,13 @@ impl<S: BlockStore> CachedNetFlow<S> {
         let super_source = "__super_source__";
         let mut capacity: HashMap<&str, HashMap<&str, f64>> = HashMap::new();
 
-        let mut total_seed_outflow = 0.0f64;
+        let mut has_seed_outflow = false;
         for seed in &self.seed_nodes {
             if let Some(edges) = graph.get(seed.as_str()) {
                 let seed_outflow: f64 = edges.values().sum();
-                total_seed_outflow += seed_outflow;
+                if seed_outflow > 0.0 {
+                    has_seed_outflow = true;
+                }
                 capacity
                     .entry(super_source)
                     .or_default()
@@ -413,7 +423,7 @@ impl<S: BlockStore> CachedNetFlow<S> {
             }
         }
 
-        if total_seed_outflow == 0.0 {
+        if !has_seed_outflow {
             return Ok(0.0);
         }
 
@@ -427,11 +437,12 @@ impl<S: BlockStore> CachedNetFlow<S> {
         }
 
         let max_flow = edmonds_karp(&mut capacity, super_source, target_pubkey);
-        Ok((max_flow / total_seed_outflow).min(1.0))
+        Ok(max_flow)
     }
 
-    /// Compute trust scores for all known agents, using the cached graph.
-    pub fn compute_all_scores(&mut self) -> Result<HashMap<String, f64>> {
+    /// Compute raw path diversity (max-flow) for all known agents, using the cached graph.
+    /// Seeds return `f64::INFINITY`.
+    pub fn compute_all_path_diversities(&mut self) -> Result<HashMap<String, f64>> {
         let pubkeys = self.store.get_all_pubkeys()?;
         let mut scores = HashMap::new();
 
@@ -449,11 +460,13 @@ impl<S: BlockStore> CachedNetFlow<S> {
         let super_source = "__super_source__";
         let mut base_capacity: HashMap<&str, HashMap<&str, f64>> = HashMap::new();
 
-        let mut total_seed_outflow = 0.0f64;
+        let mut has_seed_outflow = false;
         for seed in &self.seed_nodes {
             if let Some(edges) = graph.get(seed.as_str()) {
                 let seed_outflow: f64 = edges.values().sum();
-                total_seed_outflow += seed_outflow;
+                if seed_outflow > 0.0 {
+                    has_seed_outflow = true;
+                }
                 base_capacity
                     .entry(super_source)
                     .or_default()
@@ -472,20 +485,20 @@ impl<S: BlockStore> CachedNetFlow<S> {
 
         for pubkey in &pubkeys {
             if self.seed_nodes.contains(pubkey) {
-                scores.insert(pubkey.clone(), 1.0);
+                scores.insert(pubkey.clone(), f64::INFINITY);
                 continue;
             }
-            if !all_nodes.contains(pubkey.as_str()) || total_seed_outflow == 0.0 {
+            if !all_nodes.contains(pubkey.as_str()) || !has_seed_outflow {
                 scores.insert(pubkey.clone(), 0.0);
                 continue;
             }
             let mut capacity = base_capacity.clone();
             let max_flow = edmonds_karp(&mut capacity, super_source, pubkey);
-            scores.insert(pubkey.clone(), (max_flow / total_seed_outflow).min(1.0));
+            scores.insert(pubkey.clone(), max_flow);
         }
 
         for seed in &self.seed_nodes {
-            scores.entry(seed.clone()).or_insert(1.0);
+            scores.entry(seed.clone()).or_insert(f64::INFINITY);
         }
 
         Ok(scores)
@@ -542,7 +555,7 @@ mod tests {
         let seed = Identity::from_bytes(&[1u8; 32]);
         let engine = NetFlowTrust::new(&store, vec![seed.pubkey_hex()]).unwrap();
 
-        assert_eq!(engine.compute_trust(&seed.pubkey_hex()).unwrap(), 1.0);
+        assert_eq!(engine.compute_path_diversity(&seed.pubkey_hex()).unwrap(), f64::INFINITY);
     }
 
     #[test]
@@ -551,7 +564,7 @@ mod tests {
         let seed = Identity::from_bytes(&[1u8; 32]);
         let engine = NetFlowTrust::new(&store, vec![seed.pubkey_hex()]).unwrap();
 
-        assert_eq!(engine.compute_trust("unknown").unwrap(), 0.0);
+        assert_eq!(engine.compute_path_diversity("unknown").unwrap(), 0.0);
     }
 
     #[test]
@@ -563,12 +576,11 @@ mod tests {
         create_interaction(&mut store, &seed, &agent, 1, 1, GENESIS_HASH, GENESIS_HASH);
 
         let engine = NetFlowTrust::new(&store, vec![seed.pubkey_hex()]).unwrap();
-        let score = engine.compute_trust(&agent.pubkey_hex()).unwrap();
+        let score = engine.compute_path_diversity(&agent.pubkey_hex()).unwrap();
         assert!(
             score > 0.0,
-            "direct interaction should yield positive trust"
+            "direct interaction should yield positive path diversity"
         );
-        assert!(score <= 1.0);
     }
 
     #[test]
@@ -594,10 +606,10 @@ mod tests {
         );
 
         let engine = NetFlowTrust::new(&store, vec![seed.pubkey_hex()]).unwrap();
-        let score = engine.compute_trust(&target.pubkey_hex()).unwrap();
+        let score = engine.compute_path_diversity(&target.pubkey_hex()).unwrap();
         assert!(
             score > 0.0,
-            "transitive interaction should yield positive trust"
+            "transitive interaction should yield positive path diversity"
         );
     }
 
@@ -622,14 +634,14 @@ mod tests {
         }
 
         let engine = NetFlowTrust::new(&store, vec![seed.pubkey_hex()]).unwrap();
-        let sybil_score = engine.compute_trust(&sybil1.pubkey_hex()).unwrap();
-        let honest_score = engine.compute_trust(&honest.pubkey_hex()).unwrap();
+        let sybil_score = engine.compute_path_diversity(&sybil1.pubkey_hex()).unwrap();
+        let honest_score = engine.compute_path_diversity(&honest.pubkey_hex()).unwrap();
 
         assert!(
             sybil_score < honest_score,
-            "sybil ({sybil_score}) should have lower trust than honest ({honest_score})"
+            "sybil ({sybil_score}) should have lower path diversity than honest ({honest_score})"
         );
-        assert_eq!(sybil_score, 0.0, "disconnected sybil should have 0 trust");
+        assert_eq!(sybil_score, 0.0, "disconnected sybil should have 0 path diversity");
     }
 
     #[test]
@@ -641,9 +653,9 @@ mod tests {
         create_interaction(&mut store, &seed, &agent, 1, 1, GENESIS_HASH, GENESIS_HASH);
 
         let engine = NetFlowTrust::new(&store, vec![seed.pubkey_hex()]).unwrap();
-        let scores = engine.compute_all_scores().unwrap();
+        let scores = engine.compute_all_path_diversities().unwrap();
 
-        assert_eq!(scores[&seed.pubkey_hex()], 1.0);
+        assert_eq!(scores[&seed.pubkey_hex()], f64::INFINITY);
         assert!(scores[&agent.pubkey_hex()] > 0.0);
     }
 
@@ -683,11 +695,11 @@ mod tests {
         let mut cached = CachedNetFlow::new(store, vec![seed.pubkey_hex()]).unwrap();
 
         // First call builds the graph.
-        let score1 = cached.compute_trust(&agent.pubkey_hex()).unwrap();
+        let score1 = cached.compute_path_diversity(&agent.pubkey_hex()).unwrap();
         assert!(score1 > 0.0);
 
         // Second call should reuse (same block count).
-        let score2 = cached.compute_trust(&agent.pubkey_hex()).unwrap();
+        let score2 = cached.compute_path_diversity(&agent.pubkey_hex()).unwrap();
         assert!(
             (score1 - score2).abs() < 1e-10,
             "cached result should be identical"
@@ -705,7 +717,7 @@ mod tests {
 
         let mut cached = CachedNetFlow::new(store, vec![seed.pubkey_hex()]).unwrap();
 
-        let score_before = cached.compute_trust(&agent2.pubkey_hex()).unwrap();
+        let score_before = cached.compute_path_diversity(&agent2.pubkey_hex()).unwrap();
         assert_eq!(score_before, 0.0, "agent2 should have 0 trust initially");
 
         // Add an interaction with agent2 directly on the store inside CachedNetFlow.
@@ -715,15 +727,15 @@ mod tests {
         // The store is owned, so we can't easily mutate it.
         // Instead, test that invalidate() works.
         cached.invalidate();
-        let score_after_invalidate = cached.compute_trust(&agent2.pubkey_hex()).unwrap();
+        let score_after_invalidate = cached.compute_path_diversity(&agent2.pubkey_hex()).unwrap();
         assert_eq!(
             score_after_invalidate, 0.0,
             "should still be 0 after invalidate (no new blocks)"
         );
 
         // Verify all_scores works with cache.
-        let scores = cached.compute_all_scores().unwrap();
-        assert_eq!(scores[&seed.pubkey_hex()], 1.0);
+        let scores = cached.compute_all_path_diversities().unwrap();
+        assert_eq!(scores[&seed.pubkey_hex()], f64::INFINITY);
         assert!(scores[&agent.pubkey_hex()] > 0.0);
     }
 
@@ -748,18 +760,25 @@ mod tests {
 
         // Uncached scores.
         let uncached = NetFlowTrust::new(&store, vec![seed.pubkey_hex()]).unwrap();
-        let uncached_scores = uncached.compute_all_scores().unwrap();
+        let uncached_scores = uncached.compute_all_path_diversities().unwrap();
 
         // Cached scores.
         let mut cached = CachedNetFlow::new(store, vec![seed.pubkey_hex()]).unwrap();
-        let cached_scores = cached.compute_all_scores().unwrap();
+        let cached_scores = cached.compute_all_path_diversities().unwrap();
 
         for (pk, &uncached_score) in &uncached_scores {
             let cached_score = cached_scores.get(pk).copied().unwrap_or(0.0);
-            assert!(
-                (uncached_score - cached_score).abs() < 1e-10,
-                "mismatch for {pk}: uncached={uncached_score}, cached={cached_score}"
-            );
+            if uncached_score.is_infinite() {
+                assert!(
+                    cached_score.is_infinite(),
+                    "mismatch for {pk}: uncached=inf, cached={cached_score}"
+                );
+            } else {
+                assert!(
+                    (uncached_score - cached_score).abs() < 1e-10,
+                    "mismatch for {pk}: uncached={uncached_score}, cached={cached_score}"
+                );
+            }
         }
     }
 }

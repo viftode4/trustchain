@@ -53,8 +53,8 @@ td.pubkey{font-family:monospace;color:#7dd3fc;max-width:200px;overflow:hidden;te
 <div class="card">
   <h2>Peers</h2>
   <table>
-    <thead><tr><th>Peer</th><th>Address</th><th>Trust</th><th>Interactions</th></tr></thead>
-    <tbody id="peers"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody>
+    <thead><tr><th>Peer</th><th>Address</th><th>Trust</th><th>C / I / D</th><th>Interactions</th></tr></thead>
+    <tbody id="peers"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
   </table>
 </div>
 
@@ -94,14 +94,17 @@ async function refresh() {
     const tbody = document.getElementById('peers');
 
     if (!peers.length) {
-      tbody.innerHTML = '<tr><td colspan="4" class="empty">No peers discovered yet</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="5" class="empty">No peers discovered yet</td></tr>';
     } else {
       const rows = [];
       for (const p of peers) {
-        let score = 0;
+        let score = 0, conn = '-', integ = '-', div = '-';
         try {
           const t = await fetchJSON('/trust/' + p.pubkey);
           score = typeof t === 'number' ? t : (t.trust_score ?? t.score ?? 0);
+          if (t.connectivity != null) conn = t.connectivity.toFixed(2);
+          if (t.integrity != null) integ = t.integrity.toFixed(2);
+          if (t.diversity != null) div = t.diversity.toFixed(2);
         } catch {}
         const cls = trustColor(score);
         rows.push(`<tr>
@@ -111,6 +114,7 @@ async function refresh() {
             <span class="trust-bar"><span class="fill ${cls}" style="width:${Math.round(score*100)}%"></span></span>
             ${score.toFixed(3)}
           </td>
+          <td>${conn} / ${integ} / ${div}</td>
           <td>${p.latest_seq ?? '-'}</td>
         </tr>`);
       }

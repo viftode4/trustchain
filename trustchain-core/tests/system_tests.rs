@@ -82,7 +82,7 @@ impl NetworkSim {
         let master = self.master_store();
         let seed_keys: Vec<String> = seeds.iter().map(|&i| self.pubkey(i)).collect();
         match NetFlowTrust::new(&master, seed_keys) {
-            Ok(nf) => nf.compute_trust(&self.pubkey(target)).unwrap_or(0.0),
+            Ok(nf) => nf.compute_path_diversity(&self.pubkey(target)).unwrap_or(0.0),
             Err(_) => 0.0,
         }
     }
@@ -469,8 +469,8 @@ fn sysnet_identity_cycling_dilution_bounded() {
     let seed_pk = seed_id.pubkey_hex();
     let nf = NetFlowTrust::new(&master, vec![seed_pk]).unwrap();
 
-    let honest_score = nf.compute_trust(&honest_pk).unwrap();
-    let cycling_score = nf.compute_trust(&cycling_pks[0]).unwrap();
+    let honest_score = nf.compute_path_diversity(&honest_pk).unwrap();
+    let cycling_score = nf.compute_path_diversity(&cycling_pks[0]).unwrap();
 
     assert!(honest_score > 0.0, "honest agent must have positive trust");
     assert!(
@@ -478,16 +478,17 @@ fn sysnet_identity_cycling_dilution_bounded() {
         "cycling agent must have positive trust"
     );
 
-    // Honest agent should score ~10× more than any single cycling identity.
+    // With capped edges, honest scores ~2× more than cycler:
+    // honest S→H edge capped at 1.0, cycler S→C edge = 0.5.
     let ratio = honest_score / cycling_score;
     assert!(
-        ratio >= 9.0,
-        "honest (10 interactions) should outrank cycler (1 interaction) by ~10×, got ratio={:.2}",
+        ratio >= 1.5,
+        "honest (capped 1.0 edge) should outrank cycler (0.5 edge), got ratio={:.2}",
         ratio
     );
 
     // All 50 cycling agents should have the same score (symmetry).
-    let cycling_score_last = nf.compute_trust(&cycling_pks[49]).unwrap();
+    let cycling_score_last = nf.compute_path_diversity(&cycling_pks[49]).unwrap();
     assert!(
         (cycling_score - cycling_score_last).abs() < 1e-9,
         "all cycling agents score identically: {} vs {}",
