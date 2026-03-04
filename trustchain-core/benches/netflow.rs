@@ -17,7 +17,7 @@ fn bench_netflow_single(c: &mut Criterion) {
         let target = &spoke_pks[spoke_pks.len() / 2];
 
         group.bench_with_input(BenchmarkId::new("star", n_agents), &n_agents, |b, _| {
-            b.iter(|| netflow.compute_trust(target).unwrap());
+            b.iter(|| netflow.compute_path_diversity(target).unwrap());
         });
     }
     group.finish();
@@ -37,14 +37,14 @@ fn bench_netflow_single_large(c: &mut Criterion) {
         let target = &spoke_pks[spoke_pks.len() / 2];
 
         group.bench_with_input(BenchmarkId::new("star", n_agents), &n_agents, |b, _| {
-            b.iter(|| netflow.compute_trust(target).unwrap());
+            b.iter(|| netflow.compute_path_diversity(target).unwrap());
         });
     }
     group.finish();
 }
 
 // ---------------------------------------------------------------------------
-// Uncached: compute_all_scores — star
+// Uncached: compute_all_path_diversities — star
 // ---------------------------------------------------------------------------
 fn bench_netflow_all_scores(c: &mut Criterion) {
     let mut group = c.benchmark_group("netflow_all_scores");
@@ -55,7 +55,7 @@ fn bench_netflow_all_scores(c: &mut Criterion) {
         let netflow = NetFlowTrust::new(&store, vec![seed_pk]).unwrap();
 
         group.bench_with_input(BenchmarkId::new("star", n_agents), &n_agents, |b, _| {
-            b.iter(|| netflow.compute_all_scores().unwrap());
+            b.iter(|| netflow.compute_all_path_diversities().unwrap());
         });
     }
     group.finish();
@@ -78,7 +78,7 @@ fn bench_netflow_mesh(c: &mut Criterion) {
             BenchmarkId::new(format!("mesh_d{degree}"), n_agents),
             &n_agents,
             |b, _| {
-                b.iter(|| netflow.compute_trust(target).unwrap());
+                b.iter(|| netflow.compute_path_diversity(target).unwrap());
             },
         );
     }
@@ -98,10 +98,10 @@ fn bench_cached_netflow_single(c: &mut Criterion) {
         let target = spoke_pks[spoke_pks.len() / 2].clone();
 
         // Warm up: build graph once.
-        let _ = cached.compute_trust(&target).unwrap();
+        let _ = cached.compute_path_diversity(&target).unwrap();
 
         group.bench_with_input(BenchmarkId::new("star", n_agents), &n_agents, |b, _| {
-            b.iter(|| cached.compute_trust(&target).unwrap());
+            b.iter(|| cached.compute_path_diversity(&target).unwrap());
         });
     }
     group.finish();
@@ -119,17 +119,17 @@ fn bench_cached_netflow_single_large(c: &mut Criterion) {
         let (store, seed_pk, spoke_pks) = helpers::build_star_network(n_agents, 2);
         let mut cached = CachedNetFlow::new(store, vec![seed_pk]).unwrap();
         let target = spoke_pks[spoke_pks.len() / 2].clone();
-        let _ = cached.compute_trust(&target).unwrap();
+        let _ = cached.compute_path_diversity(&target).unwrap();
 
         group.bench_with_input(BenchmarkId::new("star", n_agents), &n_agents, |b, _| {
-            b.iter(|| cached.compute_trust(&target).unwrap());
+            b.iter(|| cached.compute_path_diversity(&target).unwrap());
         });
     }
     group.finish();
 }
 
 // ---------------------------------------------------------------------------
-// Cached: compute_all_scores — star (graph reuse across N queries)
+// Cached: compute_all_path_diversities — star (graph reuse across N queries)
 // ---------------------------------------------------------------------------
 fn bench_cached_netflow_all_scores(c: &mut Criterion) {
     let mut group = c.benchmark_group("cached_netflow_all_scores");
@@ -138,10 +138,10 @@ fn bench_cached_netflow_all_scores(c: &mut Criterion) {
     for &n_agents in &[50, 200, 1_000] {
         let (store, seed_pk, _) = helpers::build_star_network(n_agents, 3);
         let mut cached = CachedNetFlow::new(store, vec![seed_pk]).unwrap();
-        let _ = cached.compute_all_scores().unwrap();
+        let _ = cached.compute_all_path_diversities().unwrap();
 
         group.bench_with_input(BenchmarkId::new("star", n_agents), &n_agents, |b, _| {
-            b.iter(|| cached.compute_all_scores().unwrap());
+            b.iter(|| cached.compute_all_path_diversities().unwrap());
         });
     }
     group.finish();
@@ -159,13 +159,13 @@ fn bench_cached_netflow_mesh(c: &mut Criterion) {
         let seed_pk = pubkeys[0].clone();
         let mut cached = CachedNetFlow::new(store, vec![seed_pk]).unwrap();
         let target = pubkeys[pubkeys.len() / 2].clone();
-        let _ = cached.compute_trust(&target).unwrap();
+        let _ = cached.compute_path_diversity(&target).unwrap();
 
         group.bench_with_input(
             BenchmarkId::new(format!("mesh_d{degree}"), n_agents),
             &n_agents,
             |b, _| {
-                b.iter(|| cached.compute_trust(&target).unwrap());
+                b.iter(|| cached.compute_path_diversity(&target).unwrap());
             },
         );
     }
