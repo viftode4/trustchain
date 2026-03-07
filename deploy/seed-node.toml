@@ -1,0 +1,12 @@
+# TrustChain seed node configuration — 5.161.255.238 (Hetzner VPS)
+
+key_path = "/var/lib/trustchain/identity.key"
+db_path = "/var/lib/trustchain/trustchain.db"
+
+quic_addr = "0.0.0.0:8200"
+grpc_addr = "0.0.0.0:8201"
+http_addr = "0.0.0.0:8202"
+proxy_addr = "0.0.0.0:8203"
+
+advertise_addr = "http://5.161.255.238:8202"
+log_level = "info"
