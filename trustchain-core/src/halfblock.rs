@@ -127,6 +127,11 @@ impl HalfBlock {
     pub fn is_checkpoint(&self) -> bool {
         self.block_type == "checkpoint"
     }
+
+    /// Check if this is an audit block (single-player, self-referencing).
+    pub fn is_audit(&self) -> bool {
+        self.block_type == "audit"
+    }
 }
 
 impl std::fmt::Display for HalfBlock {
@@ -254,8 +259,8 @@ pub fn validate_block_invariants(block: &HalfBlock) -> ValidationResult {
         errors.push("Linked public key is not valid".to_string());
     }
 
-    // 7. No self-signed blocks.
-    if block.public_key == block.link_public_key && !block.is_checkpoint() {
+    // 7. No self-signed blocks (checkpoints and audits are self-referencing by design).
+    if block.public_key == block.link_public_key && !block.is_checkpoint() && !block.is_audit() {
         errors.push("Self signed block".to_string());
     }
 

@@ -74,6 +74,8 @@ pub enum BlockType {
     Revocation,
     /// Identity succession (key rotation).
     Succession,
+    /// Single-player audit record (self-referencing, no counterparty).
+    Audit,
 }
 
 impl fmt::Display for BlockType {
@@ -85,6 +87,7 @@ impl fmt::Display for BlockType {
             BlockType::Delegation => write!(f, "delegation"),
             BlockType::Revocation => write!(f, "revocation"),
             BlockType::Succession => write!(f, "succession"),
+            BlockType::Audit => write!(f, "audit"),
         }
     }
 }
@@ -99,6 +102,7 @@ impl BlockType {
             "delegation" => Some(BlockType::Delegation),
             "revocation" => Some(BlockType::Revocation),
             "succession" => Some(BlockType::Succession),
+            "audit" => Some(BlockType::Audit),
             _ => None,
         }
     }
@@ -122,6 +126,7 @@ mod tests {
         assert_eq!(BlockType::Delegation.to_string(), "delegation");
         assert_eq!(BlockType::Revocation.to_string(), "revocation");
         assert_eq!(BlockType::Succession.to_string(), "succession");
+        assert_eq!(BlockType::Audit.to_string(), "audit");
     }
 
     #[test]
@@ -140,6 +145,9 @@ mod tests {
 
         let succession: BlockType = serde_json::from_str("\"succession\"").unwrap();
         assert_eq!(succession, BlockType::Succession);
+
+        let audit: BlockType = serde_json::from_str("\"audit\"").unwrap();
+        assert_eq!(audit, BlockType::Audit);
     }
 
     #[test]
@@ -168,6 +176,7 @@ mod tests {
             BlockType::from_str_loose("succession"),
             Some(BlockType::Succession)
         );
+        assert_eq!(BlockType::from_str_loose("AUDIT"), Some(BlockType::Audit));
         assert_eq!(BlockType::from_str_loose("invalid"), None);
     }
 

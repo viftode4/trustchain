@@ -198,6 +198,19 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+/// Request for audit endpoint (single-player mode).
+#[derive(Deserialize)]
+pub struct AuditRequest {
+    pub transaction: serde_json::Value,
+}
+
+/// Response for audit endpoint.
+#[derive(Serialize)]
+pub struct AuditResponse {
+    pub block: HalfBlock,
+    pub sequence_number: u64,
+}
+
 /// Response for trust score endpoint.
 #[derive(Serialize)]
 pub struct TrustScoreResponse {
@@ -213,6 +226,7 @@ pub struct TrustScoreResponse {
     pub path_diversity: f64,
     pub interaction_count: usize,
     pub block_count: usize,
+    pub audit_count: usize,
 }
 
 /// Request for delegation endpoint.
@@ -310,6 +324,7 @@ pub fn build_router<S: BlockStore + Send + 'static, D: DelegationStore + Send + 
         .route("/status", get(handle_status::<S, D>))
         .route("/healthz", get(handle_healthz::<S, D>))
         .route("/metrics", get(handle_metrics::<S, D>))
+        .route("/audit", post(handle_audit::<S, D>))
         .route("/propose", post(handle_propose::<S, D>))
         .route("/receive_proposal", post(handle_receive_proposal::<S, D>))
         .route("/receive_agreement", post(handle_receive_agreement::<S, D>))
@@ -374,6 +389,26 @@ async fn handle_status<S: BlockStore + 'static, D: DelegationStore + Send + 'sta
         agent_endpoint: state.agent_endpoint.clone(),
         name: state.agent_name.clone(),
         version: env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+async fn handle_audit<S: BlockStore + 'static, D: DelegationStore + Send + 'static>(
+    State(state): State<AppState<S, D>>,
+    Json(req): Json<AuditRequest>,
+) -> Result<Json<AuditResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let mut proto = state.protocol.lock().await;
+    let block = proto.create_audit(req.transaction, None).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+    let seq = block.sequence_number;
+    Ok(Json(AuditResponse {
+        block,
+        sequence_number: seq,
     }))
 }
 
@@ -839,6 +874,7 @@ async fn handle_trust_score<S: BlockStore + 'static, D: DelegationStore + Send +
         },
         interaction_count: evidence.interactions,
         block_count,
+        audit_count: evidence.audit_count,
     }))
 }
 

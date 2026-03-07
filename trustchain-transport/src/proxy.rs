@@ -206,6 +206,22 @@ async fn proxy_handler<S: BlockStore + 'static, D: DelegationStore + 'static>(
         }
     }
 
+    // 3b. If NOT a TC peer, record an audit block (single-player mode).
+    if peer.is_none() {
+        if let Some(ref auth) = authority {
+            let tx = serde_json::json!({
+                "audit": true,
+                "method": req.method().as_str(),
+                "path": req.uri().path(),
+                "destination": auth,
+            });
+            let mut proto = state.protocol.lock().await;
+            if let Err(e) = proto.create_audit(tx, None) {
+                log::warn!("audit block creation failed for {auth}: {e}");
+            }
+        }
+    }
+
     // 4. Compute trust info for response headers (best-effort).
     let trust_headers = if let Some(ref peer) = peer {
         compute_trust_headers(&state, peer).await

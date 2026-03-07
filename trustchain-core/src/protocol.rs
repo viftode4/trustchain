@@ -305,6 +305,39 @@ impl<S: BlockStore> TrustChainProtocol<S> {
     }
 
     // -----------------------------------------------------------------------
+    // AUDIT (single-player mode)
+    // -----------------------------------------------------------------------
+
+    /// Create an audit block — a self-referencing record with no counterparty.
+    ///
+    /// Audit blocks record interactions as a cryptographic audit trail even when
+    /// no TrustChain peer is available. They count for integrity and recency but
+    /// NOT for diversity or connectivity (self-attested, no Sybil resistance).
+    pub fn create_audit(
+        &mut self,
+        transaction: serde_json::Value,
+        timestamp: Option<u64>,
+    ) -> Result<HalfBlock> {
+        let pubkey = self.identity.pubkey_hex();
+        let seq = self.store.get_latest_seq(&pubkey)? + 1;
+        let prev_hash = self.store.get_head_hash(&pubkey)?;
+
+        let block = create_half_block(
+            &self.identity,
+            seq,
+            &pubkey, // self-referencing
+            0,       // no linked sequence
+            &prev_hash,
+            BlockType::Audit,
+            transaction,
+            timestamp,
+        );
+
+        self.store.add_block(&block)?;
+        Ok(block)
+    }
+
+    // -----------------------------------------------------------------------
     // Chain validation
     // -----------------------------------------------------------------------
 
@@ -1493,6 +1526,64 @@ mod tests {
         assert!(
             result.unwrap_err().to_string().contains("unrestricted"),
             "empty scope under restricted parent should be rejected as escalation"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Audit (single-player mode)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_audit_block() {
+        let alice = Identity::from_bytes(&[1u8; 32]);
+        let mut proto = TrustChainProtocol::new(alice.clone(), MemoryBlockStore::new());
+
+        let block = proto
+            .create_audit(serde_json::json!({"action": "test"}), Some(1000))
+            .unwrap();
+
+        assert_eq!(block.block_type, "audit");
+        assert_eq!(block.public_key, alice.pubkey_hex());
+        assert_eq!(block.link_public_key, alice.pubkey_hex());
+        assert_eq!(block.link_sequence_number, 0);
+        assert_eq!(block.sequence_number, 1);
+        assert!(block.verify().unwrap());
+    }
+
+    #[test]
+    fn test_audit_chain_integrity() {
+        let alice = Identity::from_bytes(&[1u8; 32]);
+        let mut proto = TrustChainProtocol::new(alice.clone(), MemoryBlockStore::new());
+
+        let b1 = proto
+            .create_audit(serde_json::json!({"action": "first"}), Some(1000))
+            .unwrap();
+        let b2 = proto
+            .create_audit(serde_json::json!({"action": "second"}), Some(1001))
+            .unwrap();
+
+        assert_eq!(b1.sequence_number, 1);
+        assert_eq!(b2.sequence_number, 2);
+        assert_eq!(b2.previous_hash, b1.block_hash);
+        assert!(proto.validate_chain(&alice.pubkey_hex()).unwrap());
+    }
+
+    #[test]
+    fn test_audit_self_referencing() {
+        let alice = Identity::from_bytes(&[1u8; 32]);
+        let mut proto = TrustChainProtocol::new(alice.clone(), MemoryBlockStore::new());
+
+        let block = proto
+            .create_audit(serde_json::json!({"audit": true}), Some(1000))
+            .unwrap();
+
+        // Self-referencing: link_public_key == public_key
+        assert_eq!(block.public_key, block.link_public_key);
+        // Should pass invariant validation (audit blocks are self-referencing by design).
+        let result = crate::halfblock::validate_block_invariants(&block);
+        assert!(
+            result.is_valid(),
+            "audit block should pass invariants: {result:?}"
         );
     }
 }

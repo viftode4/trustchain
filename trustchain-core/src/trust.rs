@@ -113,6 +113,8 @@ pub struct TrustEvidence {
     pub fraud: bool,
     /// Raw max-flow value from seed super-source to target.
     pub path_diversity: f64,
+    /// Number of audit blocks (single-player, self-referencing) in the chain.
+    pub audit_count: usize,
 }
 
 /// Pre-captured delegation context for trust computation.
@@ -348,6 +350,7 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
         let frauds = self.store.get_double_spends(pubkey)?;
         if !frauds.is_empty() {
             let chain = self.store.get_chain(pubkey)?;
+            let audit_count = chain.iter().filter(|b| b.is_audit()).count();
             return Ok(TrustEvidence {
                 trust_score: 0.0,
                 connectivity: 0.0,
@@ -358,6 +361,7 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                 interactions: chain.len(),
                 fraud: true,
                 path_diversity: 0.0,
+                audit_count,
             });
         }
 
@@ -366,6 +370,7 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
         let integrity = self.compute_chain_integrity(pubkey)?;
         let unique_peers = self.count_unique_peers(&filtered_chain);
         let interactions = filtered_chain.len();
+        let audit_count = filtered_chain.iter().filter(|b| b.is_audit()).count();
         let diversity = (unique_peers as f64 / self.config.diversity_threshold).min(1.0);
         let recency = self.compute_recency(&filtered_chain);
 
@@ -383,6 +388,7 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                         interactions,
                         fraud: false,
                         path_diversity: f64::INFINITY,
+                        audit_count,
                     });
                 }
 
@@ -401,6 +407,7 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                         interactions,
                         fraud: false,
                         path_diversity: path_div,
+                        audit_count,
                     });
                 }
 
@@ -417,6 +424,7 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                     interactions,
                     fraud: false,
                     path_diversity: path_div,
+                    audit_count,
                 });
             }
         }
@@ -433,6 +441,7 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
             interactions,
             fraud: false,
             path_diversity: 0.0,
+            audit_count,
         })
     }
 
@@ -514,6 +523,7 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                         interactions: root_evidence.interactions,
                         fraud: false,
                         path_diversity: root_evidence.path_diversity,
+                        audit_count: root_evidence.audit_count,
                     });
                 }
             }
@@ -530,6 +540,7 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                     interactions: 0,
                     fraud: false,
                     path_diversity: 0.0,
+                    audit_count: 0,
                 });
             }
 
@@ -547,6 +558,7 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                         interactions: 0,
                         fraud: true,
                         path_diversity: 0.0,
+                        audit_count: 0,
                     });
                 }
             }
