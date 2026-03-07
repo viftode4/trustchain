@@ -9,6 +9,8 @@ use std::collections::HashSet;
 use crate::blockstore::BlockStore;
 use crate::delegation::{DelegationRecord, DelegationStore};
 use crate::error::Result;
+#[cfg(feature = "meritrank")]
+use crate::meritrank::MeritRankTrust;
 use crate::netflow::{CachedNetFlow, NetFlowTrust};
 use crate::types::GENESIS_HASH;
 
@@ -18,18 +20,58 @@ pub const DEFAULT_CONNECTIVITY_THRESHOLD: f64 = 3.0;
 /// Default diversity threshold M: unique_peers / M, capped at 1.0.
 pub const DEFAULT_DIVERSITY_THRESHOLD: f64 = 5.0;
 
+/// Default recency decay factor λ: last ~20 interactions dominate.
+pub const DEFAULT_RECENCY_LAMBDA: f64 = 0.95;
+
+/// Trust computation algorithm selection.
+#[derive(Debug, Clone)]
+pub enum TrustAlgorithm {
+    /// Max-flow from seeds.
+    NetFlow,
+    /// Personalized random walks (MeritRank) — bounded Sybil resistance.
+    #[cfg(feature = "meritrank")]
+    MeritRank {
+        /// Number of random walks per computation.
+        num_walks: usize,
+    },
+}
+
+impl Default for TrustAlgorithm {
+    fn default() -> Self {
+        #[cfg(feature = "meritrank")]
+        {
+            TrustAlgorithm::MeritRank { num_walks: 10000 }
+        }
+        #[cfg(not(feature = "meritrank"))]
+        {
+            TrustAlgorithm::NetFlow
+        }
+    }
+}
+
 /// Configuration for the multiplicative trust model.
 ///
-/// Trust = connectivity × integrity × diversity
+/// Trust = connectivity × integrity × diversity × recency
 /// - **connectivity** = min(path_diversity / K, 1.0)
 /// - **integrity** = chain_integrity (fraction of valid blocks)
 /// - **diversity** = min(unique_peers / M, 1.0)
+/// - **recency** = exponential-decay-weighted outcome quality
 #[derive(Debug, Clone)]
 pub struct TrustConfig {
     /// K: number of independent paths needed for full connectivity score.
     pub connectivity_threshold: f64,
     /// M: number of unique peers needed for full diversity score.
     pub diversity_threshold: f64,
+    /// Which algorithm to use for connectivity computation.
+    pub algorithm: TrustAlgorithm,
+    /// λ: exponential decay factor for recency (0 < λ < 1). Default 0.95.
+    /// Last ~20 interactions dominate when λ=0.95.
+    pub recency_lambda: f64,
+    /// Number of direct interactions before delegation trust is fully replaced
+    /// by direct trust (cold start blending). Default 5.
+    pub cold_start_threshold: usize,
+    /// Trust budget factor applied to delegation-based trust. Default 0.8.
+    pub delegation_factor: f64,
 }
 
 impl Default for TrustConfig {
@@ -37,6 +79,10 @@ impl Default for TrustConfig {
         Self {
             connectivity_threshold: DEFAULT_CONNECTIVITY_THRESHOLD,
             diversity_threshold: DEFAULT_DIVERSITY_THRESHOLD,
+            algorithm: TrustAlgorithm::default(),
+            recency_lambda: DEFAULT_RECENCY_LAMBDA,
+            cold_start_threshold: 5,
+            delegation_factor: 0.8,
         }
     }
 }
@@ -57,6 +103,8 @@ pub struct TrustEvidence {
     pub integrity: f64,
     /// diversity = min(unique_peers / M, 1.0).
     pub diversity: f64,
+    /// Recency: exponential-decay-weighted outcome quality [0.0, 1.0].
+    pub recency: f64,
     /// Number of distinct peers in the target's chain.
     pub unique_peers: usize,
     /// Total interactions (blocks) in the target's chain.
@@ -83,6 +131,8 @@ pub struct DelegationContext {
     pub root_pubkey: Option<String>,
     /// Active delegation count at the root delegator level (for budget split).
     pub root_active_delegation_count: usize,
+    /// Delegation depth (number of hops from root to this delegate).
+    pub depth: usize,
 }
 
 impl DelegationContext {
@@ -102,14 +152,16 @@ impl DelegationContext {
         let was_delegate = ds.is_delegate(pubkey)?;
 
         // Walk to root delegator if this is an active delegate
-        let (root_pubkey, root_active_delegation_count) =
+        let (root_pubkey, root_active_delegation_count, depth) =
             if let Some(ref delegation) = active_delegation {
                 let mut root = delegation.delegator_pubkey.clone();
                 let mut current = delegation.clone();
+                let mut depth = 1usize;
                 while let Some(ref parent_id) = current.parent_delegation_id {
                     if let Ok(Some(parent)) = ds.get_delegation(parent_id) {
                         root = parent.delegator_pubkey.clone();
                         current = parent;
+                        depth += 1;
                     } else {
                         break;
                     }
@@ -120,9 +172,9 @@ impl DelegationContext {
                     .filter(|d| d.is_active(now_ms))
                     .count()
                     .max(1);
-                (Some(root), active_count)
+                (Some(root), active_count, depth)
             } else {
-                (None, 0)
+                (None, 0, 0)
             };
 
         // Get delegations where this pubkey is delegator (for fraud propagation)
@@ -134,6 +186,7 @@ impl DelegationContext {
             delegations_as_delegator,
             root_pubkey,
             root_active_delegation_count,
+            depth,
         })
     }
 }
@@ -176,28 +229,31 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
 
     /// Compute the blended trust score for an agent.
     ///
-    /// Delegation-aware:
-    /// - If the pubkey is an active delegate, trust is derived from the root delegator
-    ///   with a budget split across active delegations.
-    /// - If the pubkey was a delegate but the delegation is no longer active, returns 0.0.
-    /// - If any delegate (active or revoked) of this pubkey committed fraud, returns 0.0.
+    /// Delegation-aware with cold start blending:
+    /// - Active delegates blend delegation trust with direct trust as interactions accumulate.
+    /// - Expired delegates get 0.0.
+    /// - Delegate fraud propagates to delegator.
     ///
     /// Standard (non-delegated):
-    /// Score = `w_integrity * integrity + w_netflow * netflow`.
-    /// If netflow is unavailable (no seed nodes), only integrity is used.
+    /// Trust = connectivity × integrity × diversity × recency (4-factor multiplicative).
+    /// If netflow is unavailable (no seed nodes), only integrity × recency is used.
     /// Returns hard zero for agents with proven double-spend fraud.
     pub fn compute_trust(&self, pubkey: &str) -> Result<f64> {
+        self.compute_trust_ctx(pubkey, None)
+    }
+
+    /// Compute trust with optional context filter.
+    ///
+    /// When `context` is `Some`, recency and diversity are computed over the
+    /// context-filtered chain only. Connectivity (Sybil resistance) always uses
+    /// the full graph.
+    pub fn compute_trust_ctx(&self, pubkey: &str, context: Option<&str>) -> Result<f64> {
         // Check delegation context
         if let Some(ref ctx) = self.delegation_ctx {
             // Is this an active delegated identity?
             if let Some(ref _delegation) = ctx.active_delegation {
                 if let Some(ref root_pubkey) = ctx.root_pubkey {
-                    // Compute root's trust
-                    let root_trust = self.compute_standard_trust(root_pubkey)?;
-                    // Budget split
-                    let active_count = ctx.root_active_delegation_count.max(1);
-                    let effective = root_trust / active_count as f64;
-                    return Ok(effective.clamp(0.0, 1.0));
+                    return self.compute_delegated_trust_blended(pubkey, root_pubkey, ctx, context);
                 }
             }
 
@@ -215,21 +271,79 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
             }
         }
 
-        self.compute_standard_trust(pubkey)
+        self.compute_standard_trust(pubkey, context)
+    }
+
+    /// Cold start blending for delegated identities.
+    ///
+    /// Blends delegation-based trust with emerging direct trust as interactions
+    /// accumulate. Once `cold_start_threshold` interactions are reached, direct
+    /// trust is used exclusively.
+    fn compute_delegated_trust_blended(
+        &self,
+        pubkey: &str,
+        root_pubkey: &str,
+        ctx: &DelegationContext,
+        context: Option<&str>,
+    ) -> Result<f64> {
+        let chain = self.get_chain_for_context(pubkey, context)?;
+        let direct_interactions = chain.len();
+
+        // Compute delegated trust: root_trust * delegation_factor / active_count
+        let root_trust = self.compute_standard_trust(root_pubkey, context)?;
+        let active_count = ctx.root_active_delegation_count.max(1);
+        let depth_factor = if ctx.depth > 1 {
+            self.config.delegation_factor.powi(ctx.depth as i32 - 1)
+        } else {
+            1.0
+        };
+        let delegated =
+            (root_trust * self.config.delegation_factor * depth_factor) / active_count as f64;
+
+        if direct_interactions >= self.config.cold_start_threshold {
+            // Enough history — use direct trust only
+            return self.compute_standard_trust(pubkey, context);
+        }
+
+        // Blend: shift weight from delegation trust to direct trust
+        let blend = direct_interactions as f64 / self.config.cold_start_threshold.max(1) as f64;
+        let direct = if direct_interactions > 0 {
+            self.compute_standard_trust(pubkey, context)?
+        } else {
+            0.0
+        };
+        let blended = delegated * (1.0 - blend) + direct * blend;
+        Ok(blended.clamp(0.0, 1.0))
     }
 
     /// Standard trust computation (non-delegated path).
     ///
-    /// Trust = connectivity × integrity × diversity (multiplicative model).
-    /// When seed nodes are configured, path_diversity (max-flow) is used for
-    /// the connectivity factor. When no seeds are configured, connectivity=1.0.
-    fn compute_standard_trust(&self, pubkey: &str) -> Result<f64> {
-        let evidence = self.compute_standard_trust_evidence(pubkey)?;
+    /// Trust = connectivity × integrity × diversity × recency (4-factor multiplicative).
+    /// When seed nodes are configured, path_diversity is used for connectivity.
+    /// When no seeds are configured, connectivity=1.0, diversity=1.0.
+    fn compute_standard_trust(&self, pubkey: &str, context: Option<&str>) -> Result<f64> {
+        let evidence = self.compute_standard_trust_evidence(pubkey, context)?;
         Ok(evidence.trust_score)
     }
 
+    /// Get the chain filtered by context, or the full chain if no context.
+    fn get_chain_for_context(
+        &self,
+        pubkey: &str,
+        context: Option<&str>,
+    ) -> Result<Vec<crate::halfblock::HalfBlock>> {
+        match context {
+            Some(ctx) => self.store.get_chain_by_context(pubkey, ctx),
+            None => self.store.get_chain(pubkey),
+        }
+    }
+
     /// Compute trust with full evidence bundle for the standard (non-delegated) path.
-    fn compute_standard_trust_evidence(&self, pubkey: &str) -> Result<TrustEvidence> {
+    fn compute_standard_trust_evidence(
+        &self,
+        pubkey: &str,
+        context: Option<&str>,
+    ) -> Result<TrustEvidence> {
         // Hard zero for proven fraud.
         let frauds = self.store.get_double_spends(pubkey)?;
         if !frauds.is_empty() {
@@ -239,6 +353,7 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                 connectivity: 0.0,
                 integrity: 0.0,
                 diversity: 0.0,
+                recency: 0.0,
                 unique_peers: self.count_unique_peers(&chain),
                 interactions: chain.len(),
                 fraud: true,
@@ -246,11 +361,13 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
             });
         }
 
-        let chain = self.store.get_chain(pubkey)?;
+        // Use context-filtered chain for recency and diversity.
+        let filtered_chain = self.get_chain_for_context(pubkey, context)?;
         let integrity = self.compute_chain_integrity(pubkey)?;
-        let unique_peers = self.count_unique_peers(&chain);
-        let interactions = chain.len();
+        let unique_peers = self.count_unique_peers(&filtered_chain);
+        let interactions = filtered_chain.len();
         let diversity = (unique_peers as f64 / self.config.diversity_threshold).min(1.0);
+        let recency = self.compute_recency(&filtered_chain);
 
         if let Some(ref seeds) = self.seed_nodes {
             if !seeds.is_empty() {
@@ -261,6 +378,7 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                         connectivity: 1.0,
                         integrity: 1.0,
                         diversity: 1.0,
+                        recency: 1.0,
                         unique_peers,
                         interactions,
                         fraud: false,
@@ -268,6 +386,7 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                     });
                 }
 
+                // Connectivity always uses full graph (context-independent).
                 let path_div = self.compute_path_diversity_score(pubkey)?;
 
                 // Sybil gate: no path from seeds → zero trust.
@@ -277,6 +396,7 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                         connectivity: 0.0,
                         integrity,
                         diversity,
+                        recency,
                         unique_peers,
                         interactions,
                         fraud: false,
@@ -285,13 +405,14 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                 }
 
                 let connectivity = (path_div / self.config.connectivity_threshold).min(1.0);
-                let trust_score = (connectivity * integrity * diversity).clamp(0.0, 1.0);
+                let trust_score = (connectivity * integrity * diversity * recency).clamp(0.0, 1.0);
 
                 return Ok(TrustEvidence {
                     trust_score,
                     connectivity,
                     integrity,
                     diversity,
+                    recency,
                     unique_peers,
                     interactions,
                     fraud: false,
@@ -300,18 +421,55 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
             }
         }
 
-        // No seeds configured — no Sybil resistance, use integrity only.
+        // No seeds configured — no Sybil resistance, use integrity × recency only.
         // Connectivity and diversity default to 1.0 since there's no topology to measure.
         Ok(TrustEvidence {
-            trust_score: integrity,
+            trust_score: (integrity * recency).clamp(0.0, 1.0),
             connectivity: 1.0,
             integrity,
             diversity: 1.0,
+            recency,
             unique_peers,
             interactions,
             fraud: false,
             path_diversity: 0.0,
         })
+    }
+
+    /// Compute recency: exponential-decay-weighted outcome quality.
+    ///
+    /// recency = Σ(λ^(n-1-k) × outcome_k) / Σ(λ^(n-1-k))
+    /// Empty chain → 1.0 (no penalty for no data).
+    fn compute_recency(&self, chain: &[crate::halfblock::HalfBlock]) -> f64 {
+        if chain.is_empty() {
+            return 1.0;
+        }
+        let lambda = self.config.recency_lambda;
+        let n = chain.len();
+        let mut weighted_sum = 0.0;
+        let mut weight_total = 0.0;
+        for (k, block) in chain.iter().enumerate() {
+            let weight = lambda.powi((n - 1 - k) as i32);
+            let outcome = Self::extract_outcome(&block.transaction);
+            weighted_sum += weight * outcome;
+            weight_total += weight;
+        }
+        if weight_total < 1e-10 {
+            return 1.0;
+        }
+        (weighted_sum / weight_total).clamp(0.0, 1.0)
+    }
+
+    /// Extract outcome from a block's transaction data.
+    ///
+    /// "completed" / "success" → 1.0, "failed" / "error" → 0.0.
+    /// Missing or unknown → 1.0 (backward compat: assume success).
+    fn extract_outcome(transaction: &serde_json::Value) -> f64 {
+        match transaction.get("outcome").and_then(|v| v.as_str()) {
+            Some("completed") | Some("success") => 1.0,
+            Some("failed") | Some("error") => 0.0,
+            _ => 1.0, // backward compat: unknown = success
+        }
     }
 
     /// Count unique peers (distinct link_public_keys) in a chain.
@@ -327,20 +485,31 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
 
     /// Compute trust with full evidence bundle (delegation-aware).
     pub fn compute_trust_with_evidence(&self, pubkey: &str) -> Result<TrustEvidence> {
+        self.compute_trust_with_evidence_ctx(pubkey, None)
+    }
+
+    /// Compute trust with full evidence bundle and optional context filter.
+    pub fn compute_trust_with_evidence_ctx(
+        &self,
+        pubkey: &str,
+        context: Option<&str>,
+    ) -> Result<TrustEvidence> {
         // Check delegation context
         if let Some(ref ctx) = self.delegation_ctx {
             // Is this an active delegated identity?
             if let Some(ref _delegation) = ctx.active_delegation {
                 if let Some(ref root_pubkey) = ctx.root_pubkey {
-                    let root_evidence = self.compute_standard_trust_evidence(root_pubkey)?;
-                    let active_count = ctx.root_active_delegation_count.max(1);
-                    let effective =
-                        (root_evidence.trust_score / active_count as f64).clamp(0.0, 1.0);
+                    let root_evidence =
+                        self.compute_standard_trust_evidence(root_pubkey, context)?;
+                    // Use cold start blending for the score
+                    let blended_score =
+                        self.compute_delegated_trust_blended(pubkey, root_pubkey, ctx, context)?;
                     return Ok(TrustEvidence {
-                        trust_score: effective,
+                        trust_score: blended_score,
                         connectivity: root_evidence.connectivity,
                         integrity: root_evidence.integrity,
                         diversity: root_evidence.diversity,
+                        recency: root_evidence.recency,
                         unique_peers: root_evidence.unique_peers,
                         interactions: root_evidence.interactions,
                         fraud: false,
@@ -356,6 +525,7 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                     connectivity: 0.0,
                     integrity: 0.0,
                     diversity: 0.0,
+                    recency: 0.0,
                     unique_peers: 0,
                     interactions: 0,
                     fraud: false,
@@ -372,6 +542,7 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                         connectivity: 0.0,
                         integrity: 0.0,
                         diversity: 0.0,
+                        recency: 0.0,
                         unique_peers: 0,
                         interactions: 0,
                         fraud: true,
@@ -381,7 +552,7 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
             }
         }
 
-        self.compute_standard_trust_evidence(pubkey)
+        self.compute_standard_trust_evidence(pubkey, context)
     }
 
     /// Compute chain integrity score (fraction of valid blocks from start).
@@ -433,13 +604,20 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
         Ok(1.0)
     }
 
-    /// Compute the raw path diversity (max-flow) for Sybil resistance.
+    /// Compute the raw path diversity (max-flow or MeritRank) for Sybil resistance.
     pub fn compute_path_diversity_score(&self, pubkey: &str) -> Result<f64> {
         match &self.seed_nodes {
-            Some(seeds) if !seeds.is_empty() => {
-                let nf = NetFlowTrust::new(self.store, seeds.clone())?;
-                nf.compute_path_diversity(pubkey)
-            }
+            Some(seeds) if !seeds.is_empty() => match &self.config.algorithm {
+                TrustAlgorithm::NetFlow => {
+                    let nf = NetFlowTrust::new(self.store, seeds.clone())?;
+                    nf.compute_path_diversity(pubkey)
+                }
+                #[cfg(feature = "meritrank")]
+                TrustAlgorithm::MeritRank { num_walks } => {
+                    let mr = MeritRankTrust::new(self.store, seeds.clone(), Some(*num_walks))?;
+                    mr.compute_path_diversity(pubkey)
+                }
+            },
             _ => Ok(0.0),
         }
     }
@@ -871,14 +1049,17 @@ mod tests {
             delegations_as_delegator: vec![],
             root_pubkey: Some(root.pubkey_hex()),
             root_active_delegation_count: 2,
+            depth: 1,
         };
 
         let engine = TrustEngine::new(&store, None, None, Some(ctx));
         let delegate_trust = engine.compute_trust(&delegate1.pubkey_hex()).unwrap();
-        let expected = root_trust / 2.0;
+        // Cold start: 0 direct interactions → pure delegation trust
+        // delegated = root_trust * delegation_factor / active_count
+        let expected = root_trust * 0.8 / 2.0;
         assert!(
-            (delegate_trust - expected).abs() < 1e-10,
-            "delegate trust {delegate_trust} should be ~root/2 = {expected}"
+            (delegate_trust - expected).abs() < 1e-6,
+            "delegate trust {delegate_trust} should be ~root*0.8/2 = {expected}"
         );
     }
 
@@ -894,6 +1075,7 @@ mod tests {
             delegations_as_delegator: vec![],
             root_pubkey: None,
             root_active_delegation_count: 0,
+            depth: 0,
         };
 
         let engine = TrustEngine::new(&store, None, None, Some(ctx));
@@ -964,6 +1146,7 @@ mod tests {
             delegations_as_delegator: vec![deleg_record],
             root_pubkey: None,
             root_active_delegation_count: 0,
+            depth: 0,
         };
 
         let engine = TrustEngine::new(&store, None, None, Some(ctx));
@@ -1072,6 +1255,7 @@ mod tests {
         assert!(evidence.connectivity > 0.0);
         assert!((evidence.integrity - 1.0).abs() < 1e-10);
         assert!(evidence.diversity > 0.0);
+        assert!(evidence.recency > 0.0);
         assert!(evidence.unique_peers >= 1);
         assert!(!evidence.fraud);
         assert!(evidence.path_diversity > 0.0);
@@ -1156,6 +1340,710 @@ mod tests {
         assert!(
             (integrity - 0.5).abs() < 1e-10,
             "integrity should be 0.5 with sequence gap, got {integrity}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 1: Recency tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create interaction with a specific outcome in the transaction.
+    #[allow(clippy::too_many_arguments)]
+    fn create_interaction_with_outcome(
+        store: &mut MemoryBlockStore,
+        alice: &Identity,
+        bob: &Identity,
+        alice_seq: u64,
+        bob_seq: u64,
+        alice_prev: &str,
+        bob_prev: &str,
+        ts: u64,
+        outcome: &str,
+    ) -> (String, String) {
+        let proposal = create_half_block(
+            alice,
+            alice_seq,
+            &bob.pubkey_hex(),
+            0,
+            alice_prev,
+            BlockType::Proposal,
+            serde_json::json!({"service": "test", "outcome": outcome}),
+            Some(ts),
+        );
+        store.add_block(&proposal).unwrap();
+
+        let agreement = create_half_block(
+            bob,
+            bob_seq,
+            &alice.pubkey_hex(),
+            alice_seq,
+            bob_prev,
+            BlockType::Agreement,
+            serde_json::json!({"service": "test", "outcome": outcome}),
+            Some(ts + 1),
+        );
+        store.add_block(&agreement).unwrap();
+
+        (proposal.block_hash, agreement.block_hash)
+    }
+
+    #[test]
+    fn test_recency_all_success() {
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[1u8; 32]);
+        let peer = Identity::from_bytes(&[2u8; 32]);
+
+        let (p1, _) = create_interaction_with_outcome(
+            &mut store,
+            &agent,
+            &peer,
+            1,
+            1,
+            GENESIS_HASH,
+            GENESIS_HASH,
+            1000,
+            "completed",
+        );
+        create_interaction_with_outcome(
+            &mut store,
+            &agent,
+            &peer,
+            2,
+            2,
+            &p1,
+            GENESIS_HASH,
+            2000,
+            "completed",
+        );
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine
+            .compute_trust_with_evidence(&agent.pubkey_hex())
+            .unwrap();
+        assert!(
+            (evidence.recency - 1.0).abs() < 1e-6,
+            "all successes should give recency ≈ 1.0, got {}",
+            evidence.recency
+        );
+    }
+
+    #[test]
+    fn test_recency_all_failures() {
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[1u8; 32]);
+        let peer = Identity::from_bytes(&[2u8; 32]);
+
+        let (p1, _) = create_interaction_with_outcome(
+            &mut store,
+            &agent,
+            &peer,
+            1,
+            1,
+            GENESIS_HASH,
+            GENESIS_HASH,
+            1000,
+            "failed",
+        );
+        create_interaction_with_outcome(
+            &mut store,
+            &agent,
+            &peer,
+            2,
+            2,
+            &p1,
+            GENESIS_HASH,
+            2000,
+            "failed",
+        );
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine
+            .compute_trust_with_evidence(&agent.pubkey_hex())
+            .unwrap();
+        assert!(
+            evidence.recency < 1e-6,
+            "all failures should give recency ≈ 0.0, got {}",
+            evidence.recency
+        );
+    }
+
+    #[test]
+    fn test_recency_recent_success_after_old_failures() {
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[1u8; 32]);
+        let peer = Identity::from_bytes(&[2u8; 32]);
+
+        // Build a chain: old failures then recent successes
+        let mut prev = GENESIS_HASH.to_string();
+        let mut bob_seq = 0u64;
+        for seq in 1..=5 {
+            bob_seq += 1;
+            let (p, _) = create_interaction_with_outcome(
+                &mut store,
+                &agent,
+                &peer,
+                seq,
+                bob_seq,
+                &prev,
+                GENESIS_HASH,
+                1000 * seq,
+                "failed",
+            );
+            prev = p;
+        }
+        for seq in 6..=10 {
+            bob_seq += 1;
+            let (p, _) = create_interaction_with_outcome(
+                &mut store,
+                &agent,
+                &peer,
+                seq,
+                bob_seq,
+                &prev,
+                GENESIS_HASH,
+                1000 * seq,
+                "completed",
+            );
+            prev = p;
+        }
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine
+            .compute_trust_with_evidence(&agent.pubkey_hex())
+            .unwrap();
+        // Recent successes should dominate → recency > 0.5
+        assert!(
+            evidence.recency > 0.5,
+            "recent successes should give recency > 0.5, got {}",
+            evidence.recency
+        );
+    }
+
+    #[test]
+    fn test_recency_no_outcome_backward_compat() {
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[1u8; 32]);
+        let peer = Identity::from_bytes(&[2u8; 32]);
+
+        // Standard create_interaction has no "outcome" field → default 1.0
+        create_interaction(
+            &mut store,
+            &agent,
+            &peer,
+            1,
+            1,
+            GENESIS_HASH,
+            GENESIS_HASH,
+            1000,
+        );
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine
+            .compute_trust_with_evidence(&agent.pubkey_hex())
+            .unwrap();
+        assert!(
+            (evidence.recency - 1.0).abs() < 1e-6,
+            "no outcome field should give recency = 1.0, got {}",
+            evidence.recency
+        );
+    }
+
+    #[test]
+    fn test_recency_empty_chain() {
+        let store = MemoryBlockStore::new();
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine.compute_trust_with_evidence("unknown").unwrap();
+        assert!(
+            (evidence.recency - 1.0).abs() < 1e-6,
+            "empty chain should give recency = 1.0, got {}",
+            evidence.recency
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 1B: MeritRank default
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_default_algorithm_is_meritrank() {
+        let algo = TrustAlgorithm::default();
+        #[cfg(feature = "meritrank")]
+        assert!(
+            matches!(algo, TrustAlgorithm::MeritRank { .. }),
+            "default should be MeritRank when feature enabled"
+        );
+        #[cfg(not(feature = "meritrank"))]
+        assert!(
+            matches!(algo, TrustAlgorithm::NetFlow),
+            "default should be NetFlow when meritrank disabled"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: Context-scoped trust
+    // -----------------------------------------------------------------------
+
+    /// Helper: create interaction with a specific interaction_type.
+    #[allow(clippy::too_many_arguments)]
+    fn create_interaction_with_type(
+        store: &mut MemoryBlockStore,
+        alice: &Identity,
+        bob: &Identity,
+        alice_seq: u64,
+        bob_seq: u64,
+        alice_prev: &str,
+        bob_prev: &str,
+        ts: u64,
+        interaction_type: &str,
+        outcome: &str,
+    ) -> (String, String) {
+        let proposal = create_half_block(
+            alice,
+            alice_seq,
+            &bob.pubkey_hex(),
+            0,
+            alice_prev,
+            BlockType::Proposal,
+            serde_json::json!({
+                "service": "test",
+                "interaction_type": interaction_type,
+                "outcome": outcome,
+            }),
+            Some(ts),
+        );
+        store.add_block(&proposal).unwrap();
+
+        let agreement = create_half_block(
+            bob,
+            bob_seq,
+            &alice.pubkey_hex(),
+            alice_seq,
+            bob_prev,
+            BlockType::Agreement,
+            serde_json::json!({
+                "service": "test",
+                "interaction_type": interaction_type,
+                "outcome": outcome,
+            }),
+            Some(ts + 1),
+        );
+        store.add_block(&agreement).unwrap();
+
+        (proposal.block_hash, agreement.block_hash)
+    }
+
+    #[test]
+    fn test_context_different_scores() {
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[1u8; 32]);
+        let peer = Identity::from_bytes(&[2u8; 32]);
+
+        // 3 successful code_execution interactions
+        let mut prev = GENESIS_HASH.to_string();
+        let mut bob_seq = 0u64;
+        for seq in 1..=3 {
+            bob_seq += 1;
+            let (p, _) = create_interaction_with_type(
+                &mut store,
+                &agent,
+                &peer,
+                seq,
+                bob_seq,
+                &prev,
+                GENESIS_HASH,
+                1000 * seq,
+                "code_execution",
+                "completed",
+            );
+            prev = p;
+        }
+        // 3 failed data_retrieval interactions
+        for seq in 4..=6 {
+            bob_seq += 1;
+            let (p, _) = create_interaction_with_type(
+                &mut store,
+                &agent,
+                &peer,
+                seq,
+                bob_seq,
+                &prev,
+                GENESIS_HASH,
+                1000 * seq,
+                "data_retrieval",
+                "failed",
+            );
+            prev = p;
+        }
+
+        let engine = TrustEngine::new(&store, None, None, None);
+
+        let ev_code = engine
+            .compute_trust_with_evidence_ctx(&agent.pubkey_hex(), Some("code_execution"))
+            .unwrap();
+        let ev_data = engine
+            .compute_trust_with_evidence_ctx(&agent.pubkey_hex(), Some("data_retrieval"))
+            .unwrap();
+
+        // Code execution: all successes → high recency
+        assert!(
+            ev_code.recency > 0.9,
+            "code_execution recency should be ~1.0, got {}",
+            ev_code.recency
+        );
+        // Data retrieval: all failures → low recency
+        assert!(
+            ev_data.recency < 0.1,
+            "data_retrieval recency should be ~0.0, got {}",
+            ev_data.recency
+        );
+    }
+
+    #[test]
+    fn test_context_prefix_matching() {
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[1u8; 32]);
+        let peer = Identity::from_bytes(&[2u8; 32]);
+
+        let (p1, _) = create_interaction_with_type(
+            &mut store,
+            &agent,
+            &peer,
+            1,
+            1,
+            GENESIS_HASH,
+            GENESIS_HASH,
+            1000,
+            "tool:web_search",
+            "completed",
+        );
+        create_interaction_with_type(
+            &mut store,
+            &agent,
+            &peer,
+            2,
+            2,
+            &p1,
+            GENESIS_HASH,
+            2000,
+            "tool:code_exec",
+            "completed",
+        );
+
+        let engine = TrustEngine::new(&store, None, None, None);
+
+        // Context "tool" should match both "tool:web_search" and "tool:code_exec"
+        let ev_tool = engine
+            .compute_trust_with_evidence_ctx(&agent.pubkey_hex(), Some("tool"))
+            .unwrap();
+        assert_eq!(
+            ev_tool.interactions, 2,
+            "tool context should match 2 interactions via prefix"
+        );
+    }
+
+    #[test]
+    fn test_no_context_backward_compat() {
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[1u8; 32]);
+        let peer = Identity::from_bytes(&[2u8; 32]);
+
+        create_interaction(
+            &mut store,
+            &agent,
+            &peer,
+            1,
+            1,
+            GENESIS_HASH,
+            GENESIS_HASH,
+            1000,
+        );
+
+        let engine = TrustEngine::new(&store, None, None, None);
+
+        let ev_none = engine
+            .compute_trust_with_evidence(&agent.pubkey_hex())
+            .unwrap();
+        let ev_ctx = engine
+            .compute_trust_with_evidence_ctx(&agent.pubkey_hex(), None)
+            .unwrap();
+
+        assert!(
+            (ev_none.trust_score - ev_ctx.trust_score).abs() < 1e-10,
+            "None context should equal no-context: {} vs {}",
+            ev_none.trust_score,
+            ev_ctx.trust_score
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3: Cold start delegation blending
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cold_start_zero_interactions_gets_delegated_trust() {
+        let mut store = MemoryBlockStore::new();
+        let root = Identity::from_bytes(&[1u8; 32]);
+        let delegate = Identity::from_bytes(&[2u8; 32]);
+        let peer = Identity::from_bytes(&[3u8; 32]);
+
+        // Give root some trust
+        create_interaction(
+            &mut store,
+            &root,
+            &peer,
+            1,
+            1,
+            GENESIS_HASH,
+            GENESIS_HASH,
+            1000,
+        );
+
+        let engine_root = TrustEngine::new(&store, None, None, None);
+        let root_trust = engine_root.compute_trust(&root.pubkey_hex()).unwrap();
+
+        let deleg = crate::delegation::DelegationRecord {
+            delegation_id: "d1".to_string(),
+            delegator_pubkey: root.pubkey_hex(),
+            delegate_pubkey: delegate.pubkey_hex(),
+            scope: vec![],
+            max_depth: 1,
+            issued_at: 1000,
+            expires_at: 999999,
+            delegation_block_hash: "aa".repeat(32),
+            agreement_block_hash: None,
+            parent_delegation_id: None,
+            revoked: false,
+            revocation_block_hash: None,
+        };
+        let ctx = DelegationContext {
+            active_delegation: Some(deleg),
+            was_delegate: true,
+            delegations_as_delegator: vec![],
+            root_pubkey: Some(root.pubkey_hex()),
+            root_active_delegation_count: 1,
+            depth: 1,
+        };
+
+        let engine = TrustEngine::new(&store, None, None, Some(ctx));
+        let trust = engine.compute_trust(&delegate.pubkey_hex()).unwrap();
+        // 0 interactions → pure delegation: root_trust * 0.8 / 1
+        let expected = root_trust * 0.8;
+        assert!(
+            (trust - expected).abs() < 1e-6,
+            "zero interactions should give delegated trust: {trust} vs {expected}"
+        );
+        assert!(trust > 0.0);
+    }
+
+    #[test]
+    fn test_cold_start_blending_partial() {
+        let mut store = MemoryBlockStore::new();
+        let root = Identity::from_bytes(&[1u8; 32]);
+        let delegate = Identity::from_bytes(&[2u8; 32]);
+        let peer = Identity::from_bytes(&[3u8; 32]);
+
+        // Give root some trust
+        create_interaction(
+            &mut store,
+            &root,
+            &peer,
+            1,
+            1,
+            GENESIS_HASH,
+            GENESIS_HASH,
+            1000,
+        );
+
+        // Give delegate 3 direct interactions (below threshold of 5)
+        let mut prev = GENESIS_HASH.to_string();
+        let mut bob_seq = 1u64; // peer already used seq 1 with root
+        for seq in 1..=3u64 {
+            bob_seq += 1;
+            let (p, _) = create_interaction(
+                &mut store,
+                &delegate,
+                &peer,
+                seq,
+                bob_seq,
+                &prev,
+                GENESIS_HASH,
+                2000 + seq,
+            );
+            prev = p;
+        }
+
+        let deleg = crate::delegation::DelegationRecord {
+            delegation_id: "d1".to_string(),
+            delegator_pubkey: root.pubkey_hex(),
+            delegate_pubkey: delegate.pubkey_hex(),
+            scope: vec![],
+            max_depth: 1,
+            issued_at: 1000,
+            expires_at: 999999,
+            delegation_block_hash: "aa".repeat(32),
+            agreement_block_hash: None,
+            parent_delegation_id: None,
+            revoked: false,
+            revocation_block_hash: None,
+        };
+        let ctx = DelegationContext {
+            active_delegation: Some(deleg),
+            was_delegate: true,
+            delegations_as_delegator: vec![],
+            root_pubkey: Some(root.pubkey_hex()),
+            root_active_delegation_count: 1,
+            depth: 1,
+        };
+
+        let engine = TrustEngine::new(&store, None, None, Some(ctx));
+        let trust = engine.compute_trust(&delegate.pubkey_hex()).unwrap();
+        // With 3 interactions (threshold=5), blend = 0.6 direct + 0.4 delegated
+        // Score should be between pure delegation and pure direct
+        assert!(trust > 0.0, "blended trust should be positive: {trust}");
+    }
+
+    #[test]
+    fn test_cold_start_above_threshold_uses_direct() {
+        let mut store = MemoryBlockStore::new();
+        let root = Identity::from_bytes(&[1u8; 32]);
+        let delegate = Identity::from_bytes(&[2u8; 32]);
+        let peer = Identity::from_bytes(&[3u8; 32]);
+
+        // Give root some trust
+        create_interaction(
+            &mut store,
+            &root,
+            &peer,
+            1,
+            1,
+            GENESIS_HASH,
+            GENESIS_HASH,
+            1000,
+        );
+
+        // Give delegate 6 interactions (above threshold of 5)
+        let mut prev = GENESIS_HASH.to_string();
+        let mut bob_seq = 1u64;
+        for seq in 1..=6u64 {
+            bob_seq += 1;
+            let (p, _) = create_interaction(
+                &mut store,
+                &delegate,
+                &peer,
+                seq,
+                bob_seq,
+                &prev,
+                GENESIS_HASH,
+                2000 + seq,
+            );
+            prev = p;
+        }
+
+        let deleg = crate::delegation::DelegationRecord {
+            delegation_id: "d1".to_string(),
+            delegator_pubkey: root.pubkey_hex(),
+            delegate_pubkey: delegate.pubkey_hex(),
+            scope: vec![],
+            max_depth: 1,
+            issued_at: 1000,
+            expires_at: 999999,
+            delegation_block_hash: "aa".repeat(32),
+            agreement_block_hash: None,
+            parent_delegation_id: None,
+            revoked: false,
+            revocation_block_hash: None,
+        };
+        let ctx = DelegationContext {
+            active_delegation: Some(deleg),
+            was_delegate: true,
+            delegations_as_delegator: vec![],
+            root_pubkey: Some(root.pubkey_hex()),
+            root_active_delegation_count: 1,
+            depth: 1,
+        };
+
+        let engine_delegated = TrustEngine::new(&store, None, None, Some(ctx));
+        let delegated_trust = engine_delegated
+            .compute_trust(&delegate.pubkey_hex())
+            .unwrap();
+
+        // Direct trust (no delegation)
+        let engine_direct = TrustEngine::new(&store, None, None, None);
+        let direct_trust = engine_direct.compute_trust(&delegate.pubkey_hex()).unwrap();
+
+        assert!(
+            (delegated_trust - direct_trust).abs() < 1e-6,
+            "above threshold should use direct trust: {delegated_trust} vs {direct_trust}"
+        );
+    }
+
+    #[test]
+    fn test_delegation_depth_reduces_trust() {
+        let mut store = MemoryBlockStore::new();
+        let root = Identity::from_bytes(&[1u8; 32]);
+        let delegate = Identity::from_bytes(&[2u8; 32]);
+        let peer = Identity::from_bytes(&[3u8; 32]);
+
+        create_interaction(
+            &mut store,
+            &root,
+            &peer,
+            1,
+            1,
+            GENESIS_HASH,
+            GENESIS_HASH,
+            1000,
+        );
+
+        let engine_root = TrustEngine::new(&store, None, None, None);
+        let root_trust = engine_root.compute_trust(&root.pubkey_hex()).unwrap();
+
+        // depth=1
+        let make_ctx = |depth: usize| {
+            let deleg = crate::delegation::DelegationRecord {
+                delegation_id: "d1".to_string(),
+                delegator_pubkey: root.pubkey_hex(),
+                delegate_pubkey: delegate.pubkey_hex(),
+                scope: vec![],
+                max_depth: 2,
+                issued_at: 1000,
+                expires_at: 999999,
+                delegation_block_hash: "aa".repeat(32),
+                agreement_block_hash: None,
+                parent_delegation_id: None,
+                revoked: false,
+                revocation_block_hash: None,
+            };
+            DelegationContext {
+                active_delegation: Some(deleg),
+                was_delegate: true,
+                delegations_as_delegator: vec![],
+                root_pubkey: Some(root.pubkey_hex()),
+                root_active_delegation_count: 1,
+                depth,
+            }
+        };
+
+        let engine_d1 = TrustEngine::new(&store, None, None, Some(make_ctx(1)));
+        let trust_d1 = engine_d1.compute_trust(&delegate.pubkey_hex()).unwrap();
+
+        let engine_d2 = TrustEngine::new(&store, None, None, Some(make_ctx(2)));
+        let trust_d2 = engine_d2.compute_trust(&delegate.pubkey_hex()).unwrap();
+
+        // depth=1: root_trust * 0.8, depth=2: root_trust * 0.8 * 0.8
+        let expected_d1 = root_trust * 0.8;
+        let expected_d2 = root_trust * 0.8 * 0.8;
+        assert!(
+            (trust_d1 - expected_d1).abs() < 1e-6,
+            "depth=1 trust {trust_d1} should be ~{expected_d1}"
+        );
+        assert!(
+            (trust_d2 - expected_d2).abs() < 1e-6,
+            "depth=2 trust {trust_d2} should be ~{expected_d2}"
+        );
+        assert!(
+            trust_d1 > trust_d2,
+            "depth=1 ({trust_d1}) should be higher than depth=2 ({trust_d2})"
         );
     }
 }

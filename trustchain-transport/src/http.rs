@@ -206,6 +206,7 @@ pub struct TrustScoreResponse {
     pub connectivity: f64,
     pub integrity: f64,
     pub diversity: f64,
+    pub recency: f64,
     pub unique_peers: usize,
     pub interactions: usize,
     pub fraud: bool,
@@ -736,14 +737,16 @@ fn build_delegation_ctx<D: DelegationStore>(
 
     let was_delegate = ds.is_delegate(pubkey).unwrap_or(false);
 
-    let (root_pubkey, root_active_delegation_count) =
+    let (root_pubkey, root_active_delegation_count, depth) =
         if let Some(ref delegation) = active_delegation {
             let mut root = delegation.delegator_pubkey.clone();
             let mut current = delegation.clone();
+            let mut depth = 1usize;
             while let Some(ref parent_id) = current.parent_delegation_id {
                 if let Ok(Some(parent)) = ds.get_delegation(parent_id) {
                     root = parent.delegator_pubkey.clone();
                     current = parent;
+                    depth += 1;
                 } else {
                     break;
                 }
@@ -754,9 +757,9 @@ fn build_delegation_ctx<D: DelegationStore>(
                 .filter(|d| d.is_active(now_ms))
                 .count()
                 .max(1);
-            (Some(root), active_count)
+            (Some(root), active_count, depth)
         } else {
-            (None, 0)
+            (None, 0, 0)
         };
 
     let delegations_as_delegator = ds.get_delegations_by_delegator(pubkey).unwrap_or_default();
@@ -767,13 +770,22 @@ fn build_delegation_ctx<D: DelegationStore>(
         delegations_as_delegator,
         root_pubkey,
         root_active_delegation_count,
+        depth,
     })
+}
+
+/// Query params for the trust score endpoint.
+#[derive(Deserialize)]
+pub struct TrustScoreParams {
+    /// Optional context filter (e.g. "code_execution", "tool:web_search").
+    pub context: Option<String>,
 }
 
 /// Query the trust score for a given public key.
 async fn handle_trust_score<S: BlockStore + 'static, D: DelegationStore + Send + 'static>(
     State(state): State<AppState<S, D>>,
     Path(pubkey): Path<String>,
+    Query(params): Query<TrustScoreParams>,
 ) -> Result<Json<TrustScoreResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Build delegation context first (separate lock scope).
     let delegation_ctx = {
@@ -797,14 +809,16 @@ async fn handle_trust_score<S: BlockStore + 'static, D: DelegationStore + Send +
     if let Some(cp) = checkpoint {
         engine = engine.with_checkpoint(cp);
     }
-    let evidence = engine.compute_trust_with_evidence(&pubkey).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-    })?;
+    let evidence = engine
+        .compute_trust_with_evidence_ctx(&pubkey, params.context.as_deref())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        })?;
 
     let block_count = store.get_block_count().unwrap_or(0);
 
@@ -814,6 +828,7 @@ async fn handle_trust_score<S: BlockStore + 'static, D: DelegationStore + Send +
         connectivity: evidence.connectivity,
         integrity: evidence.integrity,
         diversity: evidence.diversity,
+        recency: evidence.recency,
         unique_peers: evidence.unique_peers,
         interactions: evidence.interactions,
         fraud: evidence.fraud,
@@ -1352,6 +1367,7 @@ mod tests {
         assert!(trust_resp.get("connectivity").is_some());
         assert!(trust_resp.get("integrity").is_some());
         assert!(trust_resp.get("diversity").is_some());
+        assert!(trust_resp.get("recency").is_some());
         assert!(trust_resp.get("unique_peers").is_some());
         assert!(trust_resp.get("fraud").is_some());
         assert!(trust_resp.get("interaction_count").is_some());

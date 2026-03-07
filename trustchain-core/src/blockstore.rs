@@ -79,6 +79,25 @@ pub trait BlockStore: Send {
 
     /// Remove a peer record by public key.
     fn remove_stale_peer(&mut self, pubkey: &str) -> Result<()>;
+
+    /// Get all blocks for an agent filtered by interaction context, sorted ascending.
+    ///
+    /// Context matches blocks whose `transaction.interaction_type` equals `context`
+    /// or starts with `"{context}:"` (prefix matching).  Default implementation
+    /// loads the full chain and filters in-memory; `SqliteBlockStore` overrides
+    /// this with an indexed query.
+    fn get_chain_by_context(&self, pubkey: &str, context: &str) -> Result<Vec<HalfBlock>> {
+        let chain = self.get_chain(pubkey)?;
+        Ok(chain
+            .into_iter()
+            .filter(|b| {
+                b.transaction
+                    .get("interaction_type")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|t| t == context || t.starts_with(&format!("{context}:")))
+            })
+            .collect())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +302,7 @@ impl SqliteBlockStore {
                 block_hash TEXT NOT NULL,
                 timestamp INTEGER NOT NULL,
                 insert_time REAL NOT NULL,
+                interaction_context TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (public_key, sequence_number)
             );
             CREATE INDEX IF NOT EXISTS idx_link ON blocks(link_public_key, link_sequence_number);
@@ -317,6 +337,21 @@ impl SqliteBlockStore {
                 timestamp INTEGER NOT NULL,
                 finalized INTEGER NOT NULL DEFAULT 1
             );",
+        )?;
+        // Migration: add interaction_context column to existing databases.
+        // SQLite's ALTER TABLE ADD COLUMN is a no-op if the column already exists
+        // (we catch the "duplicate column" error and ignore it).
+        let _ = conn.execute_batch(
+            "ALTER TABLE blocks ADD COLUMN interaction_context TEXT NOT NULL DEFAULT ''",
+        );
+        // Backfill existing rows that have an interaction_type in tx_data.
+        conn.execute_batch(
+            "UPDATE blocks SET interaction_context = json_extract(tx_data, '$.interaction_type')
+             WHERE interaction_context = '' AND json_extract(tx_data, '$.interaction_type') IS NOT NULL",
+        )?;
+        // Create context index after migration ensures column exists.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_context ON blocks(public_key, interaction_context);",
         )?;
         Ok(())
     }
@@ -475,12 +510,17 @@ impl SqliteBlockStore {
 impl BlockStore for SqliteBlockStore {
     fn add_block(&mut self, block: &HalfBlock) -> Result<()> {
         let tx_data = serde_json::to_string(&block.transaction)?;
+        let interaction_context = block
+            .transaction
+            .get("interaction_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let conn = self.lock_conn();
         conn.execute(
             "INSERT INTO blocks (public_key, sequence_number, link_public_key,
              link_sequence_number, previous_hash, signature, block_type, tx_data,
-             block_hash, timestamp, insert_time)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             block_hash, timestamp, insert_time, interaction_context)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 block.public_key,
                 block.sequence_number,
@@ -493,6 +533,7 @@ impl BlockStore for SqliteBlockStore {
                 block.block_hash,
                 block.timestamp,
                 Self::insert_time(),
+                interaction_context,
             ],
         )
         .map_err(|e| {
@@ -712,6 +753,26 @@ impl BlockStore for SqliteBlockStore {
         let conn = self.lock_conn();
         conn.execute("DELETE FROM peers WHERE pubkey = ?1", params![pubkey])?;
         Ok(())
+    }
+
+    fn get_chain_by_context(&self, pubkey: &str, context: &str) -> Result<Vec<HalfBlock>> {
+        let conn = self.lock_conn();
+        // Use the indexed interaction_context column.
+        // Exact match OR prefix match (context + ':').
+        let mut stmt = conn.prepare(
+            "SELECT public_key, sequence_number, link_public_key, link_sequence_number,
+             previous_hash, signature, block_type, tx_data, block_hash, timestamp
+             FROM blocks WHERE public_key = ?1
+             AND (interaction_context = ?2 OR interaction_context LIKE ?3)
+             ORDER BY sequence_number ASC",
+        )?;
+        let prefix_pattern = format!("{context}:%");
+        let rows = stmt.query_map(params![pubkey, context, prefix_pattern], Self::row_to_block)?;
+        let mut blocks = Vec::new();
+        for row in rows {
+            blocks.push(row.map_err(|e| TrustChainError::Storage(e.to_string()))?);
+        }
+        Ok(blocks)
     }
 }
 
@@ -1014,5 +1075,104 @@ mod tests {
         assert_eq!(store.load_peers().unwrap().len(), 1);
         store.remove_stale_peer("aaa").unwrap();
         assert_eq!(store.load_peers().unwrap().len(), 0);
+    }
+
+    fn test_context_query(store: &mut dyn BlockStore) {
+        let id = setup_identity();
+        let counterparty = "b".repeat(64);
+
+        // Block with context "tool:web_search"
+        let b1 = create_half_block(
+            &id,
+            1,
+            &counterparty,
+            0,
+            GENESIS_HASH,
+            BlockType::Proposal,
+            serde_json::json!({"interaction_type": "tool:web_search"}),
+            Some(1000),
+        );
+        // Block with context "tool:code_exec"
+        let b2 = create_half_block(
+            &id,
+            2,
+            &counterparty,
+            0,
+            &b1.block_hash,
+            BlockType::Proposal,
+            serde_json::json!({"interaction_type": "tool:code_exec"}),
+            Some(2000),
+        );
+        // Block with context "data_retrieval"
+        let b3 = create_half_block(
+            &id,
+            3,
+            &counterparty,
+            0,
+            &b2.block_hash,
+            BlockType::Proposal,
+            serde_json::json!({"interaction_type": "data_retrieval"}),
+            Some(3000),
+        );
+        // Block with no context
+        let b4 = create_half_block(
+            &id,
+            4,
+            &counterparty,
+            0,
+            &b3.block_hash,
+            BlockType::Proposal,
+            serde_json::json!({"service": "test"}),
+            Some(4000),
+        );
+
+        store.add_block(&b1).unwrap();
+        store.add_block(&b2).unwrap();
+        store.add_block(&b3).unwrap();
+        store.add_block(&b4).unwrap();
+
+        // Exact match
+        let results = store
+            .get_chain_by_context(&id.pubkey_hex(), "data_retrieval")
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].sequence_number, 3);
+
+        // Prefix match: "tool" matches "tool:web_search" and "tool:code_exec"
+        let results = store
+            .get_chain_by_context(&id.pubkey_hex(), "tool")
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].sequence_number, 1);
+        assert_eq!(results[1].sequence_number, 2);
+
+        // Exact sub-match: "tool:web_search" matches only one
+        let results = store
+            .get_chain_by_context(&id.pubkey_hex(), "tool:web_search")
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].sequence_number, 1);
+
+        // No match
+        let results = store
+            .get_chain_by_context(&id.pubkey_hex(), "nonexistent")
+            .unwrap();
+        assert_eq!(results.len(), 0);
+
+        // Full chain still returns all 4
+        assert_eq!(store.get_chain(&id.pubkey_hex()).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_memory_store_context_query() {
+        let mut store = MemoryBlockStore::new();
+        test_context_query(&mut store);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_sqlite_store_context_query() {
+        let mut store = SqliteBlockStore::in_memory().unwrap();
+        test_context_query(&mut store);
     }
 }

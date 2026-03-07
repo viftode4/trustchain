@@ -14,9 +14,10 @@ readme = "../README.md"
 [features]
 default = []
 mcp = ["dep:rmcp", "dep:schemars"]
+ipv8 = ["dep:sha1"]
 
 [dependencies]
-trustchain-core = { workspace = true, features = ["sqlite"] }
+trustchain-core = { workspace = true, features = ["sqlite", "meritrank"] }
 quinn = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
@@ -38,6 +39,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }
+sha1 = { workspace = true, optional = true }
 rmcp = { workspace = true, optional = true }
 schemars = { workspace = true, optional = true }
 

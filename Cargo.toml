@@ -20,6 +20,7 @@ categories = ["cryptography", "network-programming"]
 [workspace.dependencies]
 # Crypto
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha1 = "0.10"
 sha2 = "0.10"
 rand = "0.8"
 hex = "0.4"
@@ -37,6 +38,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Graph
 petgraph = "0.6"
+meritrank = "0.4.0"
 
 # Time
 chrono = "0.4"

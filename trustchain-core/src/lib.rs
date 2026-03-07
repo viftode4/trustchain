@@ -19,6 +19,8 @@ pub mod delegation;
 pub mod error;
 pub mod halfblock;
 pub mod identity;
+#[cfg(feature = "meritrank")]
+pub mod meritrank;
 pub mod netflow;
 pub mod protocol;
 pub mod trust;
@@ -40,11 +42,13 @@ pub use halfblock::{
     verify_block, HalfBlock,
 };
 pub use identity::Identity;
+#[cfg(feature = "meritrank")]
+pub use meritrank::MeritRankTrust;
 pub use netflow::{CachedNetFlow, NetFlowTrust};
 pub use protocol::TrustChainProtocol;
 pub use trust::{
-    DelegationContext, TrustConfig, TrustEngine, TrustEvidence, TrustWeights,
-    DEFAULT_CONNECTIVITY_THRESHOLD, DEFAULT_DIVERSITY_THRESHOLD,
+    DelegationContext, TrustAlgorithm, TrustConfig, TrustEngine, TrustEvidence, TrustWeights,
+    DEFAULT_CONNECTIVITY_THRESHOLD, DEFAULT_DIVERSITY_THRESHOLD, DEFAULT_RECENCY_LAMBDA,
 };
 pub use types::{
     BlockType, ValidationResult, GENESIS_HASH, GENESIS_SEQ, MAX_DELEGATION_TTL_MS, UNKNOWN_SEQ,

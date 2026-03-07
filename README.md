@@ -7,7 +7,7 @@
 
 TrustChain is a universal trust primitive — a bilateral signed ledger where every agent-to-agent interaction produces cryptographic proof. Trust scores emerge from real interaction history, not ratings or reputation systems. Sybil attacks fail because fake identities have no legitimate transaction graph to exploit.
 
-Built on the [TrustChain protocol](https://doi.org/10.1016/j.future.2017.08.048) (Otte, de Vos, Pouwelse — TU Delft), extended with NetFlow trust computation for AI agent economies.
+Built on the [TrustChain protocol](https://doi.org/10.1016/j.future.2017.08.048) (Otte, de Vos, Pouwelse — TU Delft), extended with pluggable trust computation (NetFlow max-flow + MeritRank random walks) for AI agent economies.
 
 ## Quick Start
 
@@ -58,14 +58,15 @@ trustchain-node launch --name my-agent -- python my_agent.py
 - **Transparent sidecar proxy** — agents set `HTTP_PROXY` once; trust is handled invisibly
 - **Ed25519 identity** — self-sovereign keypairs, auto-generated on first run
 - **Bilateral half-block chain** — each party signs only their own block; no coordinator
-- **NetFlow Sybil resistance** — max-flow from seed nodes; fake identities can't manufacture trust
+- **Pluggable Sybil resistance** — NetFlow max-flow (default) or MeritRank random walks; fake identities can't manufacture trust
 - **QUIC P2P transport** — TLS 1.3 mutual auth, STUN NAT traversal
+- **IPv8 UDP transport** — interoperable with py-ipv8/Tribler peers (feature-gated)
 - **Live dashboard** — embedded HTML dashboard at `GET /dashboard`
 - **Trust headers** — `X-TrustChain-Score`, `X-TrustChain-Pubkey`, `X-TrustChain-Interactions` injected into proxied responses
 - **SQLite storage** — WAL mode, survives restarts
 - **Delegation protocol** — identity succession and capability delegation with revocation
 - **MCP server** — expose trust tools to Claude Desktop, Cursor, VS Code Copilot
-- **296 tests** across the workspace
+- **304 tests** across the workspace
 
 ## Architecture
 
@@ -78,7 +79,7 @@ graph TD
     QUIC["QUIC P2P\n:8200"]
     Dashboard["Dashboard\n/dashboard"]
     MCP["MCP Server\n/mcp or stdio"]
-    Core["TrustEngine\nNetFlow + Chain Integrity"]
+    Core["TrustEngine\nNetFlow | MeritRank"]
     Store["SQLite BlockStore"]
 
     Agent -->|HTTP_PROXY=:8203| Proxy
@@ -95,8 +96,8 @@ graph TD
 
 | Crate | Description |
 |-------|-------------|
-| [`trustchain-core`](trustchain-core/) | Identity, half-blocks, block storage, trust engine, NetFlow, CHECO consensus, delegation |
-| [`trustchain-transport`](trustchain-transport/) | QUIC P2P, gRPC, HTTP REST, transparent proxy, dashboard, peer discovery, MCP server |
+| [`trustchain-core`](trustchain-core/) | Identity, half-blocks, block storage, trust engine, NetFlow, MeritRank, CHECO consensus, delegation |
+| [`trustchain-transport`](trustchain-transport/) | QUIC P2P, gRPC, HTTP REST, transparent proxy, IPv8 UDP, dashboard, peer discovery, MCP server |
 | [`trustchain-node`](trustchain-node/) | CLI binary — sidecar, launch wrapper, keygen, MCP stdio |
 | [`trustchain-wasm`](trustchain-wasm/) | WASM bindings for browser/edge (experimental) |
 
@@ -104,6 +105,7 @@ graph TD
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
+| 8000 | UDP | IPv8 peer-to-peer (feature `ipv8`) |
 | 8200 | QUIC/UDP | P2P transport |
 | 8201 | gRPC/TCP | Protobuf API |
 | 8202 | HTTP/TCP | REST API + dashboard + MCP |
@@ -135,12 +137,22 @@ All ports shift with `--port-base`.
 
 ## Trust Scoring
 
-| Component | Weight | What it measures |
-|-----------|--------|-----------------|
-| **Chain Integrity** | 50% | Hash links, sequence continuity, Ed25519 signatures |
-| **NetFlow** | 50% | Max-flow from seed nodes — Sybil resistance |
+**Trust = connectivity × integrity × diversity** (multiplicative model)
 
-Proven fraud → permanent hard-zero trust score.
+| Factor | Formula | What it measures |
+|--------|---------|-----------------|
+| **Connectivity** | min(path_diversity / 3.0, 1.0) | Sybil resistance — independent paths from seed nodes |
+| **Integrity** | valid_blocks / total_blocks | Hash links, sequence continuity, Ed25519 signatures |
+| **Diversity** | min(unique_peers / 5.0, 1.0) | Distinct interaction partners |
+
+Two pluggable algorithms for the connectivity factor:
+
+| Algorithm | Type | Feature flag |
+|-----------|------|-------------|
+| **NetFlow** (default) | Max-flow (Edmonds-Karp) from seed super-source | always available |
+| **MeritRank** | Personalized random walks with negative edge propagation | `meritrank` |
+
+Proven fraud → permanent hard-zero trust score. No seeds configured → integrity only.
 
 ## Protocol
 
@@ -165,12 +177,18 @@ Alice's chain:              Bob's chain:
 git clone https://github.com/viftode4/trustchain.git
 cd trustchain
 cargo build --release
-cargo test --workspace   # 296 tests
+cargo test --workspace                         # 304 tests
+cargo test --workspace --features meritrank    # include MeritRank tests
+cargo test --workspace --features ipv8         # include IPv8 transport tests
 ```
 
 ## Research
 
 **Core paper**: Otte, de Vos, Pouwelse — [TrustChain: A Sybil-resistant scalable blockchain](https://doi.org/10.1016/j.future.2017.08.048) (Future Generation Computer Systems, 2020)
+
+**Trust algorithms**:
+- Nasrulin, Ishmaev, Pouwelse — [MeritRank: Sybil Tolerant Reputation for Merit-based Tokenomics](https://arxiv.org/abs/2207.09950) (2022)
+- Werthenbach, Pouwelse — [Social Reputation Mechanisms](https://arxiv.org/abs/2212.06436) (2022)
 
 **IETF drafts**:
 - [draft-pouwelse-trustchain-01](https://datatracker.ietf.org/doc/draft-pouwelse-trustchain/) — base bilateral ledger protocol (Pouwelse, TU Delft, 2018)

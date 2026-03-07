@@ -21,12 +21,14 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 rusqlite = { workspace = true, optional = true }
 petgraph = { workspace = true }
+meritrank = { workspace = true, optional = true }
 chrono = { workspace = true }
 log = { workspace = true }
 
 [features]
-default = ["sqlite"]
+default = ["sqlite", "meritrank"]
 sqlite = ["dep:rusqlite"]
+meritrank = ["dep:meritrank"]
 
 [dev-dependencies]
 tempfile = "3"
@@ -58,3 +60,8 @@ harness = false
 name = "sqlite"
 harness = false
 required-features = ["sqlite"]
+
+[[bench]]
+name = "meritrank"
+harness = false
+required-features = ["meritrank"]

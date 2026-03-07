@@ -20,7 +20,7 @@ RUN cargo build --release --bin trustchain-node
 # --- Runtime stage ---
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -r -s /bin/false -u 1001 trustchain
 
@@ -44,7 +44,7 @@ VOLUME /data
 ENV RUST_LOG=info
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD ["/usr/local/bin/trustchain-node", "--help"]
+  CMD ["curl", "-sf", "http://localhost:8202/healthz"]
 
 USER trustchain
 

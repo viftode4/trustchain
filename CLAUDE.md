@@ -1,15 +1,17 @@
 # TrustChain Rust Workspace
 
 Bilateral signed interaction ledger implementing IETF draft-pouwelse-trustchain-01, extended
-with NetFlow Sybil-resistant trust computation. No blockchain, offline-capable.
+with pluggable Sybil-resistant trust computation (NetFlow + MeritRank). No blockchain, offline-capable.
 
 ## Build & Test
 
 ```sh
 cargo build                                    # debug build
 cargo build --release --bin trustchain-node    # release binary
-cargo test --workspace                         # run all tests (currently 296)
+cargo test --workspace                         # run all tests (currently 304)
 cargo test --workspace --features mcp          # include MCP feature tests
+cargo test --workspace --features meritrank    # include MeritRank tests
+cargo test --workspace --features ipv8         # include IPv8 transport tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```
@@ -20,12 +22,14 @@ CI runs tests on ubuntu, windows, macos. Requires `protoc` on PATH (needed by to
 
 | Crate | Role |
 |---|---|
-| `trustchain-core` | Identity, HalfBlock, BlockStore, NetFlow trust, protocol state machine, delegation |
-| `trustchain-transport` | QUIC (quinn), gRPC (tonic), HTTP REST (axum), transparent proxy (port 8203), MCP server (rmcp) |
+| `trustchain-core` | Identity, HalfBlock, BlockStore, NetFlow trust, MeritRank trust, protocol state machine, delegation |
+| `trustchain-transport` | QUIC (quinn), gRPC (tonic), HTTP REST (axum), transparent proxy (port 8203), IPv8 UDP, MCP server (rmcp) |
 | `trustchain-node` | Binary entry point -- CLI, config, sidecar lifecycle |
 | `trustchain-wasm` | WASM bindings for browser/Node.js |
 
 `trustchain-transport` feature `mcp` is optional (rmcp, schemars). Default features off.
+`trustchain-transport` feature `ipv8` is optional (sha1). Enables IPv8 UDP transport.
+`trustchain-core` feature `meritrank` is optional (meritrank crate). Enables MeritRank algorithm.
 `trustchain-core` feature `sqlite` is on by default; WASM builds disable it.
 
 ## Key Conventions
@@ -59,6 +63,7 @@ MAX_DELEGATION_TTL_MS = 30 * 24 * 3600 * 1000  // 30-day cap, enforced in core
   not just the HTTP API, so callers cannot bypass the cap.
 
 ### Ports (sidecar mode)
+- 8000/UDP -- IPv8 peer-to-peer (feature `ipv8`, py-ipv8 compatible)
 - 8200/UDP -- QUIC peer-to-peer
 - 8201/TCP -- gRPC
 - 8202/TCP -- HTTP REST API
