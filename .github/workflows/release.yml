@@ -70,15 +70,17 @@ jobs:
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
-          cp target/${{ matrix.target }}/release/trustchain-node trustchain-node
-          tar czf ${{ matrix.artifact }}.tar.gz trustchain-node
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/trustchain-node staging/trustchain-node
+          tar czf ${{ matrix.artifact }}.tar.gz -C staging trustchain-node
 
       - name: Package (zip)
         if: matrix.archive == 'zip'
         shell: bash
         run: |
-          cp target/${{ matrix.target }}/release/trustchain-node.exe trustchain-node.exe
-          7z a ${{ matrix.artifact }}.zip trustchain-node.exe
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/trustchain-node.exe staging/trustchain-node.exe
+          cd staging && 7z a ../${{ matrix.artifact }}.zip trustchain-node.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
