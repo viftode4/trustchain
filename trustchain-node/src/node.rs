@@ -84,7 +84,15 @@ impl Node {
     pub fn new(identity: Identity, config: NodeConfig) -> Self {
         let db_path = config.db_path.to_str().unwrap_or("trustchain.db");
         let store = SqliteBlockStore::open(db_path).expect("failed to open SQLite database");
-        let protocol = TrustChainProtocol::new(identity.clone(), store);
+        let mut protocol = TrustChainProtocol::new(identity.clone(), store);
+
+        // Configure audit recording level if specified.
+        if let Some(ref level_str) = config.audit_level {
+            if let Some(level) = trustchain_core::AuditLevel::from_str_loose(level_str) {
+                protocol.set_audit_config(trustchain_core::AuditConfig::with_level(level));
+                tracing::info!(audit_level = %level, "audit recording configured");
+            }
+        }
 
         // Second store handle to the same DB file (WAL mode enables concurrent readers).
         let consensus_store =
@@ -400,6 +408,95 @@ impl Node {
 
         quic_accept_handle.1.shutdown();
         tracing::info!("node shut down");
+        Ok(())
+    }
+
+    /// Start in audit-only mode: HTTP + proxy only, no networking.
+    ///
+    /// Used when `--no-networking` is set. Only the HTTP REST API and transparent
+    /// proxy are started. No QUIC, gRPC, STUN, gossip, or peer discovery.
+    pub async fn run_audit_only(&self) -> anyhow::Result<()> {
+        let pubkey = self.identity.pubkey_hex();
+        tracing::info!(
+            pubkey = &pubkey[..8],
+            "starting TrustChain node in audit-only mode (no networking)"
+        );
+
+        // Start HTTP REST API.
+        let http_addr: SocketAddr = self.config.http_addr.parse()?;
+        let http_state = AppState {
+            protocol: self.protocol.clone(),
+            discovery: self.discovery.clone(),
+            quic: None,
+            agent_endpoint: self.config.agent_endpoint.clone(),
+            delegation_store: self.delegation_store.clone(),
+            latest_checkpoint: self.latest_checkpoint.clone(),
+            seed_nodes: vec![], // No seeds in audit-only mode.
+            agent_name: self.config.agent_name.clone(),
+        };
+
+        let http_handle = tokio::spawn(async move {
+            let router = build_router(http_state);
+            let listener = match tokio::net::TcpListener::bind(http_addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("HTTP bind failed: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = axum::serve(listener, router).await {
+                tracing::error!("HTTP server error: {e}");
+            }
+        });
+        tracing::info!(%http_addr, "HTTP API ready (audit-only)");
+
+        // Start transparent HTTP proxy (QUIC bound to ephemeral port, unused).
+        let proxy_addr: SocketAddr = self.config.proxy_addr.parse()?;
+        let dummy_quic = Arc::new(
+            QuicTransport::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &pubkey)
+                .await
+                .map_err(|e| anyhow::anyhow!("QUIC ephemeral bind: {e}"))?,
+        );
+        let proxy_state = ProxyState {
+            protocol: self.protocol.clone(),
+            discovery: self.discovery.clone(),
+            quic: dummy_quic,
+            client: reqwest::Client::new(),
+            peer_locks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            delegation_store: Some(self.delegation_store.clone()),
+            seed_nodes: vec![],
+        };
+        let proxy_handle = tokio::spawn(async move {
+            if let Err(e) = start_proxy_server(proxy_addr, proxy_state).await {
+                tracing::error!("proxy server error: {e}");
+            }
+        });
+        tracing::info!(%proxy_addr, "trust proxy ready (audit-only)");
+
+        // Register agent endpoint alias.
+        if let Some(ref endpoint) = self.config.agent_endpoint {
+            self.discovery
+                .add_alias(endpoint.clone(), pubkey.clone())
+                .await;
+        }
+
+        tracing::info!(
+            pubkey = &pubkey[..8],
+            http = %http_addr,
+            proxy = %proxy_addr,
+            "audit-only node started (no networking)"
+        );
+
+        tokio::select! {
+            _ = http_handle => tracing::warn!("HTTP server exited"),
+            _ = proxy_handle => tracing::warn!("proxy server exited"),
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received shutdown signal");
+            }
+        }
+
         Ok(())
     }
 

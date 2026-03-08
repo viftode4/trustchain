@@ -71,6 +71,30 @@ pub struct VerifyChainParams {
     pub peer: String,
 }
 
+/// Parameters for the `trustchain_record_audit` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RecordAuditParams {
+    /// Action description (e.g. "read_file", "call_api", "make_decision").
+    pub action: String,
+    /// Outcome of the action: "completed", "failed", "pending".
+    #[serde(default = "default_outcome")]
+    pub outcome: String,
+    /// Event type: "tool_call", "llm_decision", "error", "state_change", "human_override".
+    #[serde(default = "default_event_type")]
+    pub event_type: String,
+    /// Additional metadata as a JSON object.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+}
+
+fn default_outcome() -> String {
+    "completed".to_string()
+}
+
+fn default_event_type() -> String {
+    "tool_call".to_string()
+}
+
 // ---------------------------------------------------------------------------
 // MCP Server (generic over BlockStore)
 // ---------------------------------------------------------------------------
@@ -291,6 +315,78 @@ impl<S: BlockStore + 'static> TrustChainMcpServer<S> {
             "block_count": block_count,
             "peer_count": peer_count,
             "agent_endpoint": self.agent_endpoint,
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    /// Record an audit block — a single-player cryptographic log entry.
+    #[tool(
+        name = "trustchain_record_audit",
+        description = "Record an audit block — a tamper-proof log entry for agent actions. \
+                        Creates a self-signed, hash-chained block that serves as a \
+                        cryptographic audit trail. No counterparty needed."
+    )]
+    async fn record_audit(
+        &self,
+        params: Parameters<RecordAuditParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut proto = self.protocol.lock().await;
+        let mut tx = serde_json::json!({
+            "action": params.0.action,
+            "outcome": params.0.outcome,
+            "event_type": params.0.event_type,
+        });
+        if let Some(metadata) = &params.0.metadata {
+            if let (Some(tx_obj), Some(meta_obj)) = (tx.as_object_mut(), metadata.as_object()) {
+                for (k, v) in meta_obj {
+                    tx_obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let block = proto
+            .create_audit(tx, None)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let result = serde_json::json!({
+            "status": "recorded",
+            "block_hash": block.block_hash,
+            "sequence_number": block.sequence_number,
+            "timestamp": block.timestamp,
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    /// Get the audit report for this node's chain.
+    #[tool(
+        name = "trustchain_get_audit_report",
+        description = "Get a summary report of this node's audit chain. Returns total blocks, \
+                        audit vs bilateral counts, integrity status, event type breakdown, \
+                        and timestamp range."
+    )]
+    async fn get_audit_report(&self) -> Result<CallToolResult, McpError> {
+        let proto = self.protocol.lock().await;
+        let pubkey = proto.pubkey();
+        let engine = self.make_engine(proto.store());
+        let report = engine
+            .compute_audit_report(&pubkey)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let result = serde_json::json!({
+            "total_blocks": report.total_blocks,
+            "audit_blocks": report.audit_blocks,
+            "bilateral_blocks": report.bilateral_blocks,
+            "integrity_valid": report.integrity_valid,
+            "integrity_score": report.integrity_score,
+            "event_type_breakdown": report.event_type_breakdown,
+            "first_timestamp": report.first_timestamp,
+            "last_timestamp": report.last_timestamp,
+            "chain_length": report.chain_length,
         });
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -522,7 +618,7 @@ mod tests {
     fn test_tool_count() {
         let server = make_test_server();
         let tools = server.tool_router.list_all();
-        assert_eq!(tools.len(), 5, "expected 5 MCP tools, got {}", tools.len());
+        assert_eq!(tools.len(), 7, "expected 7 MCP tools, got {}", tools.len());
     }
 
     fn make_test_server_with_seeds(seeds: Vec<String>) -> TrustChainMcpServer<MemoryBlockStore> {

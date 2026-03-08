@@ -80,6 +80,16 @@ pub struct NodeConfig {
     /// 127.0.0.1 (only suitable for single-machine testing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advertise_addr: Option<String>,
+
+    /// Audit recording level (minimal, standard, comprehensive).
+    /// Default: standard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_level: Option<String>,
+
+    /// Disable all networking (QUIC, gossip, STUN, peer discovery).
+    /// Pure audit-only mode for single-player use.
+    #[serde(default)]
+    pub no_networking: bool,
 }
 
 impl Default for NodeConfig {
@@ -101,6 +111,8 @@ impl Default for NodeConfig {
             agent_name: None,
             agent_endpoint: None,
             advertise_addr: None,
+            audit_level: None,
+            no_networking: false,
         }
     }
 }

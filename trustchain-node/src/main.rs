@@ -83,6 +83,14 @@ enum Commands {
         /// Log level.
         #[arg(long, default_value = "info")]
         log_level: String,
+
+        /// Audit recording level: minimal, standard (default), comprehensive.
+        #[arg(long, default_value = "standard")]
+        audit_mode: String,
+
+        /// Disable networking (QUIC, gossip, STUN). Pure audit-only sidecar.
+        #[arg(long)]
+        no_networking: bool,
     },
 
     /// Launch an app with a TrustChain sidecar (Dapr-style).
@@ -119,6 +127,14 @@ enum Commands {
         /// Log level.
         #[arg(long, default_value = "info")]
         log_level: String,
+
+        /// Audit recording level: minimal, standard (default), comprehensive.
+        #[arg(long, default_value = "standard")]
+        audit_mode: String,
+
+        /// Disable networking (QUIC, gossip, STUN). Pure audit-only sidecar.
+        #[arg(long)]
+        no_networking: bool,
 
         /// The command and arguments to launch (after --).
         #[arg(trailing_var_arg = true, required = true)]
@@ -237,6 +253,8 @@ async fn main() -> anyhow::Result<()> {
             advertise,
             data_dir,
             log_level,
+            audit_mode,
+            no_networking,
         } => {
             // Resolve data directory: --data-dir or ~/.trustchain/<name>/
             let data_dir = data_dir.unwrap_or_else(|| {
@@ -279,16 +297,24 @@ async fn main() -> anyhow::Result<()> {
                 agent_name: Some(name.clone()),
                 agent_endpoint: Some(endpoint.clone()),
                 advertise_addr: advertise,
+                audit_level: Some(audit_mode.clone()),
+                no_networking,
                 ..NodeConfig::default()
             };
 
             // Print banner.
             let pubkey = identity.pubkey_hex();
+            let mode_label = if no_networking {
+                format!("{audit_mode} (offline)")
+            } else {
+                audit_mode
+            };
             println!();
             println!("  TrustChain Sidecar");
             println!("  ──────────────────────────────────────────");
             println!("  Agent:     {name}");
             println!("  Endpoint:  {endpoint}");
+            println!("  Audit:     {mode_label}");
             println!("  Public key: {pubkey}");
             println!("  Data dir:  {}", data_dir.display());
             println!();
@@ -303,7 +329,11 @@ async fn main() -> anyhow::Result<()> {
             println!();
 
             let node = Node::new(identity, config);
-            node.run().await?;
+            if no_networking {
+                node.run_audit_only().await?;
+            } else {
+                node.run().await?;
+            }
         }
 
         Commands::Launch {
@@ -314,6 +344,8 @@ async fn main() -> anyhow::Result<()> {
             advertise,
             data_dir,
             log_level,
+            audit_mode,
+            no_networking,
             command,
         } => {
             // Resolve data directory.
@@ -357,15 +389,23 @@ async fn main() -> anyhow::Result<()> {
                 agent_name: Some(name.clone()),
                 agent_endpoint: Some(endpoint.clone()),
                 advertise_addr: advertise,
+                audit_level: Some(audit_mode.clone()),
+                no_networking,
                 ..NodeConfig::default()
             };
 
             let pubkey = identity.pubkey_hex();
+            let mode_label = if no_networking {
+                format!("{audit_mode} (offline)")
+            } else {
+                audit_mode
+            };
             println!();
             println!("  TrustChain Launch");
             println!("  ──────────────────────────────────────────");
             println!("  Agent:      {name}");
             println!("  Endpoint:   {endpoint}");
+            println!("  Audit:      {mode_label}");
             println!("  Public key: {pubkey}");
             println!("  Command:    {}", command.join(" "));
             println!("  ──────────────────────────────────────────");
@@ -373,8 +413,14 @@ async fn main() -> anyhow::Result<()> {
 
             // Start sidecar in background.
             let node = Node::new(identity, config);
+            let run_no_net = no_networking;
             let node_handle = tokio::spawn(async move {
-                if let Err(e) = node.run().await {
+                let result = if run_no_net {
+                    node.run_audit_only().await
+                } else {
+                    node.run().await
+                };
+                if let Err(e) = result {
                     tracing::error!("Sidecar error: {e}");
                 }
             });

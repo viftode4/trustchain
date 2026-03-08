@@ -23,6 +23,7 @@ pub mod identity;
 pub mod meritrank;
 pub mod netflow;
 pub mod protocol;
+pub mod schema;
 pub mod trust;
 pub mod types;
 
@@ -46,10 +47,13 @@ pub use identity::Identity;
 pub use meritrank::MeritRankTrust;
 pub use netflow::{CachedNetFlow, NetFlowTrust};
 pub use protocol::TrustChainProtocol;
+pub use schema::{validate_transaction, SchemaId};
 pub use trust::{
-    DelegationContext, TrustAlgorithm, TrustConfig, TrustEngine, TrustEvidence, TrustWeights,
-    DEFAULT_CONNECTIVITY_THRESHOLD, DEFAULT_DIVERSITY_THRESHOLD, DEFAULT_RECENCY_LAMBDA,
+    AuditReport, DelegationContext, TrustAlgorithm, TrustConfig, TrustEngine, TrustEvidence,
+    TrustWeights, DEFAULT_CONNECTIVITY_THRESHOLD, DEFAULT_DIVERSITY_THRESHOLD,
+    DEFAULT_RECENCY_LAMBDA,
 };
 pub use types::{
-    BlockType, ValidationResult, GENESIS_HASH, GENESIS_SEQ, MAX_DELEGATION_TTL_MS, UNKNOWN_SEQ,
+    AuditConfig, AuditLevel, BlockType, EventType, ValidationResult, GENESIS_HASH, GENESIS_SEQ,
+    MAX_DELEGATION_TTL_MS, UNKNOWN_SEQ,
 };

@@ -211,6 +211,42 @@ pub struct AuditResponse {
     pub sequence_number: u64,
 }
 
+/// Request for batch audit endpoint.
+#[derive(Deserialize)]
+pub struct AuditBatchRequest {
+    pub entries: Vec<serde_json::Value>,
+}
+
+/// Response for batch audit endpoint.
+#[derive(Serialize)]
+pub struct AuditBatchResponse {
+    pub blocks: Vec<HalfBlock>,
+    pub count: usize,
+}
+
+/// Response for audit report endpoint.
+#[derive(Serialize)]
+pub struct AuditReportResponse {
+    pub total_blocks: usize,
+    pub audit_blocks: usize,
+    pub bilateral_blocks: usize,
+    pub integrity_valid: bool,
+    pub integrity_score: f64,
+    pub event_type_breakdown: std::collections::HashMap<String, usize>,
+    pub first_timestamp: Option<u64>,
+    pub last_timestamp: Option<u64>,
+    pub chain_length: usize,
+}
+
+/// Response for chain export endpoint.
+#[derive(Serialize)]
+pub struct ExportChainResponse {
+    pub pubkey: String,
+    pub chain: Vec<HalfBlock>,
+    pub exported_at: u64,
+    pub chain_hash: String,
+}
+
 /// Response for trust score endpoint.
 #[derive(Serialize)]
 pub struct TrustScoreResponse {
@@ -325,6 +361,9 @@ pub fn build_router<S: BlockStore + Send + 'static, D: DelegationStore + Send + 
         .route("/healthz", get(handle_healthz::<S, D>))
         .route("/metrics", get(handle_metrics::<S, D>))
         .route("/audit", post(handle_audit::<S, D>))
+        .route("/audit-batch", post(handle_audit_batch::<S, D>))
+        .route("/audit-report", get(handle_audit_report::<S, D>))
+        .route("/export-chain", get(handle_export_chain::<S, D>))
         .route("/propose", post(handle_propose::<S, D>))
         .route("/receive_proposal", post(handle_receive_proposal::<S, D>))
         .route("/receive_agreement", post(handle_receive_agreement::<S, D>))
@@ -409,6 +448,86 @@ async fn handle_audit<S: BlockStore + 'static, D: DelegationStore + Send + 'stat
     Ok(Json(AuditResponse {
         block,
         sequence_number: seq,
+    }))
+}
+
+async fn handle_audit_batch<S: BlockStore + 'static, D: DelegationStore + Send + 'static>(
+    State(state): State<AppState<S, D>>,
+    Json(req): Json<AuditBatchRequest>,
+) -> Result<Json<AuditBatchResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let mut proto = state.protocol.lock().await;
+    let blocks = proto.create_audit_batch(req.entries).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+    let count = blocks.len();
+    Ok(Json(AuditBatchResponse { blocks, count }))
+}
+
+async fn handle_audit_report<S: BlockStore + 'static, D: DelegationStore + Send + 'static>(
+    State(state): State<AppState<S, D>>,
+) -> Result<Json<AuditReportResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let proto = state.protocol.lock().await;
+    let pubkey = proto.pubkey();
+    let engine = TrustEngine::new(proto.store(), None, None, None);
+    let report = engine.compute_audit_report(&pubkey).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+    Ok(Json(AuditReportResponse {
+        total_blocks: report.total_blocks,
+        audit_blocks: report.audit_blocks,
+        bilateral_blocks: report.bilateral_blocks,
+        integrity_valid: report.integrity_valid,
+        integrity_score: report.integrity_score,
+        event_type_breakdown: report.event_type_breakdown,
+        first_timestamp: report.first_timestamp,
+        last_timestamp: report.last_timestamp,
+        chain_length: report.chain_length,
+    }))
+}
+
+async fn handle_export_chain<S: BlockStore + 'static, D: DelegationStore + Send + 'static>(
+    State(state): State<AppState<S, D>>,
+) -> Result<Json<ExportChainResponse>, (StatusCode, Json<ErrorResponse>)> {
+    use sha2::{Digest, Sha256};
+
+    let proto = state.protocol.lock().await;
+    let pubkey = proto.pubkey();
+    let chain = proto.store().get_chain(&pubkey).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+
+    // Compute a hash over all block hashes for integrity verification.
+    let mut hasher = Sha256::new();
+    for block in &chain {
+        hasher.update(block.block_hash.as_bytes());
+    }
+    let chain_hash = hex::encode(hasher.finalize());
+
+    let exported_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    Ok(Json(ExportChainResponse {
+        pubkey,
+        chain,
+        exported_at,
+        chain_hash,
     }))
 }
 

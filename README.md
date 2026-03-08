@@ -58,7 +58,8 @@ trustchain-node launch --name my-agent -- python my_agent.py
 - **Transparent sidecar proxy** — agents set `HTTP_PROXY` once; trust is handled invisibly
 - **Ed25519 identity** — self-sovereign keypairs, auto-generated on first run
 - **Bilateral half-block chain** — each party signs only their own block; no coordinator
-- **Pluggable Sybil resistance** — NetFlow max-flow (default) or MeritRank random walks; fake identities can't manufacture trust
+- **Single-player audit mode** — cryptographic audit log without a network; every tool call recorded as a self-signed audit block (agent black box recorder)
+- **Pluggable Sybil resistance** — MeritRank random walks (default) or NetFlow max-flow; fake identities can't manufacture trust
 - **QUIC P2P transport** — TLS 1.3 mutual auth, STUN NAT traversal
 - **IPv8 UDP transport** — interoperable with py-ipv8/Tribler peers (feature-gated)
 - **Live dashboard** — embedded HTML dashboard at `GET /dashboard`
@@ -66,6 +67,7 @@ trustchain-node launch --name my-agent -- python my_agent.py
 - **SQLite storage** — WAL mode, survives restarts
 - **Delegation protocol** — identity succession and capability delegation with revocation
 - **MCP server** — expose trust tools to Claude Desktop, Cursor, VS Code Copilot
+- **Audit blocks** — `BlockType::Audit` for unilateral events; self-referencing, no counterparty needed
 - **304 tests** across the workspace
 
 ## Architecture
@@ -137,22 +139,23 @@ All ports shift with `--port-base`.
 
 ## Trust Scoring
 
-**Trust = connectivity × integrity × diversity** (multiplicative model)
+**Trust = connectivity × integrity × diversity × recency** (4-factor multiplicative model, v3)
 
 | Factor | Formula | What it measures |
 |--------|---------|-----------------|
 | **Connectivity** | min(path_diversity / 3.0, 1.0) | Sybil resistance — independent paths from seed nodes |
 | **Integrity** | valid_blocks / total_blocks | Hash links, sequence continuity, Ed25519 signatures |
 | **Diversity** | min(unique_peers / 5.0, 1.0) | Distinct interaction partners |
+| **Recency** | exponential decay (λ=0.95) | Recent interactions dominate; last ~20 interactions carry most weight |
 
 Two pluggable algorithms for the connectivity factor:
 
 | Algorithm | Type | Feature flag |
 |-----------|------|-------------|
-| **NetFlow** (default) | Max-flow (Edmonds-Karp) from seed super-source | always available |
-| **MeritRank** | Personalized random walks with negative edge propagation | `meritrank` |
+| **MeritRank** (default) | Personalized random walks with bounded Sybil resistance | `meritrank` (in default features) |
+| **NetFlow** | Max-flow (Edmonds-Karp) from seed super-source | always available |
 
-Proven fraud → permanent hard-zero trust score. No seeds configured → integrity only.
+Proven fraud → permanent hard-zero trust score. No seeds configured → integrity × recency only.
 
 ## Protocol
 

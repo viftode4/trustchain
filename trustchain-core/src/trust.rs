@@ -4,7 +4,9 @@
 //! into a single score, with configurable weights.
 //! Delegation-aware: delegated identities inherit trust from their root principal.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
 
 use crate::blockstore::BlockStore;
 use crate::delegation::{DelegationRecord, DelegationStore};
@@ -647,6 +649,111 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Audit report — summary of a single agent's audit chain
+// ---------------------------------------------------------------------------
+
+/// Summary report of an agent's audit chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditReport {
+    /// Total blocks in the chain (audit + bilateral).
+    pub total_blocks: usize,
+    /// Number of audit blocks (self-referencing, single-player).
+    pub audit_blocks: usize,
+    /// Number of bilateral blocks (proposals + agreements).
+    pub bilateral_blocks: usize,
+    /// Whether the entire chain passes integrity validation.
+    pub integrity_valid: bool,
+    /// Integrity score: fraction of valid blocks before first error (0.0-1.0).
+    pub integrity_score: f64,
+    /// Breakdown of audit blocks by event_type field in transaction JSON.
+    pub event_type_breakdown: HashMap<String, usize>,
+    /// Timestamp of the first block (ms since epoch), if any.
+    pub first_timestamp: Option<u64>,
+    /// Timestamp of the last block (ms since epoch), if any.
+    pub last_timestamp: Option<u64>,
+    /// Total chain length (same as total_blocks, for clarity).
+    pub chain_length: usize,
+}
+
+impl<S: BlockStore> TrustEngine<'_, S> {
+    /// Compute an audit report for the given public key.
+    pub fn compute_audit_report(&self, pubkey: &str) -> Result<AuditReport> {
+        let chain = self.store.get_chain(pubkey)?;
+        let total_blocks = chain.len();
+
+        let mut audit_blocks = 0usize;
+        let mut bilateral_blocks = 0usize;
+        let mut event_type_breakdown: HashMap<String, usize> = HashMap::new();
+        let mut first_timestamp: Option<u64> = None;
+        let mut last_timestamp: Option<u64> = None;
+
+        for block in &chain {
+            if first_timestamp.is_none() {
+                first_timestamp = Some(block.timestamp);
+            }
+            last_timestamp = Some(block.timestamp);
+
+            if block.block_type == "audit" {
+                audit_blocks += 1;
+                // Extract event_type from transaction JSON.
+                if let Some(et) = block.transaction.get("event_type").and_then(|v| v.as_str()) {
+                    *event_type_breakdown.entry(et.to_string()).or_insert(0) += 1;
+                } else {
+                    *event_type_breakdown
+                        .entry("untyped".to_string())
+                        .or_insert(0) += 1;
+                }
+            } else if block.block_type == "proposal" || block.block_type == "agreement" {
+                bilateral_blocks += 1;
+            }
+        }
+
+        // Compute integrity using the existing protocol method logic.
+        let mut integrity_valid = true;
+        let mut integrity_score = 1.0;
+
+        if !chain.is_empty() {
+            let total = chain.len() as f64;
+            for (i, block) in chain.iter().enumerate() {
+                let expected_seq = (i as u64) + 1;
+                if block.sequence_number != expected_seq {
+                    integrity_valid = false;
+                    integrity_score = i as f64 / total;
+                    break;
+                }
+                let expected_prev = if i == 0 {
+                    GENESIS_HASH.to_string()
+                } else {
+                    chain[i - 1].block_hash.clone()
+                };
+                if block.previous_hash != expected_prev {
+                    integrity_valid = false;
+                    integrity_score = i as f64 / total;
+                    break;
+                }
+                if !crate::halfblock::verify_block(block).unwrap_or(false) {
+                    integrity_valid = false;
+                    integrity_score = i as f64 / total;
+                    break;
+                }
+            }
+        }
+
+        Ok(AuditReport {
+            total_blocks,
+            audit_blocks,
+            bilateral_blocks,
+            integrity_valid,
+            integrity_score,
+            event_type_breakdown,
+            first_timestamp,
+            last_timestamp,
+            chain_length: total_blocks,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,7 +761,6 @@ mod tests {
     use crate::halfblock::create_half_block;
     use crate::identity::Identity;
     use crate::types::BlockType;
-    use std::collections::HashMap;
 
     #[allow(clippy::too_many_arguments)]
     fn create_interaction(
@@ -2057,5 +2163,137 @@ mod tests {
             trust_d1 > trust_d2,
             "depth=1 ({trust_d1}) should be higher than depth=2 ({trust_d2})"
         );
+    }
+
+    // --- AuditReport tests ---
+
+    #[test]
+    fn test_audit_report_empty_chain() {
+        let store = MemoryBlockStore::new();
+        let engine = TrustEngine::new(&store, None, None, None);
+        let alice = Identity::from_bytes(&[1u8; 32]);
+        let report = engine
+            .compute_audit_report(&alice.pubkey_hex())
+            .unwrap();
+        assert_eq!(report.total_blocks, 0);
+        assert_eq!(report.audit_blocks, 0);
+        assert_eq!(report.bilateral_blocks, 0);
+        assert!(report.integrity_valid);
+        assert_eq!(report.integrity_score, 1.0);
+        assert!(report.event_type_breakdown.is_empty());
+        assert!(report.first_timestamp.is_none());
+        assert!(report.last_timestamp.is_none());
+    }
+
+    #[test]
+    fn test_audit_report_with_audit_blocks() {
+        let alice = Identity::from_bytes(&[1u8; 32]);
+        let mut store = MemoryBlockStore::new();
+        let mut proto =
+            crate::protocol::TrustChainProtocol::new(alice.clone(), MemoryBlockStore::new());
+
+        let b1 = proto
+            .create_audit(
+                serde_json::json!({"event_type": "tool_call", "action": "read"}),
+                Some(1000),
+            )
+            .unwrap();
+        let b2 = proto
+            .create_audit(
+                serde_json::json!({"event_type": "llm_decision", "action": "think"}),
+                Some(2000),
+            )
+            .unwrap();
+        let b3 = proto
+            .create_audit(
+                serde_json::json!({"event_type": "tool_call", "action": "write"}),
+                Some(3000),
+            )
+            .unwrap();
+
+        // Copy blocks into the store for the engine.
+        store.add_block(&b1).unwrap();
+        store.add_block(&b2).unwrap();
+        store.add_block(&b3).unwrap();
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let report = engine
+            .compute_audit_report(&alice.pubkey_hex())
+            .unwrap();
+
+        assert_eq!(report.total_blocks, 3);
+        assert_eq!(report.audit_blocks, 3);
+        assert_eq!(report.bilateral_blocks, 0);
+        assert!(report.integrity_valid);
+        assert_eq!(report.integrity_score, 1.0);
+        assert_eq!(report.event_type_breakdown.get("tool_call"), Some(&2));
+        assert_eq!(report.event_type_breakdown.get("llm_decision"), Some(&1));
+        assert_eq!(report.first_timestamp, Some(1000));
+        assert_eq!(report.last_timestamp, Some(3000));
+        assert_eq!(report.chain_length, 3);
+    }
+
+    #[test]
+    fn test_audit_report_untyped_events() {
+        let alice = Identity::from_bytes(&[1u8; 32]);
+        let mut store = MemoryBlockStore::new();
+        let mut proto =
+            crate::protocol::TrustChainProtocol::new(alice.clone(), MemoryBlockStore::new());
+
+        let b1 = proto
+            .create_audit(serde_json::json!({"action": "freeform"}), Some(1000))
+            .unwrap();
+        store.add_block(&b1).unwrap();
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let report = engine
+            .compute_audit_report(&alice.pubkey_hex())
+            .unwrap();
+
+        assert_eq!(report.audit_blocks, 1);
+        assert_eq!(report.event_type_breakdown.get("untyped"), Some(&1));
+    }
+
+    #[test]
+    fn test_audit_report_mixed_blocks() {
+        let alice = Identity::from_bytes(&[1u8; 32]);
+        let bob = Identity::from_bytes(&[2u8; 32]);
+        let mut store = MemoryBlockStore::new();
+
+        // Create an audit block.
+        let audit = create_half_block(
+            &alice,
+            1,
+            &alice.pubkey_hex(),
+            0,
+            GENESIS_HASH,
+            BlockType::Audit,
+            serde_json::json!({"event_type": "tool_call"}),
+            Some(1000),
+        );
+        store.add_block(&audit).unwrap();
+
+        // Create a proposal block.
+        let proposal = create_half_block(
+            &alice,
+            2,
+            &bob.pubkey_hex(),
+            0,
+            &audit.block_hash,
+            BlockType::Proposal,
+            serde_json::json!({"interaction_type": "test"}),
+            Some(2000),
+        );
+        store.add_block(&proposal).unwrap();
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let report = engine
+            .compute_audit_report(&alice.pubkey_hex())
+            .unwrap();
+
+        assert_eq!(report.total_blocks, 2);
+        assert_eq!(report.audit_blocks, 1);
+        assert_eq!(report.bilateral_blocks, 1);
+        assert!(report.integrity_valid);
     }
 }

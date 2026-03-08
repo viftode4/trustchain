@@ -207,17 +207,44 @@ async fn proxy_handler<S: BlockStore + 'static, D: DelegationStore + 'static>(
     }
 
     // 3b. If NOT a TC peer, record an audit block (single-player mode).
+    //     Classify the request into semantic event types for structured recording.
     if peer.is_none() {
         if let Some(ref auth) = authority {
-            let tx = serde_json::json!({
-                "audit": true,
-                "method": req.method().as_str(),
-                "path": req.uri().path(),
-                "destination": auth,
-            });
+            let method = req.method().as_str().to_string();
+            let path = req.uri().path().to_string();
+            let event_type = classify_event(auth, &path);
+
             let mut proto = state.protocol.lock().await;
-            if let Err(e) = proto.create_audit(tx, None) {
-                log::warn!("audit block creation failed for {auth}: {e}");
+            // Check if this event type should be recorded under the current audit config.
+            if let Some(et) = trustchain_core::EventType::from_str_loose(&event_type) {
+                if !proto.should_record_event(&et) {
+                    log::debug!("skipping audit block for {auth} (event_type '{event_type}' disabled)");
+                } else {
+                    let tx = serde_json::json!({
+                        "event_type": event_type,
+                        "action": format!("{method} {path}"),
+                        "outcome": "forwarded",
+                        "destination": auth,
+                        "method": method,
+                        "path": path,
+                    });
+                    if let Err(e) = proto.create_audit(tx, None) {
+                        log::warn!("audit block creation failed for {auth}: {e}");
+                    }
+                }
+            } else {
+                // Unknown event type — record as external_api (always, unless filtered).
+                let tx = serde_json::json!({
+                    "event_type": event_type,
+                    "action": format!("{method} {path}"),
+                    "outcome": "forwarded",
+                    "destination": auth,
+                    "method": method,
+                    "path": path,
+                });
+                if let Err(e) = proto.create_audit(tx, None) {
+                    log::warn!("audit block creation failed for {auth}: {e}");
+                }
             }
         }
     }
@@ -671,6 +698,56 @@ async fn forward_request(
 }
 
 // ---------------------------------------------------------------------------
+// Semantic event classification for audit blocks
+// ---------------------------------------------------------------------------
+
+/// Known LLM API host patterns for automatic event classification.
+const LLM_HOSTS: &[&str] = &[
+    "api.openai.com",
+    "api.anthropic.com",
+    "generativelanguage.googleapis.com",
+    "api.mistral.ai",
+    "api.cohere.ai",
+    "api.cohere.com",
+    "api.together.xyz",
+    "api.groq.com",
+    "api.deepseek.com",
+    "api.fireworks.ai",
+];
+
+/// Path patterns that indicate tool/action invocations.
+const TOOL_PATH_PATTERNS: &[&str] = &[
+    "/tool",
+    "/action",
+    "/execute",
+    "/invoke",
+    "/run",
+    "/call_tool",
+];
+
+/// Classify an outbound HTTP request into a semantic event type.
+///
+/// Returns one of: "llm_decision", "tool_call", "external_api".
+fn classify_event(authority: &str, path: &str) -> String {
+    // Check against known LLM API hosts.
+    let host = authority.split(':').next().unwrap_or(authority);
+    if LLM_HOSTS.contains(&host) {
+        return "llm_decision".to_string();
+    }
+
+    // Check against known tool/action path patterns.
+    let path_lower = path.to_lowercase();
+    if TOOL_PATH_PATTERNS
+        .iter()
+        .any(|&p| path_lower.contains(p))
+    {
+        return "tool_call".to_string();
+    }
+
+    "external_api".to_string()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -773,5 +850,63 @@ mod tests {
         // Unknown address returns None.
         let none = disc.get_peer_by_address("1.2.3.4:9999").await;
         assert!(none.is_none());
+    }
+
+    // --- classify_event tests ---
+
+    #[test]
+    fn test_classify_event_llm_hosts() {
+        assert_eq!(
+            classify_event("api.openai.com", "/v1/chat/completions"),
+            "llm_decision"
+        );
+        assert_eq!(
+            classify_event("api.anthropic.com", "/v1/messages"),
+            "llm_decision"
+        );
+        assert_eq!(
+            classify_event("generativelanguage.googleapis.com", "/v1beta/models"),
+            "llm_decision"
+        );
+        assert_eq!(
+            classify_event("api.mistral.ai", "/v1/chat/completions"),
+            "llm_decision"
+        );
+        assert_eq!(
+            classify_event("api.openai.com:443", "/v1/chat/completions"),
+            "llm_decision"
+        );
+    }
+
+    #[test]
+    fn test_classify_event_tool_paths() {
+        assert_eq!(
+            classify_event("my-service:8080", "/api/tool/run"),
+            "tool_call"
+        );
+        assert_eq!(
+            classify_event("localhost:9000", "/execute"),
+            "tool_call"
+        );
+        assert_eq!(
+            classify_event("agent-b:8202", "/v1/invoke"),
+            "tool_call"
+        );
+        assert_eq!(
+            classify_event("example.com", "/call_tool"),
+            "tool_call"
+        );
+    }
+
+    #[test]
+    fn test_classify_event_external_api() {
+        assert_eq!(
+            classify_event("api.stripe.com", "/v1/charges"),
+            "external_api"
+        );
+        assert_eq!(
+            classify_event("example.com", "/api/data"),
+            "external_api"
+        );
     }
 }

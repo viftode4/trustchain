@@ -88,6 +88,9 @@ pub enum TrustChainError {
 
     #[error("serialization error: {0}")]
     Serialization(String),
+
+    #[error("validation error: {0}")]
+    Validation(String),
 }
 
 impl TrustChainError {
@@ -165,6 +168,10 @@ impl TrustChainError {
             pubkey: pubkey.into(),
             detail: detail.into(),
         }
+    }
+
+    pub fn validation(detail: impl Into<String>) -> Self {
+        Self::Validation(detail.into())
     }
 
     pub fn succession(

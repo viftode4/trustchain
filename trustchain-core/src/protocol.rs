@@ -10,18 +10,36 @@ use crate::delegation::{DelegationRecord, DelegationStore, SuccessionRecord};
 use crate::error::{Result, TrustChainError};
 use crate::halfblock::{create_half_block, validate_and_record, verify_block, HalfBlock};
 use crate::identity::Identity;
-use crate::types::{BlockType, ValidationResult, GENESIS_HASH, MAX_DELEGATION_TTL_MS};
+use crate::schema::{validate_transaction, SchemaId};
+use crate::types::{
+    AuditConfig, BlockType, EventType, ValidationResult, GENESIS_HASH, MAX_DELEGATION_TTL_MS,
+};
 
 /// The TrustChain protocol engine. Manages proposal/agreement lifecycle for one agent.
 pub struct TrustChainProtocol<S: BlockStore> {
     identity: Identity,
     store: S,
+    audit_config: Option<AuditConfig>,
 }
 
 impl<S: BlockStore> TrustChainProtocol<S> {
     /// Create a new protocol instance for the given identity and store.
     pub fn new(identity: Identity, store: S) -> Self {
-        Self { identity, store }
+        Self {
+            identity,
+            store,
+            audit_config: None,
+        }
+    }
+
+    /// Set the audit configuration (recording level and schema validation).
+    pub fn set_audit_config(&mut self, config: AuditConfig) {
+        self.audit_config = Some(config);
+    }
+
+    /// Get the current audit configuration, if any.
+    pub fn audit_config(&self) -> Option<&AuditConfig> {
+        self.audit_config.as_ref()
     }
 
     /// Get this agent's public key hex.
@@ -313,11 +331,23 @@ impl<S: BlockStore> TrustChainProtocol<S> {
     /// Audit blocks record interactions as a cryptographic audit trail even when
     /// no TrustChain peer is available. They count for integrity and recency but
     /// NOT for diversity or connectivity (self-attested, no Sybil resistance).
+    ///
+    /// If an `AuditConfig` with a schema is set, the transaction is validated
+    /// against the schema before the block is created.
     pub fn create_audit(
         &mut self,
         transaction: serde_json::Value,
         timestamp: Option<u64>,
     ) -> Result<HalfBlock> {
+        // Validate against schema if configured.
+        if let Some(ref config) = self.audit_config {
+            if let Some(ref schema_name) = config.schema {
+                if let Some(schema_id) = SchemaId::from_str_loose(schema_name) {
+                    validate_transaction(&schema_id, &transaction)?;
+                }
+            }
+        }
+
         let pubkey = self.identity.pubkey_hex();
         let seq = self.store.get_latest_seq(&pubkey)? + 1;
         let prev_hash = self.store.get_head_hash(&pubkey)?;
@@ -335,6 +365,65 @@ impl<S: BlockStore> TrustChainProtocol<S> {
 
         self.store.add_block(&block)?;
         Ok(block)
+    }
+
+    /// Check if the given event type should be recorded under the current config.
+    ///
+    /// Returns `true` if no config is set (freeform mode records everything)
+    /// or if the event type is enabled in the config.
+    pub fn should_record_event(&self, event_type: &EventType) -> bool {
+        match &self.audit_config {
+            Some(config) => config.is_event_enabled(event_type),
+            None => true,
+        }
+    }
+
+    /// Create multiple audit blocks in a single batch.
+    ///
+    /// Each entry is validated against the schema (if configured) before any
+    /// blocks are created. On schema validation failure, returns an error and
+    /// no blocks are created (atomic: all-or-nothing).
+    pub fn create_audit_batch(
+        &mut self,
+        entries: Vec<serde_json::Value>,
+    ) -> Result<Vec<HalfBlock>> {
+        // Pre-validate all entries against schema.
+        if let Some(ref config) = self.audit_config {
+            if let Some(ref schema_name) = config.schema {
+                if let Some(schema_id) = SchemaId::from_str_loose(schema_name) {
+                    for (i, entry) in entries.iter().enumerate() {
+                        validate_transaction(&schema_id, entry).map_err(|e| {
+                            TrustChainError::validation(format!(
+                                "batch entry {i}: {e}"
+                            ))
+                        })?;
+                    }
+                }
+            }
+        }
+
+        let mut blocks = Vec::with_capacity(entries.len());
+        for entry in entries {
+            // Schema already validated above, create directly.
+            let pubkey = self.identity.pubkey_hex();
+            let seq = self.store.get_latest_seq(&pubkey)? + 1;
+            let prev_hash = self.store.get_head_hash(&pubkey)?;
+
+            let block = create_half_block(
+                &self.identity,
+                seq,
+                &pubkey,
+                0,
+                &prev_hash,
+                BlockType::Audit,
+                entry,
+                None,
+            );
+
+            self.store.add_block(&block)?;
+            blocks.push(block);
+        }
+        Ok(blocks)
     }
 
     // -----------------------------------------------------------------------
@@ -1585,5 +1674,121 @@ mod tests {
             result.is_valid(),
             "audit block should pass invariants: {result:?}"
         );
+    }
+
+    #[test]
+    fn test_create_audit_with_schema_validation() {
+        let alice = Identity::from_bytes(&[1u8; 32]);
+        let mut proto = TrustChainProtocol::new(alice, MemoryBlockStore::new());
+
+        proto.set_audit_config(AuditConfig {
+            schema: Some("base".to_string()),
+            ..Default::default()
+        });
+
+        // Valid transaction — has action and outcome.
+        let result = proto.create_audit(
+            serde_json::json!({"action": "test", "outcome": "completed"}),
+            None,
+        );
+        assert!(result.is_ok());
+
+        // Invalid transaction — missing outcome.
+        let result = proto.create_audit(serde_json::json!({"action": "test"}), None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("outcome"));
+    }
+
+    #[test]
+    fn test_create_audit_no_schema_allows_freeform() {
+        let alice = Identity::from_bytes(&[1u8; 32]);
+        let mut proto = TrustChainProtocol::new(alice, MemoryBlockStore::new());
+
+        // No schema configured — any JSON is fine.
+        let result = proto.create_audit(serde_json::json!({"anything": 42}), None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_audit_batch_happy_path() {
+        let alice = Identity::from_bytes(&[1u8; 32]);
+        let mut proto = TrustChainProtocol::new(alice.clone(), MemoryBlockStore::new());
+
+        let entries = vec![
+            serde_json::json!({"action": "step1"}),
+            serde_json::json!({"action": "step2"}),
+            serde_json::json!({"action": "step3"}),
+        ];
+
+        let blocks = proto.create_audit_batch(entries).unwrap();
+        assert_eq!(blocks.len(), 3);
+
+        // Verify chain linkage.
+        assert_eq!(blocks[0].sequence_number, 1);
+        assert_eq!(blocks[1].sequence_number, 2);
+        assert_eq!(blocks[2].sequence_number, 3);
+        assert_eq!(blocks[0].previous_hash, GENESIS_HASH);
+        assert_eq!(blocks[1].previous_hash, blocks[0].block_hash);
+        assert_eq!(blocks[2].previous_hash, blocks[1].block_hash);
+
+        // All are audit blocks.
+        for b in &blocks {
+            assert_eq!(b.block_type, "audit");
+            assert_eq!(b.public_key, b.link_public_key);
+        }
+    }
+
+    #[test]
+    fn test_create_audit_batch_empty() {
+        let alice = Identity::from_bytes(&[1u8; 32]);
+        let mut proto = TrustChainProtocol::new(alice, MemoryBlockStore::new());
+
+        let blocks = proto.create_audit_batch(vec![]).unwrap();
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn test_create_audit_batch_schema_fail_is_atomic() {
+        let alice = Identity::from_bytes(&[1u8; 32]);
+        let mut proto = TrustChainProtocol::new(alice.clone(), MemoryBlockStore::new());
+
+        proto.set_audit_config(AuditConfig {
+            schema: Some("base".to_string()),
+            ..Default::default()
+        });
+
+        // Second entry is invalid — missing outcome.
+        let entries = vec![
+            serde_json::json!({"action": "ok", "outcome": "completed"}),
+            serde_json::json!({"action": "bad"}), // missing outcome
+        ];
+
+        let result = proto.create_audit_batch(entries);
+        assert!(result.is_err());
+
+        // No blocks should have been created (atomic).
+        assert_eq!(proto.store().get_latest_seq(&alice.pubkey_hex()).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_should_record_event_no_config() {
+        let alice = Identity::from_bytes(&[1u8; 32]);
+        let proto = TrustChainProtocol::new(alice, MemoryBlockStore::new());
+
+        // No config = record everything.
+        assert!(proto.should_record_event(&EventType::ToolCall));
+        assert!(proto.should_record_event(&EventType::RawHttp));
+    }
+
+    #[test]
+    fn test_should_record_event_minimal() {
+        let alice = Identity::from_bytes(&[1u8; 32]);
+        let mut proto = TrustChainProtocol::new(alice, MemoryBlockStore::new());
+        proto.set_audit_config(AuditConfig::with_level(crate::types::AuditLevel::Minimal));
+
+        assert!(proto.should_record_event(&EventType::ToolCall));
+        assert!(proto.should_record_event(&EventType::Error));
+        assert!(!proto.should_record_event(&EventType::LlmDecision));
+        assert!(!proto.should_record_event(&EventType::RawHttp));
     }
 }
