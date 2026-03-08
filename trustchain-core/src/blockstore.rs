@@ -80,6 +80,24 @@ pub trait BlockStore: Send {
     /// Remove a peer record by public key.
     fn remove_stale_peer(&mut self, pubkey: &str) -> Result<()>;
 
+    /// Look up a block by its hash. Default implementation scans all blocks; SQLite
+    /// overrides with an indexed query.
+    fn get_block_by_hash(&self, block_hash: &str) -> Option<HalfBlock> {
+        // Fallback: scan all pubkeys and chains.
+        if let Ok(pubkeys) = self.get_all_pubkeys() {
+            for pk in pubkeys {
+                if let Ok(chain) = self.get_chain(&pk) {
+                    for block in chain {
+                        if block.block_hash == block_hash {
+                            return Some(block);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Get all blocks for an agent filtered by interaction context, sorted ascending.
     ///
     /// Context matches blocks whose `transaction.interaction_type` equals `context`
@@ -773,6 +791,21 @@ impl BlockStore for SqliteBlockStore {
             blocks.push(row.map_err(|e| TrustChainError::Storage(e.to_string()))?);
         }
         Ok(blocks)
+    }
+
+    fn get_block_by_hash(&self, block_hash: &str) -> Option<HalfBlock> {
+        let conn = self.lock_conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT public_key, sequence_number, link_public_key, link_sequence_number,
+                 previous_hash, signature, block_type, tx_data, block_hash, timestamp
+                 FROM blocks WHERE block_hash = ?1 LIMIT 1",
+            )
+            .ok()?;
+        let mut rows = stmt
+            .query_map(params![block_hash], Self::row_to_block)
+            .ok()?;
+        rows.next()?.ok()
     }
 }
 

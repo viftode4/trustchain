@@ -14,9 +14,9 @@ use trustchain_core::{
 use trustchain_transport::{
     build_router, discover,
     message::{
-        block_to_bytes, bytes_to_block, BlockPairBroadcastPayload, CheckpointFinalizedPayload,
-        CheckpointProposalPayload, CheckpointVotePayload, CheckpointWire, FraudProofPayload,
-        MessageType, TransportMessage,
+        block_to_bytes, bytes_to_block, BlockMetadataPayload, BlockMetadataRequestPayload,
+        BlockPairBroadcastPayload, CheckpointFinalizedPayload, CheckpointProposalPayload,
+        CheckpointVotePayload, CheckpointWire, FraudProofPayload, MessageType, TransportMessage,
     },
     start_grpc_server, start_proxy_server, AppState, ConnectionPool, PeerDiscovery, ProxyState,
     QuicTransport, QUIC_PORT_OFFSET,
@@ -24,10 +24,20 @@ use trustchain_transport::{
 
 use crate::config::NodeConfig;
 
-/// Default broadcast fanout (number of peers to gossip to).
+/// Plumtree eager fanout — send full blocks to K random peers.
+const EAGER_FANOUT: usize = 4;
+/// Plumtree lazy fanout — send metadata-only to M additional peers.
+const LAZY_FANOUT: usize = 3;
+/// Legacy broadcast fanout (for fraud proofs and non-Plumtree messages).
 const BROADCAST_FANOUT: usize = 10;
 /// Default TTL for broadcast messages.
 const BROADCAST_TTL: u8 = 3;
+/// SWIM: consecutive failures before asking other peers to probe.
+const SWIM_SUSPECT_THRESHOLD: u32 = 3;
+/// SWIM: number of random peers to ask for indirect probe.
+const SWIM_INDIRECT_PROBES: usize = 2;
+/// SWIM: total failures (direct + indirect) before eviction.
+const SWIM_EVICT_THRESHOLD: u32 = 5;
 /// Max number of relayed block IDs to track (ring buffer).
 const BROADCAST_HISTORY_SIZE: usize = 10_000;
 
@@ -302,8 +312,16 @@ impl Node {
         let disc_protocol = self.protocol.clone();
         let bootstrap_nodes = self.config.effective_bootstrap_nodes();
         let disc_delegation_store = self.delegation_store.clone();
+        let disc_quic = quic_accept_handle.1.clone();
         let discovery_handle = tokio::spawn(async move {
-            Self::discovery_loop(disc, disc_protocol, bootstrap_nodes, disc_delegation_store).await;
+            Self::discovery_loop(
+                disc,
+                disc_protocol,
+                bootstrap_nodes,
+                disc_delegation_store,
+                disc_quic,
+            )
+            .await;
         });
         tracing::info!("peer discovery started");
 
@@ -1095,11 +1113,85 @@ impl Node {
                     .unwrap_or_default()
             }
 
+            // Plumtree lazy push: peer sends us metadata about a block pair.
+            // If we don't have it, request the full block.
+            MessageType::BlockMetadata => {
+                let meta: BlockMetadataPayload = match serde_json::from_slice(&msg.payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        return Self::error_response(&format!("invalid block metadata: {e}"));
+                    }
+                };
+
+                let block_id = format!("{}:{}", meta.block1_hash, meta.block2_hash);
+                let already_seen = {
+                    let mut t = tracker.lock().await;
+                    !t.mark_if_new(&block_id)
+                };
+
+                if already_seen {
+                    // We already have this block pair, ignore.
+                    serde_json::to_vec(&serde_json::json!({"status": "already_have"}))
+                        .unwrap_or_default()
+                } else {
+                    // Request the full block pair from the sender.
+                    let req_payload = BlockMetadataRequestPayload {
+                        block1_hash: meta.block1_hash,
+                        block2_hash: meta.block2_hash,
+                    };
+                    let resp = TransportMessage::new(
+                        MessageType::BlockMetadataRequest,
+                        {
+                            let proto = protocol.lock().await;
+                            proto.pubkey()
+                        },
+                        serde_json::to_vec(&req_payload).unwrap_or_default(),
+                        msg.request_id,
+                    );
+                    serde_json::to_vec(&resp).unwrap_or_default()
+                }
+            }
+
+            // Plumtree: peer requests full block pair after receiving our metadata.
+            // Look up the blocks in our store and return them.
+            MessageType::BlockMetadataRequest => {
+                let req: BlockMetadataRequestPayload = match serde_json::from_slice(&msg.payload) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return Self::error_response(&format!(
+                            "invalid block metadata request: {e}"
+                        ));
+                    }
+                };
+
+                let proto = protocol.lock().await;
+                let block1 = proto.store().get_block_by_hash(&req.block1_hash);
+                let block2 = proto.store().get_block_by_hash(&req.block2_hash);
+
+                match (block1, block2) {
+                    (Some(b1), Some(b2)) => {
+                        let payload = BlockPairBroadcastPayload {
+                            block1: b1,
+                            block2: b2,
+                            ttl: 1, // Don't relay further — the requester already has metadata.
+                        };
+                        let resp = TransportMessage::new(
+                            MessageType::BlockPairBroadcast,
+                            proto.pubkey(),
+                            serde_json::to_vec(&payload).unwrap_or_default(),
+                            msg.request_id,
+                        );
+                        serde_json::to_vec(&resp).unwrap_or_default()
+                    }
+                    _ => Self::error_response("block pair not found"),
+                }
+            }
+
             _ => Self::error_response("unhandled message type"),
         }
     }
 
-    /// Broadcast a block pair to random peers via QUIC.
+    /// Plumtree broadcast: eager push (full blocks) to K peers, lazy push (metadata) to M more.
     async fn broadcast_to_peers(
         payload: &BlockPairBroadcastPayload,
         our_pubkey: &str,
@@ -1107,45 +1199,94 @@ impl Node {
         quic: &Arc<QuicTransport>,
         _tracker: &Arc<Mutex<BroadcastTracker>>,
     ) {
-        let peers = discovery.get_gossip_peers(BROADCAST_FANOUT).await;
+        let total_needed = EAGER_FANOUT + LAZY_FANOUT;
+        let peers = discovery.get_gossip_peers(total_needed).await;
         if peers.is_empty() {
             return;
         }
 
-        let msg = TransportMessage::new(
+        // Split peers: first EAGER_FANOUT get full blocks, rest get metadata only.
+        let eager_count = EAGER_FANOUT.min(peers.len());
+        let (eager_peers, lazy_peers) = peers.split_at(eager_count);
+
+        // Eager push: full block pair.
+        let full_msg = TransportMessage::new(
             MessageType::BlockPairBroadcast,
             our_pubkey.to_string(),
             serde_json::to_vec(payload).unwrap_or_default(),
             format!("bc-{}", payload.block1.block_hash.get(..8).unwrap_or("?")),
         );
-        let msg_bytes = serde_json::to_vec(&msg).unwrap_or_default();
+        let full_msg_bytes = serde_json::to_vec(&full_msg).unwrap_or_default();
 
-        for peer in peers {
-            // Derive QUIC address from HTTP address (port - QUIC_PORT_OFFSET).
-            let quic_addr = match peer
-                .address
-                .strip_prefix("http://")
-                .unwrap_or(&peer.address)
-                .parse::<SocketAddr>()
-            {
-                Ok(a) => SocketAddr::new(a.ip(), a.port().saturating_sub(QUIC_PORT_OFFSET)),
-                Err(_) => continue,
+        for peer in eager_peers {
+            let quic_addr = match Self::derive_quic_addr(&peer.address) {
+                Some(a) => a,
+                None => continue,
             };
-
             let quic = quic.clone();
-            let msg_bytes = msg_bytes.clone();
+            let bytes = full_msg_bytes.clone();
             tokio::spawn(async move {
                 match tokio::time::timeout(
                     Duration::from_secs(5),
-                    quic.send_message(quic_addr, &msg_bytes),
+                    quic.send_message(quic_addr, &bytes),
                 )
                 .await
                 {
                     Ok(Ok(_)) => {}
-                    Ok(Err(e)) => tracing::debug!("broadcast send error: {e}"),
-                    Err(_) => tracing::debug!("broadcast send timeout"),
+                    Ok(Err(e)) => tracing::debug!("eager broadcast error: {e}"),
+                    Err(_) => tracing::debug!("eager broadcast timeout"),
                 }
             });
+        }
+
+        // Lazy push: metadata only (~100 bytes vs ~2KB).
+        if !lazy_peers.is_empty() {
+            let meta_payload = BlockMetadataPayload {
+                block1_hash: payload.block1.block_hash.clone(),
+                block2_hash: payload.block2.block_hash.clone(),
+                sequence_number: payload.block1.sequence_number,
+                creator_pubkey: payload.block1.public_key.clone(),
+            };
+            let meta_msg = TransportMessage::new(
+                MessageType::BlockMetadata,
+                our_pubkey.to_string(),
+                serde_json::to_vec(&meta_payload).unwrap_or_default(),
+                format!("meta-{}", payload.block1.block_hash.get(..8).unwrap_or("?")),
+            );
+            let meta_msg_bytes = serde_json::to_vec(&meta_msg).unwrap_or_default();
+
+            for peer in lazy_peers {
+                let quic_addr = match Self::derive_quic_addr(&peer.address) {
+                    Some(a) => a,
+                    None => continue,
+                };
+                let quic = quic.clone();
+                let bytes = meta_msg_bytes.clone();
+                tokio::spawn(async move {
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        quic.send_message(quic_addr, &bytes),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => tracing::debug!("lazy broadcast error: {e}"),
+                        Err(_) => tracing::debug!("lazy broadcast timeout"),
+                    }
+                });
+            }
+        }
+    }
+
+    /// Derive QUIC socket address from an HTTP peer address string.
+    fn derive_quic_addr(address: &str) -> Option<SocketAddr> {
+        let addr_str = address.strip_prefix("http://").unwrap_or(address);
+        match addr_str.parse::<SocketAddr>() {
+            Ok(a) => Some(SocketAddr::new(
+                a.ip(),
+                a.port().saturating_sub(QUIC_PORT_OFFSET),
+            )),
+            Err(_) => None,
         }
     }
 
@@ -1207,14 +1348,9 @@ impl Node {
         let msg_bytes = serde_json::to_vec(&msg).unwrap_or_default();
 
         for peer in peers {
-            let quic_addr = match peer
-                .address
-                .strip_prefix("http://")
-                .unwrap_or(&peer.address)
-                .parse::<SocketAddr>()
-            {
-                Ok(a) => SocketAddr::new(a.ip(), a.port().saturating_sub(QUIC_PORT_OFFSET)),
-                Err(_) => continue,
+            let quic_addr = match Self::derive_quic_addr(&peer.address) {
+                Some(a) => a,
+                None => continue,
             };
 
             let quic = quic.clone();
@@ -1269,16 +1405,15 @@ impl Node {
         serde_json::to_vec(&resp).unwrap_or_default()
     }
 
-    /// Peer discovery: bootstrap then periodic gossip.
+    /// Peer discovery: bootstrap then periodic gossip via QUIC (with HTTP fallback).
     async fn discovery_loop(
         discovery: Arc<PeerDiscovery>,
         protocol: Arc<Mutex<TrustChainProtocol<SqliteBlockStore>>>,
         bootstrap_nodes: Vec<String>,
-        // Kept in signature for future delegation-aware sync; not used while
-        // auto-accept is disabled (see C7 fix).
         _delegation_store: Arc<Mutex<SqliteDelegationStore>>,
+        quic: Arc<QuicTransport>,
     ) {
-        // Phase 1: Bootstrap — connect to known nodes and fetch their peers.
+        // Phase 1: Bootstrap — connect to known nodes via HTTP (QUIC addr unknown yet).
         for addr in &bootstrap_nodes {
             tracing::info!(addr = %addr, "bootstrapping from peer");
             match Self::fetch_status_http(addr).await {
@@ -1307,41 +1442,91 @@ impl Node {
         let peer_count = discovery.peer_count().await;
         tracing::info!(peer_count, "bootstrap complete");
 
-        // Phase 2: Periodic gossip — exchange peer lists with random peers.
+        // Phase 2: Periodic gossip — exchange peer lists via QUIC, HTTP fallback.
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
 
+            let our_pubkey = {
+                let proto = protocol.lock().await;
+                proto.pubkey()
+            };
+
             let gossip_peers = discovery.get_gossip_peers(3).await;
-            for peer in gossip_peers {
-                // Refresh peer status.
-                match Self::fetch_status_http(&peer.address).await {
-                    Ok((pubkey, latest_seq, agent_endpoint)) => {
+            for peer in &gossip_peers {
+                let quic_addr = match Self::derive_quic_addr(&peer.address) {
+                    Some(a) => a,
+                    None => continue,
+                };
+
+                // Try QUIC status first, fall back to HTTP.
+                match Self::fetch_status_quic(&quic, quic_addr, &our_pubkey).await {
+                    Ok((pubkey, latest_seq)) => {
                         discovery
-                            .add_peer(pubkey.clone(), peer.address.clone(), latest_seq)
+                            .add_peer(pubkey, peer.address.clone(), latest_seq)
                             .await;
-                        if let Some(ep) = agent_endpoint {
-                            discovery.add_alias(ep, pubkey).await;
-                        }
                     }
                     Err(_) => {
-                        // Stale peer — remove if not seen for 5 minutes.
-                        let now = trustchain_transport::discovery::now_unix_ms();
-                        if now.saturating_sub(peer.last_seen_unix_ms) > 300_000 {
-                            discovery.remove_peer(&peer.pubkey).await;
+                        // QUIC failed — try HTTP fallback.
+                        match Self::fetch_status_http(&peer.address).await {
+                            Ok((pubkey, latest_seq, agent_endpoint)) => {
+                                discovery
+                                    .add_peer(pubkey.clone(), peer.address.clone(), latest_seq)
+                                    .await;
+                                if let Some(ep) = agent_endpoint {
+                                    discovery.add_alias(ep, pubkey).await;
+                                }
+                            }
+                            Err(_) => {
+                                // Both failed — SWIM failure tracking.
+                                discovery.increment_failure(&peer.pubkey).await;
+                                let failures = discovery.get_failure_count(&peer.pubkey).await;
+
+                                if (SWIM_SUSPECT_THRESHOLD..SWIM_EVICT_THRESHOLD)
+                                    .contains(&failures)
+                                {
+                                    // Ask indirect probers to check the suspect.
+                                    Self::swim_indirect_probe(
+                                        &peer.pubkey,
+                                        &peer.address,
+                                        &discovery,
+                                        &quic,
+                                        &our_pubkey,
+                                    )
+                                    .await;
+                                } else if failures >= SWIM_EVICT_THRESHOLD {
+                                    tracing::warn!(
+                                        peer = &peer.pubkey[..8.min(peer.pubkey.len())],
+                                        failures,
+                                        "evicting unresponsive peer (SWIM)"
+                                    );
+                                    discovery.remove_peer(&peer.pubkey).await;
+                                }
+                                continue;
+                            }
                         }
                     }
                 }
 
-                // Exchange peer lists.
-                if let Ok(peers) = Self::fetch_peers_http(&peer.address).await {
-                    for (pk, address, seq) in peers {
-                        discovery.add_peer(pk, address, seq).await;
+                // Exchange peer lists via QUIC DiscoveryRequest.
+                match Self::fetch_peers_quic(&quic, quic_addr, &our_pubkey, &discovery).await {
+                    Ok(peers) => {
+                        for (pk, address, seq) in peers {
+                            discovery.add_peer(pk, address, seq).await;
+                        }
+                    }
+                    Err(_) => {
+                        // QUIC peer exchange failed — HTTP fallback.
+                        if let Ok(peers) = Self::fetch_peers_http(&peer.address).await {
+                            for (pk, address, seq) in peers {
+                                discovery.add_peer(pk, address, seq).await;
+                            }
+                        }
                     }
                 }
             }
 
-            // Sync chains from peers we know about.
+            // Sync chains from peers we know about via QUIC CrawlRequest.
             let all_peers = discovery.get_peers().await;
             for peer in &all_peers {
                 let our_seq = {
@@ -1349,39 +1534,52 @@ impl Node {
                     proto.store().get_latest_seq(&peer.pubkey).unwrap_or(0)
                 };
                 if peer.latest_seq > our_seq {
-                    // Fetch missing blocks.
-                    if let Ok(blocks) =
-                        Self::fetch_crawl_http(&peer.address, &peer.pubkey, our_seq + 1).await
+                    let quic_addr = match Self::derive_quic_addr(&peer.address) {
+                        Some(a) => a,
+                        None => continue,
+                    };
+
+                    // Try QUIC crawl first, fall back to HTTP.
+                    let blocks = match Self::fetch_crawl_quic(
+                        &quic,
+                        quic_addr,
+                        &our_pubkey,
+                        &peer.pubkey,
+                        our_seq + 1,
+                    )
+                    .await
                     {
+                        Ok(b) => b,
+                        Err(_) => {
+                            // HTTP fallback for crawl.
+                            Self::fetch_crawl_http(&peer.address, &peer.pubkey, our_seq + 1)
+                                .await
+                                .unwrap_or_default()
+                        }
+                    };
+
+                    if !blocks.is_empty() {
                         let mut proto = protocol.lock().await;
-                        let our_pubkey = proto.pubkey();
+                        let our_pk = proto.pubkey();
                         for block in &blocks {
                             if let Err(e) = proto.store_mut().add_block(block) {
-                                // DuplicateSequence is expected during sync — not an error.
                                 if !e.to_string().to_lowercase().contains("duplicate") {
                                     tracing::warn!(error = %e, "failed to store synced block");
                                 }
                             }
                         }
-                        if !blocks.is_empty() {
-                            tracing::info!(
-                                peer = &peer.pubkey[..8],
-                                synced = blocks.len(),
-                                "synced blocks from peer"
-                            );
-                        }
+                        tracing::info!(
+                            peer = &peer.pubkey[..8],
+                            synced = blocks.len(),
+                            "synced blocks from peer"
+                        );
 
-                        // Notify the operator about pending delegation proposals targeting us.
-                        // Do NOT auto-accept: silently accepting delegations during crawl
-                        // allows any peer to grant themselves authority over our node without
-                        // operator consent. The operator MUST explicitly call
-                        // POST /accept_delegation to accept each delegation.
+                        // Notify about pending delegation proposals targeting us.
                         for block in &blocks {
                             if block.block_type
                                 == trustchain_core::BlockType::Delegation.to_string()
-                                && block.link_public_key == our_pubkey
+                                && block.link_public_key == our_pk
                                 && block.link_sequence_number == 0
-                            // proposal (not yet accepted)
                             {
                                 let delegation_id = block
                                     .transaction
@@ -1413,6 +1611,171 @@ impl Node {
                 }
             }
         }
+    }
+
+    /// SWIM indirect probe: ask random peers to ping a suspect on our behalf.
+    async fn swim_indirect_probe(
+        suspect_pubkey: &str,
+        _suspect_address: &str,
+        discovery: &Arc<PeerDiscovery>,
+        quic: &Arc<QuicTransport>,
+        our_pubkey: &str,
+    ) {
+        let probers = discovery.get_gossip_peers(SWIM_INDIRECT_PROBES + 1).await;
+        let mut probed = 0;
+
+        for prober in &probers {
+            if prober.pubkey == suspect_pubkey {
+                continue;
+            }
+            if probed >= SWIM_INDIRECT_PROBES {
+                break;
+            }
+
+            let quic_addr = match Self::derive_quic_addr(&prober.address) {
+                Some(a) => a,
+                None => continue,
+            };
+
+            // Send a Ping to the prober — if they can reach the suspect, they'll
+            // have recently exchanged with it. We use this as a heuristic.
+            let ping = TransportMessage::new(
+                MessageType::Ping,
+                our_pubkey.to_string(),
+                suspect_pubkey.as_bytes().to_vec(),
+                format!("swim-{}", &suspect_pubkey[..8.min(suspect_pubkey.len())]),
+            );
+            let ping_bytes = serde_json::to_vec(&ping).unwrap_or_default();
+
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                quic.send_message(quic_addr, &ping_bytes),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    // Prober responded — suspect may still be alive via other paths.
+                    // Don't escalate failure for this round.
+                    tracing::debug!(
+                        suspect = &suspect_pubkey[..8.min(suspect_pubkey.len())],
+                        prober = &prober.pubkey[..8.min(prober.pubkey.len())],
+                        "SWIM indirect probe succeeded"
+                    );
+                    discovery.reset_failure(suspect_pubkey).await;
+                    return;
+                }
+                _ => {
+                    probed += 1;
+                }
+            }
+        }
+
+        // All indirect probes failed — increment failure again.
+        if probed > 0 {
+            discovery.increment_failure(suspect_pubkey).await;
+            tracing::debug!(
+                suspect = &suspect_pubkey[..8.min(suspect_pubkey.len())],
+                "SWIM indirect probes all failed"
+            );
+        }
+    }
+
+    /// Fetch status from a peer via QUIC StatusRequest.
+    async fn fetch_status_quic(
+        quic: &Arc<QuicTransport>,
+        addr: SocketAddr,
+        our_pubkey: &str,
+    ) -> anyhow::Result<(String, u64)> {
+        let msg = TransportMessage::new(
+            MessageType::StatusRequest,
+            our_pubkey.to_string(),
+            Vec::new(),
+            "status-q".to_string(),
+        );
+        let msg_bytes = serde_json::to_vec(&msg)?;
+
+        let resp_bytes =
+            tokio::time::timeout(Duration::from_secs(5), quic.send_message(addr, &msg_bytes))
+                .await
+                .map_err(|_| anyhow::anyhow!("timeout"))?
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let resp: serde_json::Value = serde_json::from_slice(&resp_bytes)?;
+        let pubkey = resp
+            .get("public_key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing public_key"))?
+            .to_string();
+        let latest_seq = resp.get("latest_seq").and_then(|v| v.as_u64()).unwrap_or(0);
+        Ok((pubkey, latest_seq))
+    }
+
+    /// Fetch peer list via QUIC DiscoveryRequest.
+    async fn fetch_peers_quic(
+        quic: &Arc<QuicTransport>,
+        addr: SocketAddr,
+        our_pubkey: &str,
+        discovery: &Arc<PeerDiscovery>,
+    ) -> anyhow::Result<Vec<(String, String, u64)>> {
+        // Send our peers as payload so the remote can merge them too.
+        let our_peers: Vec<(String, String, u64)> = discovery
+            .get_gossip_peers(20)
+            .await
+            .into_iter()
+            .map(|p| (p.pubkey, p.address, p.latest_seq))
+            .collect();
+
+        let msg = TransportMessage::new(
+            MessageType::DiscoveryRequest,
+            our_pubkey.to_string(),
+            serde_json::to_vec(&our_peers).unwrap_or_default(),
+            "disc-q".to_string(),
+        );
+        let msg_bytes = serde_json::to_vec(&msg)?;
+
+        let resp_bytes =
+            tokio::time::timeout(Duration::from_secs(5), quic.send_message(addr, &msg_bytes))
+                .await
+                .map_err(|_| anyhow::anyhow!("timeout"))?
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // The response is a DiscoveryResponse TransportMessage with peers as payload.
+        let resp: TransportMessage = serde_json::from_slice(&resp_bytes)?;
+        let peers: Vec<(String, String, u64)> =
+            serde_json::from_slice(&resp.payload).unwrap_or_default();
+        Ok(peers)
+    }
+
+    /// Fetch blocks via QUIC CrawlRequest.
+    async fn fetch_crawl_quic(
+        quic: &Arc<QuicTransport>,
+        addr: SocketAddr,
+        our_pubkey: &str,
+        target_pubkey: &str,
+        start_seq: u64,
+    ) -> anyhow::Result<Vec<HalfBlock>> {
+        let crawl_req = serde_json::json!({
+            "pubkey": target_pubkey,
+            "start_seq": start_seq,
+        });
+        let msg = TransportMessage::new(
+            MessageType::CrawlRequest,
+            our_pubkey.to_string(),
+            serde_json::to_vec(&crawl_req)?,
+            format!("crawl-q-{}", &target_pubkey[..8.min(target_pubkey.len())]),
+        );
+        let msg_bytes = serde_json::to_vec(&msg)?;
+
+        let resp_bytes =
+            tokio::time::timeout(Duration::from_secs(10), quic.send_message(addr, &msg_bytes))
+                .await
+                .map_err(|_| anyhow::anyhow!("timeout"))?
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // Response is a CrawlResponse with blocks as payload.
+        let resp: TransportMessage = serde_json::from_slice(&resp_bytes)?;
+        let blocks: Vec<HalfBlock> = serde_json::from_slice(&resp.payload).unwrap_or_default();
+        Ok(blocks)
     }
 
     /// Fetch status from a peer via HTTP.

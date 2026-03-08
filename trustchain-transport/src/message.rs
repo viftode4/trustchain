@@ -32,6 +32,10 @@ pub enum MessageType {
     CheckpointVote,
     /// CHECO: finalized checkpoint broadcast.
     CheckpointFinalized,
+    /// Lightweight block metadata notification (Plumtree lazy push).
+    BlockMetadata,
+    /// Request full block after receiving metadata.
+    BlockMetadataRequest,
     /// Error response — wraps an error message so the sender can parse it.
     Error,
 }
@@ -57,6 +61,8 @@ impl std::fmt::Display for MessageType {
             MessageType::CheckpointProposal => write!(f, "checkpoint_proposal"),
             MessageType::CheckpointVote => write!(f, "checkpoint_vote"),
             MessageType::CheckpointFinalized => write!(f, "checkpoint_finalized"),
+            MessageType::BlockMetadata => write!(f, "block_metadata"),
+            MessageType::BlockMetadataRequest => write!(f, "block_metadata_request"),
             MessageType::Error => write!(f, "error"),
         }
     }
@@ -159,6 +165,28 @@ pub struct CheckpointWire {
 pub struct CheckpointFinalizedPayload {
     pub checkpoint: CheckpointWire,
     pub round: u64,
+}
+
+/// Lightweight block metadata for Plumtree lazy push (~100 bytes vs ~2KB full block).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockMetadataPayload {
+    /// Hash of block1 (proposal).
+    pub block1_hash: String,
+    /// Hash of block2 (agreement).
+    pub block2_hash: String,
+    /// Sequence number of the proposal block.
+    pub sequence_number: u64,
+    /// Public key of the block creator.
+    pub creator_pubkey: String,
+}
+
+/// Request for full block pair after receiving metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockMetadataRequestPayload {
+    /// Hash of block1 (proposal) we want.
+    pub block1_hash: String,
+    /// Hash of block2 (agreement) we want.
+    pub block2_hash: String,
 }
 
 #[cfg(test)]

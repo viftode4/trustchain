@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rand::seq::SliceRandom;
 use tokio::sync::RwLock;
 
 /// Get the current time as milliseconds since Unix epoch.
@@ -23,6 +24,8 @@ pub struct PeerRecord {
     /// Last seen timestamp in milliseconds since Unix epoch.
     pub last_seen_unix_ms: u64,
     pub is_bootstrap: bool,
+    /// Number of consecutive communication failures (SWIM failure detection).
+    pub failure_count: u32,
 }
 
 /// Peer discovery service.
@@ -61,10 +64,13 @@ impl PeerDiscovery {
             latest_seq,
             last_seen_unix_ms: now_unix_ms(),
             is_bootstrap: self.bootstrap_nodes.contains(&address),
+            failure_count: 0,
         });
         entry.address = address;
         entry.latest_seq = latest_seq;
         entry.last_seen_unix_ms = now_unix_ms();
+        // We just heard from this peer, so reset any failure count.
+        entry.failure_count = 0;
     }
 
     /// Get all known peers.
@@ -131,14 +137,46 @@ impl PeerDiscovery {
         &self.bootstrap_nodes
     }
 
-    /// Get peer addresses for gossip exchange.
+    /// Get peer addresses for gossip exchange (random selection).
     pub async fn get_gossip_peers(&self, max_count: usize) -> Vec<PeerRecord> {
         let peers = self.peers.read().await;
         let mut list: Vec<PeerRecord> = peers.values().cloned().collect();
-        // Sort by most recently seen first (highest unix_ms first).
-        list.sort_by(|a, b| b.last_seen_unix_ms.cmp(&a.last_seen_unix_ms));
+        let mut rng = rand::thread_rng();
+        list.shuffle(&mut rng);
         list.truncate(max_count);
         list
+    }
+
+    /// Increment the failure count for a peer (SWIM failure detection).
+    pub async fn increment_failure(&self, pubkey: &str) {
+        let mut peers = self.peers.write().await;
+        if let Some(peer) = peers.get_mut(pubkey) {
+            peer.failure_count = peer.failure_count.saturating_add(1);
+        }
+    }
+
+    /// Reset the failure count for a peer back to zero.
+    pub async fn reset_failure(&self, pubkey: &str) {
+        let mut peers = self.peers.write().await;
+        if let Some(peer) = peers.get_mut(pubkey) {
+            peer.failure_count = 0;
+        }
+    }
+
+    /// Get the current failure count for a peer (0 if unknown).
+    pub async fn get_failure_count(&self, pubkey: &str) -> u32 {
+        let peers = self.peers.read().await;
+        peers.get(pubkey).map_or(0, |p| p.failure_count)
+    }
+
+    /// Return peers whose failure count is at or above `max_failures`.
+    pub async fn get_suspect_peers(&self, max_failures: u32) -> Vec<PeerRecord> {
+        let peers = self.peers.read().await;
+        peers
+            .values()
+            .filter(|p| p.failure_count >= max_failures)
+            .cloned()
+            .collect()
     }
 
     /// Merge peers received from another node.
@@ -271,5 +309,86 @@ mod tests {
             .get_peer_by_address("http://127.0.0.1:9999")
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_failure_count_lifecycle() {
+        let disc = PeerDiscovery::new("us".to_string(), vec![]);
+        disc.add_peer("p1".to_string(), "addr1".to_string(), 0)
+            .await;
+
+        assert_eq!(disc.get_failure_count("p1").await, 0);
+
+        disc.increment_failure("p1").await;
+        disc.increment_failure("p1").await;
+        assert_eq!(disc.get_failure_count("p1").await, 2);
+
+        disc.reset_failure("p1").await;
+        assert_eq!(disc.get_failure_count("p1").await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_failure_count_unknown_peer() {
+        let disc = PeerDiscovery::new("us".to_string(), vec![]);
+        // Incrementing or querying an unknown peer should not panic.
+        disc.increment_failure("ghost").await;
+        assert_eq!(disc.get_failure_count("ghost").await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_add_peer_resets_failure_count() {
+        let disc = PeerDiscovery::new("us".to_string(), vec![]);
+        disc.add_peer("p1".to_string(), "addr1".to_string(), 0)
+            .await;
+        disc.increment_failure("p1").await;
+        disc.increment_failure("p1").await;
+        assert_eq!(disc.get_failure_count("p1").await, 2);
+
+        // Re-adding (refreshing) the peer should reset failure_count.
+        disc.add_peer("p1".to_string(), "addr1".to_string(), 1)
+            .await;
+        assert_eq!(disc.get_failure_count("p1").await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_suspect_peers() {
+        let disc = PeerDiscovery::new("us".to_string(), vec![]);
+        disc.add_peer("a".to_string(), "addr1".to_string(), 0).await;
+        disc.add_peer("b".to_string(), "addr2".to_string(), 0).await;
+        disc.add_peer("c".to_string(), "addr3".to_string(), 0).await;
+
+        disc.increment_failure("a").await;
+        disc.increment_failure("a").await;
+        disc.increment_failure("a").await;
+        disc.increment_failure("b").await;
+
+        let suspects = disc.get_suspect_peers(3).await;
+        assert_eq!(suspects.len(), 1);
+        assert_eq!(suspects[0].pubkey, "a");
+
+        let suspects = disc.get_suspect_peers(1).await;
+        assert_eq!(suspects.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_gossip_peers_random_shuffle() {
+        // Add many peers, call get_gossip_peers repeatedly, verify we don't always
+        // get the same ordering (probabilistic but extremely unlikely to fail).
+        let disc = PeerDiscovery::new("us".to_string(), vec![]);
+        for i in 0..20 {
+            disc.add_peer(format!("p{i}"), format!("addr{i}"), 0).await;
+        }
+
+        let mut orderings = std::collections::HashSet::new();
+        for _ in 0..10 {
+            let peers = disc.get_gossip_peers(20).await;
+            let keys: Vec<String> = peers.into_iter().map(|p| p.pubkey).collect();
+            orderings.insert(keys);
+        }
+        // With 20 peers shuffled 10 times, we should see at least 2 distinct orderings.
+        assert!(
+            orderings.len() >= 2,
+            "Expected random shuffle to produce varying orderings"
+        );
     }
 }
