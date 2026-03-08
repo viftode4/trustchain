@@ -54,13 +54,7 @@ pub fn validate_transaction(schema: &SchemaId, transaction: &serde_json::Value) 
         }
         SchemaId::AiAct => {
             // Base fields + AI Act Article 12 traceability fields
-            let required = [
-                "action",
-                "outcome",
-                "model",
-                "input_hash",
-                "output_hash",
-            ];
+            let required = ["action", "outcome", "model", "input_hash", "output_hash"];
             required
                 .iter()
                 .filter(|&&f| !obj.contains_key(f))
@@ -83,7 +77,9 @@ pub fn validate_transaction(schema: &SchemaId, transaction: &serde_json::Value) 
     } else {
         Err(TrustChainError::validation(format!(
             "schema '{}' requires missing fields: {}",
-            serde_json::to_string(schema).unwrap_or_default().trim_matches('"'),
+            serde_json::to_string(schema)
+                .unwrap_or_default()
+                .trim_matches('"'),
             missing.join(", ")
         )))
     }

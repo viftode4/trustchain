@@ -218,7 +218,9 @@ async fn proxy_handler<S: BlockStore + 'static, D: DelegationStore + 'static>(
             // Check if this event type should be recorded under the current audit config.
             if let Some(et) = trustchain_core::EventType::from_str_loose(&event_type) {
                 if !proto.should_record_event(&et) {
-                    log::debug!("skipping audit block for {auth} (event_type '{event_type}' disabled)");
+                    log::debug!(
+                        "skipping audit block for {auth} (event_type '{event_type}' disabled)"
+                    );
                 } else {
                     let tx = serde_json::json!({
                         "event_type": event_type,
@@ -737,10 +739,7 @@ fn classify_event(authority: &str, path: &str) -> String {
 
     // Check against known tool/action path patterns.
     let path_lower = path.to_lowercase();
-    if TOOL_PATH_PATTERNS
-        .iter()
-        .any(|&p| path_lower.contains(p))
-    {
+    if TOOL_PATH_PATTERNS.iter().any(|&p| path_lower.contains(p)) {
         return "tool_call".to_string();
     }
 
@@ -884,18 +883,9 @@ mod tests {
             classify_event("my-service:8080", "/api/tool/run"),
             "tool_call"
         );
-        assert_eq!(
-            classify_event("localhost:9000", "/execute"),
-            "tool_call"
-        );
-        assert_eq!(
-            classify_event("agent-b:8202", "/v1/invoke"),
-            "tool_call"
-        );
-        assert_eq!(
-            classify_event("example.com", "/call_tool"),
-            "tool_call"
-        );
+        assert_eq!(classify_event("localhost:9000", "/execute"), "tool_call");
+        assert_eq!(classify_event("agent-b:8202", "/v1/invoke"), "tool_call");
+        assert_eq!(classify_event("example.com", "/call_tool"), "tool_call");
     }
 
     #[test]
@@ -904,9 +894,6 @@ mod tests {
             classify_event("api.stripe.com", "/v1/charges"),
             "external_api"
         );
-        assert_eq!(
-            classify_event("example.com", "/api/data"),
-            "external_api"
-        );
+        assert_eq!(classify_event("example.com", "/api/data"), "external_api");
     }
 }

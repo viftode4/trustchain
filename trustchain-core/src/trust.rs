@@ -2172,9 +2172,7 @@ mod tests {
         let store = MemoryBlockStore::new();
         let engine = TrustEngine::new(&store, None, None, None);
         let alice = Identity::from_bytes(&[1u8; 32]);
-        let report = engine
-            .compute_audit_report(&alice.pubkey_hex())
-            .unwrap();
+        let report = engine.compute_audit_report(&alice.pubkey_hex()).unwrap();
         assert_eq!(report.total_blocks, 0);
         assert_eq!(report.audit_blocks, 0);
         assert_eq!(report.bilateral_blocks, 0);
@@ -2217,9 +2215,7 @@ mod tests {
         store.add_block(&b3).unwrap();
 
         let engine = TrustEngine::new(&store, None, None, None);
-        let report = engine
-            .compute_audit_report(&alice.pubkey_hex())
-            .unwrap();
+        let report = engine.compute_audit_report(&alice.pubkey_hex()).unwrap();
 
         assert_eq!(report.total_blocks, 3);
         assert_eq!(report.audit_blocks, 3);
@@ -2246,9 +2242,7 @@ mod tests {
         store.add_block(&b1).unwrap();
 
         let engine = TrustEngine::new(&store, None, None, None);
-        let report = engine
-            .compute_audit_report(&alice.pubkey_hex())
-            .unwrap();
+        let report = engine.compute_audit_report(&alice.pubkey_hex()).unwrap();
 
         assert_eq!(report.audit_blocks, 1);
         assert_eq!(report.event_type_breakdown.get("untyped"), Some(&1));
@@ -2287,9 +2281,7 @@ mod tests {
         store.add_block(&proposal).unwrap();
 
         let engine = TrustEngine::new(&store, None, None, None);
-        let report = engine
-            .compute_audit_report(&alice.pubkey_hex())
-            .unwrap();
+        let report = engine.compute_audit_report(&alice.pubkey_hex()).unwrap();
 
         assert_eq!(report.total_blocks, 2);
         assert_eq!(report.audit_blocks, 1);

@@ -393,9 +393,7 @@ impl<S: BlockStore> TrustChainProtocol<S> {
                 if let Some(schema_id) = SchemaId::from_str_loose(schema_name) {
                     for (i, entry) in entries.iter().enumerate() {
                         validate_transaction(&schema_id, entry).map_err(|e| {
-                            TrustChainError::validation(format!(
-                                "batch entry {i}: {e}"
-                            ))
+                            TrustChainError::validation(format!("batch entry {i}: {e}"))
                         })?;
                     }
                 }
@@ -1767,7 +1765,10 @@ mod tests {
         assert!(result.is_err());
 
         // No blocks should have been created (atomic).
-        assert_eq!(proto.store().get_latest_seq(&alice.pubkey_hex()).unwrap(), 0);
+        assert_eq!(
+            proto.store().get_latest_seq(&alice.pubkey_hex()).unwrap(),
+            0
+        );
     }
 
     #[test]
