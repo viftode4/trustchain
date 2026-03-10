@@ -1,7 +1,7 @@
 # TrustChain
 
 [![CI](https://github.com/viftode4/trustchain/actions/workflows/ci.yml/badge.svg)](https://github.com/viftode4/trustchain/actions)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 **Decentralized trust infrastructure for the AI agent economy.**
 
@@ -211,4 +211,4 @@ A public seed node is running at `http://5.161.255.238:8202` (pubkey: `2ab9b393.
 
 ## License
 
-MIT
+Apache-2.0
