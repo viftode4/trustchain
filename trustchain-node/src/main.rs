@@ -213,6 +213,10 @@ async fn main() -> anyhow::Result<()> {
 
         #[cfg(feature = "mcp")]
         Commands::McpStdio { name, data_dir } => {
+            // MCP stdio starts a full sidecar in the background so that
+            // all networking (QUIC, gossip, peer discovery) is available
+            // to MCP tool calls. Logs go to stderr (stdout is the MCP
+            // transport).
             let dir = data_dir.unwrap_or_else(|| {
                 let home = std::env::var("HOME")
                     .or_else(|_| std::env::var("USERPROFILE"))
@@ -220,6 +224,14 @@ async fn main() -> anyhow::Result<()> {
                 PathBuf::from(home).join(".trustchain").join(&name)
             });
             std::fs::create_dir_all(&dir).ok();
+
+            // Logging to stderr only (stdout is the MCP JSON-RPC channel).
+            let filter = tracing_subscriber::EnvFilter::try_new("warn")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .init();
 
             let key_path = dir.join("identity.key");
             let identity = if key_path.exists() {
@@ -231,18 +243,54 @@ async fn main() -> anyhow::Result<()> {
                 id
             };
 
-            let db_path = dir.join("trustchain.db");
-            let store = trustchain_core::SqliteBlockStore::open(&db_path)
-                .map_err(|e| anyhow::anyhow!("Failed to open database: {e}"))?;
-            let protocol = trustchain_core::TrustChainProtocol::new(identity.clone(), store);
-            let discovery = trustchain_transport::PeerDiscovery::new(identity.pubkey_hex(), vec![]);
+            // Use a high port range to avoid conflicts with user sidecars.
+            let port_base: u16 = 18200;
+            let http_addr = format!("127.0.0.1:{}", port_base + 2);
 
-            trustchain_transport::mcp::run_mcp_stdio(
-                std::sync::Arc::new(tokio::sync::Mutex::new(protocol)),
-                std::sync::Arc::new(discovery),
-                vec![], // stdio mode: no seed nodes configured (user passes via config)
-            )
-            .await?;
+            let config = NodeConfig {
+                quic_addr: format!("0.0.0.0:{port_base}"),
+                grpc_addr: format!("127.0.0.1:{}", port_base + 1),
+                http_addr: http_addr.clone(),
+                proxy_addr: format!("127.0.0.1:{}", port_base + 3),
+                key_path,
+                db_path: dir.join("trustchain.db"),
+                agent_name: Some(name.clone()),
+                ..NodeConfig::default()
+            };
+
+            let node = Node::new(identity, config);
+
+            // Grab shared handles before moving node into the background task.
+            let protocol = node.protocol.clone();
+            let discovery = node.discovery.clone();
+            let seeds = crate::config::default_seed_nodes();
+
+            // Start the full sidecar in the background.
+            tokio::spawn(async move {
+                if let Err(e) = node.run().await {
+                    tracing::error!("Sidecar error: {e}");
+                }
+            });
+
+            // Wait for the sidecar HTTP server to be ready.
+            let healthz_url = format!("http://{http_addr}/healthz");
+            let client = reqwest::Client::new();
+            let mut ready = false;
+            for _ in 0..60 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if let Ok(resp) = client.get(&healthz_url).send().await {
+                    if resp.status().is_success() {
+                        ready = true;
+                        break;
+                    }
+                }
+            }
+            if !ready {
+                anyhow::bail!("MCP sidecar did not become ready within 30 seconds");
+            }
+
+            // Run MCP stdio using the same protocol/discovery as the sidecar.
+            trustchain_transport::mcp::run_mcp_stdio(protocol, discovery, seeds).await?;
         }
 
         Commands::Sidecar {
