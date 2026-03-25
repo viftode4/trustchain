@@ -6,32 +6,41 @@
 <title>TrustChain Dashboard</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:system-ui,-apple-system,sans-serif;background:#0a0e17;color:#e0e6ed;padding:24px;max-width:960px;margin:0 auto}
+body{font-family:system-ui,-apple-system,sans-serif;background:#0a0e17;color:#e0e6ed;padding:24px;max-width:1100px;margin:0 auto}
 h1{font-size:1.5rem;margin-bottom:4px;color:#7dd3fc}
 .subtitle{color:#64748b;font-size:.85rem;margin-bottom:24px}
 .card{background:#151b2b;border:1px solid #1e293b;border-radius:8px;padding:16px;margin-bottom:16px}
-.card h2{font-size:1rem;color:#94a3b8;margin-bottom:12px;text-transform:uppercase;letter-spacing:.05em;font-size:.75rem}
+.card h2{color:#94a3b8;margin-bottom:12px;text-transform:uppercase;letter-spacing:.05em;font-size:.75rem}
 .identity{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
-.identity .pubkey{font-family:monospace;font-size:.85rem;color:#7dd3fc;word-break:break-all}
+.pubkey{font-family:monospace;font-size:.85rem;color:#7dd3fc;word-break:break-all}
 .stat{display:inline-flex;flex-direction:column;align-items:center;padding:8px 16px}
 .stat .value{font-size:1.5rem;font-weight:700;color:#7dd3fc}
 .stat .label{font-size:.7rem;color:#64748b;text-transform:uppercase}
 .stats{display:flex;gap:8px;flex-wrap:wrap}
-table{width:100%;border-collapse:collapse;font-size:.85rem}
-th{text-align:left;padding:8px 12px;color:#64748b;border-bottom:1px solid #1e293b;font-weight:500;font-size:.75rem;text-transform:uppercase}
-td{padding:8px 12px;border-bottom:1px solid #1e293b}
-td.pubkey{font-family:monospace;color:#7dd3fc;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.trust-bar{display:inline-block;height:6px;border-radius:3px;background:#1e293b;width:80px;position:relative;vertical-align:middle}
-.trust-bar .fill{height:100%;border-radius:3px;position:absolute;left:0;top:0}
-.trust-high{background:#22c55e}
-.trust-med{background:#eab308}
-.trust-low{background:#ef4444}
-.trust-none{background:#334155}
-.status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
-.online{background:#22c55e}
-.offline{background:#ef4444}
-.empty{color:#475569;text-align:center;padding:24px}
+table{width:100%;border-collapse:collapse;font-size:.82rem}
+th{text-align:left;padding:7px 10px;color:#64748b;border-bottom:1px solid #1e293b;font-weight:500;font-size:.72rem;text-transform:uppercase}
+td{padding:7px 10px;border-bottom:1px solid #1e293b;vertical-align:middle}
+td.mono{font-family:monospace;color:#7dd3fc;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar-wrap{display:inline-flex;align-items:center;gap:6px}
+.bar{display:inline-block;height:6px;border-radius:3px;background:#1e293b;width:70px;position:relative}
+.bar .fill{height:100%;border-radius:3px;position:absolute;left:0;top:0}
+.hi{background:#22c55e}.med{background:#eab308}.lo{background:#ef4444}.none{background:#334155}
+.badge{display:inline-block;padding:1px 6px;border-radius:4px;font-size:.72rem;font-weight:600}
+.badge-green{background:#14532d;color:#86efac}
+.badge-red{background:#450a0a;color:#fca5a5}
+.badge-gray{background:#1e293b;color:#94a3b8}
+.badge-blue{background:#1e3a5f;color:#93c5fd}
+.empty{color:#475569;text-align:center;padding:20px}
+.chain-viewer{max-height:360px;overflow-y:auto}
+.block-row{border-bottom:1px solid #1e293b;padding:8px 0;display:grid;grid-template-columns:40px 90px 140px 90px 1fr;gap:8px;align-items:start;font-size:.8rem}
+.block-row:last-child{border-bottom:none}
+.seq{color:#475569;font-size:.75rem;text-align:right}
+.btype{font-size:.72rem}
+.outcome{font-size:.72rem}
+.tx{color:#64748b;font-size:.72rem;word-break:break-all;line-height:1.4}
+.peer-select{background:#1e293b;color:#e0e6ed;border:1px solid #334155;border-radius:4px;padding:4px 8px;font-size:.8rem;margin-left:8px;cursor:pointer}
 #error{color:#f87171;font-size:.85rem;padding:8px;display:none}
+.last-update{color:#475569;font-size:.7rem;text-align:right;margin-top:4px}
 </style>
 </head>
 <body>
@@ -53,14 +62,37 @@ td.pubkey{font-family:monospace;color:#7dd3fc;max-width:200px;overflow:hidden;te
 <div class="card">
   <h2>Peers</h2>
   <table>
-    <thead><tr><th>Peer</th><th>Address</th><th>Trust</th><th>C / I / D</th><th>Interactions</th></tr></thead>
-    <tbody id="peers"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
+    <thead><tr>
+      <th>Peer</th>
+      <th>Address</th>
+      <th>Score</th>
+      <th>Integrity</th>
+      <th>Recency</th>
+      <th>Interactions</th>
+    </tr></thead>
+    <tbody id="peers"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
   </table>
+</div>
+
+<div class="card">
+  <h2>
+    Chain Explorer
+    <select class="peer-select" id="chain-selector" onchange="loadChain()">
+      <option value="">own chain</option>
+    </select>
+  </h2>
+  <div class="chain-viewer">
+    <div class="block-row" style="font-size:.7rem;color:#475569;font-weight:600">
+      <div>SEQ</div><div>TYPE</div><div>COUNTERPARTY</div><div>OUTCOME</div><div>TRANSACTION</div>
+    </div>
+    <div id="chain-body"><div class="empty">Loading...</div></div>
+  </div>
+  <div class="last-update" id="last-update"></div>
 </div>
 
 <script>
 const BASE = location.origin;
-let pollTimer;
+let ownPubkey = null;
 
 async function fetchJSON(path) {
   const r = await fetch(BASE + path);
@@ -68,60 +100,160 @@ async function fetchJSON(path) {
   return r.json();
 }
 
-function trustColor(score) {
-  if (score >= 0.7) return 'trust-high';
-  if (score >= 0.3) return 'trust-med';
-  if (score > 0)    return 'trust-low';
-  return 'trust-none';
+function barColor(v) {
+  if (v >= 0.7) return 'hi';
+  if (v >= 0.3) return 'med';
+  if (v > 0)    return 'lo';
+  return 'none';
 }
 
 function shortKey(k) {
-  return k ? k.slice(0, 8) + '...' + k.slice(-4) : '?';
+  return k ? k.slice(0, 8) + '...' + k.slice(-4) : '—';
+}
+
+function fmtTime(ms) {
+  if (!ms) return '—';
+  const d = new Date(ms);
+  return d.toLocaleTimeString();
+}
+
+function outcomeBadge(tx) {
+  if (!tx || typeof tx !== 'object') return '<span class="badge badge-gray">—</span>';
+  const o = tx.outcome || tx.action || tx.interaction_type || '';
+  if (!o) return '<span class="badge badge-gray">—</span>';
+  if (o === 'completed') return `<span class="badge badge-green">completed</span>`;
+  if (o === 'failed')    return `<span class="badge badge-red">failed</span>`;
+  if (o === 'flagged_rogue') return `<span class="badge badge-red">rogue</span>`;
+  return `<span class="badge badge-gray">${o}</span>`;
+}
+
+function typeBadge(t) {
+  if (t === 'proposal')  return `<span class="badge badge-blue">proposal</span>`;
+  if (t === 'agreement') return `<span class="badge badge-green">agreement</span>`;
+  if (t === 'audit')     return `<span class="badge badge-gray">audit</span>`;
+  return `<span class="badge badge-gray">${t||'?'}</span>`;
+}
+
+function scoreBar(score) {
+  const cls = barColor(score);
+  const pct = Math.round(score * 100);
+  return `<div class="bar-wrap">
+    <div class="bar"><div class="fill ${cls}" style="width:${pct}%"></div></div>
+    <span>${score.toFixed(3)}</span>
+  </div>`;
+}
+
+async function loadChain() {
+  const sel = document.getElementById('chain-selector');
+  const pubkey = sel.value || ownPubkey;
+  if (!pubkey) return;
+  try {
+    const blocks = await fetchJSON('/chain/' + pubkey);
+    const arr = blocks.blocks ?? blocks;
+    const body = document.getElementById('chain-body');
+    if (!arr.length) {
+      body.innerHTML = '<div class="empty">No blocks yet</div>';
+      return;
+    }
+    // Show newest first
+    const rows = [...arr].reverse().map(b => {
+      const tx = b.transaction || {};
+      const txStr = JSON.stringify(tx, null, 0)
+        .replace(/[{}"]/g, '')
+        .replace(/,/g, ' · ')
+        .slice(0, 80);
+      return `<div class="block-row">
+        <div class="seq">${b.sequence_number}</div>
+        <div class="btype">${typeBadge(b.block_type)}</div>
+        <div class="mono" title="${b.link_public_key}">${shortKey(b.link_public_key)}</div>
+        <div class="outcome">${outcomeBadge(tx)}</div>
+        <div class="tx">${txStr || fmtTime(b.timestamp)}</div>
+      </div>`;
+    });
+    body.innerHTML = rows.join('');
+    document.getElementById('last-update').textContent =
+      'updated ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    document.getElementById('chain-body').innerHTML =
+      `<div class="empty">Could not load chain: ${e.message}</div>`;
+  }
 }
 
 async function refresh() {
   try {
     const status = await fetchJSON('/status');
-    document.getElementById('pubkey').textContent = status.public_key || 'unknown';
+    ownPubkey = status.public_key;
+
+    document.getElementById('pubkey').textContent = ownPubkey || 'unknown';
     document.getElementById('stats').innerHTML = `
       <div class="stat"><span class="value">${status.block_count ?? 0}</span><span class="label">Blocks</span></div>
       <div class="stat"><span class="value">${status.peer_count ?? 0}</span><span class="label">Peers</span></div>
-      <div class="stat"><span class="value">${status.name || '-'}</span><span class="label">Name</span></div>
-      <div class="stat"><span class="value">${status.version || '-'}</span><span class="label">Version</span></div>
+      <div class="stat"><span class="value">${status.name || '—'}</span><span class="label">Name</span></div>
+      <div class="stat"><span class="value">${status.version || '—'}</span><span class="label">Version</span></div>
     `;
 
     const peers = await fetchJSON('/peers');
     const tbody = document.getElementById('peers');
+    const sel = document.getElementById('chain-selector');
+
+    // Update peer selector (keep current selection)
+    const currentSel = sel.value;
+    sel.innerHTML = '<option value="">own chain</option>';
+    for (const p of peers) {
+      const opt = document.createElement('option');
+      opt.value = p.pubkey;
+      opt.textContent = shortKey(p.pubkey);
+      if (p.pubkey === currentSel) opt.selected = true;
+      sel.appendChild(opt);
+    }
 
     if (!peers.length) {
-      tbody.innerHTML = '<tr><td colspan="5" class="empty">No peers discovered yet</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6" class="empty">No peers yet</td></tr>';
     } else {
       const rows = [];
       for (const p of peers) {
-        let score = 0, conn = '-', integ = '-', div = '-';
+        let trust_score = 0, integrity = 0, recency = 1, interactions = 0;
+        let displayScore = 0;
         try {
           const t = await fetchJSON('/trust/' + p.pubkey);
-          score = typeof t === 'number' ? t : (t.trust_score ?? t.score ?? 0);
-          if (t.connectivity != null) conn = t.connectivity.toFixed(2);
-          if (t.integrity != null) integ = t.integrity.toFixed(2);
-          if (t.diversity != null) div = t.diversity.toFixed(2);
+          trust_score  = t.trust_score   ?? 0;
+          integrity    = t.integrity     ?? 0;
+          recency      = t.recency       ?? 1;
+          interactions = t.interaction_count ?? t.interactions ?? 0;
+
+          // If trust_score is 0 due to missing genesis (integrity=0)
+          // but we have interactions, fall back to recency-weighted score.
+          if (trust_score < 1e-6 && interactions > 0) {
+            displayScore = recency * (interactions / (interactions + 3));
+          } else {
+            displayScore = trust_score;
+          }
         } catch {}
-        const cls = trustColor(score);
+
         rows.push(`<tr>
-          <td class="pubkey" title="${p.pubkey}">${shortKey(p.pubkey)}</td>
-          <td>${p.address || '-'}</td>
+          <td class="mono" title="${p.pubkey}">${shortKey(p.pubkey)}</td>
+          <td style="color:#94a3b8;font-size:.78rem">${p.address || '—'}</td>
+          <td>${scoreBar(displayScore)}</td>
           <td>
-            <span class="trust-bar"><span class="fill ${cls}" style="width:${Math.round(score*100)}%"></span></span>
-            ${score.toFixed(3)}
+            <div class="bar-wrap">
+              <div class="bar"><div class="fill ${barColor(integrity)}" style="width:${Math.round(integrity*100)}%"></div></div>
+              <span>${integrity.toFixed(2)}</span>
+            </div>
           </td>
-          <td>${conn} / ${integ} / ${div}</td>
-          <td>${p.latest_seq ?? '-'}</td>
+          <td>
+            <div class="bar-wrap">
+              <div class="bar"><div class="fill ${barColor(recency)}" style="width:${Math.round(recency*100)}%"></div></div>
+              <span>${recency.toFixed(2)}</span>
+            </div>
+          </td>
+          <td style="color:#94a3b8">${interactions}</td>
         </tr>`);
       }
       tbody.innerHTML = rows.join('');
     }
 
     document.getElementById('error').style.display = 'none';
+    loadChain();
   } catch (e) {
     const el = document.getElementById('error');
     el.textContent = 'Connection error: ' + e.message;
@@ -130,7 +262,7 @@ async function refresh() {
 }
 
 refresh();
-pollTimer = setInterval(refresh, 5000);
+setInterval(refresh, 5000);
 </script>
 </body>
 </html>

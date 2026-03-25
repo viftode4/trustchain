@@ -143,6 +143,57 @@ impl Node {
         }
     }
 
+    /// Resolve bootstrap URLs to pubkeys by querying each seed's /status endpoint.
+    ///
+    /// The trust engine needs pubkey hex strings (not URLs) to identify seed nodes.
+    /// Returns the resolved pubkeys; any unresolvable seeds are skipped with a warning.
+    async fn resolve_seed_pubkeys(&self) -> Vec<String> {
+        let bootstrap = self.config.effective_bootstrap_nodes();
+        if bootstrap.is_empty() {
+            return vec![];
+        }
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+
+        let mut pubkeys = Vec::new();
+        for addr in &bootstrap {
+            let url = if addr.contains("/status") {
+                addr.clone()
+            } else {
+                let base = addr.trim_end_matches('/');
+                format!("{base}/status")
+            };
+            match client.get(&url).send().await {
+                Ok(resp) => {
+                    if let Ok(body) = resp.json::<serde_json::Value>().await {
+                        if let Some(pk) = body.get("public_key").and_then(|v| v.as_str()) {
+                            tracing::info!(seed = &pk[..8.min(pk.len())], addr = %addr, "resolved seed pubkey");
+                            pubkeys.push(pk.to_string());
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(addr = %addr, err = %e, "failed to resolve seed pubkey");
+                }
+            }
+        }
+
+        // Also include any raw pubkeys (64-char hex strings) passed directly.
+        for addr in &bootstrap {
+            if addr.len() == 64
+                && addr.chars().all(|c| c.is_ascii_hexdigit())
+                && !pubkeys.contains(addr)
+            {
+                pubkeys.push(addr.clone());
+            }
+        }
+
+        pubkeys
+    }
+
     /// Start all node services (QUIC, gRPC, HTTP, discovery).
     pub async fn run(&self) -> anyhow::Result<()> {
         let pubkey = self.identity.pubkey_hex();
@@ -236,6 +287,13 @@ impl Node {
         });
         tracing::info!(%grpc_addr, "gRPC service ready");
 
+        // Resolve bootstrap URLs → pubkeys for the trust engine.
+        // TrustEngine needs hex pubkeys, not HTTP addresses.
+        let seed_pubkeys = self.resolve_seed_pubkeys().await;
+        if seed_pubkeys.is_empty() && !self.config.effective_bootstrap_nodes().is_empty() {
+            tracing::warn!("could not resolve any seed pubkeys — trust scores may be degraded");
+        }
+
         // Start HTTP REST API (+ MCP if feature enabled).
         let http_addr: SocketAddr = self.config.http_addr.parse()?;
         let http_state = AppState {
@@ -245,7 +303,7 @@ impl Node {
             agent_endpoint: self.config.agent_endpoint.clone(),
             delegation_store: self.delegation_store.clone(),
             latest_checkpoint: self.latest_checkpoint.clone(),
-            seed_nodes: self.config.effective_bootstrap_nodes(),
+            seed_nodes: seed_pubkeys.clone(),
             agent_name: self.config.agent_name.clone(),
         };
 
@@ -256,7 +314,7 @@ impl Node {
         #[cfg(feature = "mcp")]
         let mcp_endpoint = self.config.agent_endpoint.clone();
         #[cfg(feature = "mcp")]
-        let mcp_seed_nodes = self.config.effective_bootstrap_nodes();
+        let mcp_seed_nodes = seed_pubkeys.clone();
 
         let http_handle = tokio::spawn(async move {
             let router = build_router(http_state);
@@ -298,7 +356,7 @@ impl Node {
                 std::collections::HashMap::new(),
             )),
             delegation_store: Some(self.delegation_store.clone()),
-            seed_nodes: self.config.effective_bootstrap_nodes(),
+            seed_nodes: seed_pubkeys.clone(),
         };
         let proxy_handle = tokio::spawn(async move {
             if let Err(e) = start_proxy_server(proxy_addr, proxy_state).await {
@@ -400,6 +458,128 @@ impl Node {
                 endpoint = self.config.agent_endpoint.as_deref().unwrap_or("(none)"),
                 "sidecar mode — agent registered"
             );
+        }
+
+        // Bootstrap trust: propose a `bootstrap` interaction to each bootstrap peer.
+        // This creates a bilateral block that establishes a trust path from the seed
+        // to this node, enabling non-zero trust scores via NetFlow/MeritRank.
+        {
+            let bootstrap_peers = self.config.effective_bootstrap_nodes();
+            let boot_protocol = self.protocol.clone();
+            let boot_discovery = self.discovery.clone();
+            let boot_quic = quic_accept_handle.1.clone();
+            tokio::spawn(async move {
+                // Wait for discovery to populate peer list from bootstrap nodes.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+
+                for boot_addr in &bootstrap_peers {
+                    // Find the bootstrap peer's pubkey from discovery.
+                    let peers: Vec<_> = boot_discovery.get_peers().await;
+                    let boot_peer = peers.iter().find(|p| p.address == *boot_addr);
+
+                    if let Some(peer) = boot_peer {
+                        let peer_pubkey = peer.pubkey.clone();
+                        let tx = serde_json::json!({
+                            "interaction_type": "bootstrap",
+                            "outcome": "completed",
+                        });
+
+                        // Create and send proposal.
+                        let proposal = {
+                            let mut proto = boot_protocol.lock().await;
+                            match proto.create_proposal(&peer_pubkey, tx, None) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    tracing::debug!(
+                                        peer = &peer_pubkey[..8],
+                                        err = %e,
+                                        "bootstrap proposal creation failed"
+                                    );
+                                    continue;
+                                }
+                            }
+                        };
+
+                        // Send via QUIC.
+                        // Derive QUIC address from HTTP address (e.g. "http://1.2.3.4:8202").
+                        // Strip any scheme prefix, then parse host:port.
+                        let quic_addr: Option<SocketAddr> = {
+                            let addr_str = peer.address.trim();
+                            let host_port = if let Some(rest) = addr_str.strip_prefix("http://") {
+                                rest
+                            } else if let Some(rest) = addr_str.strip_prefix("https://") {
+                                rest
+                            } else {
+                                addr_str
+                            };
+                            // host_port is now "host:port" or "host"
+                            let (host, http_port): (&str, u16) =
+                                if let Some(colon) = host_port.rfind(':') {
+                                    let h = &host_port[..colon];
+                                    let p: u16 = host_port[colon + 1..].parse().unwrap_or(8202);
+                                    (h, p)
+                                } else {
+                                    (host_port, 8202_u16)
+                                };
+                            let quic_port = http_port.saturating_sub(QUIC_PORT_OFFSET);
+                            format!("{host}:{quic_port}").parse::<SocketAddr>().ok()
+                        };
+                        if let Some(addr) = quic_addr {
+                            let our_pubkey = {
+                                let proto = boot_protocol.lock().await;
+                                proto.pubkey()
+                            };
+                            let msg_id = format!("boot-{}", our_pubkey.get(..8).unwrap_or("?"));
+                            let msg = TransportMessage::new(
+                                MessageType::Proposal,
+                                our_pubkey,
+                                block_to_bytes(&proposal),
+                                msg_id,
+                            );
+                            let msg_bytes = serde_json::to_vec(&msg).unwrap_or_default();
+
+                            match tokio::time::timeout(
+                                Duration::from_secs(10),
+                                boot_quic.send_message(addr, &msg_bytes),
+                            )
+                            .await
+                            {
+                                Ok(Ok(response_bytes)) => {
+                                    if let Ok(resp_msg) =
+                                        serde_json::from_slice::<TransportMessage>(&response_bytes)
+                                    {
+                                        if resp_msg.message_type == MessageType::Agreement {
+                                            if let Ok(agreement) = bytes_to_block(&resp_msg.payload)
+                                            {
+                                                let mut proto = boot_protocol.lock().await;
+                                                if proto.receive_agreement(&agreement).is_ok() {
+                                                    tracing::info!(
+                                                        peer = &peer_pubkey[..8],
+                                                        "bootstrap trust established (bilateral)"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::debug!(
+                                        peer = &peer_pubkey[..8],
+                                        err = %e,
+                                        "bootstrap QUIC send failed"
+                                    );
+                                }
+                                Err(_) => {
+                                    tracing::debug!(
+                                        peer = &peer_pubkey[..8],
+                                        "bootstrap proposal timed out"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            });
         }
 
         tracing::info!(

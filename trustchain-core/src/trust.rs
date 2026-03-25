@@ -1474,10 +1474,11 @@ mod tests {
 
         let engine = TrustEngine::new(&store, None, None, None);
         let integrity = engine.compute_chain_integrity(&agent.pubkey_hex()).unwrap();
-        // Block 1 valid, block 3 has seq gap → 1/2 = 0.5.
+        // Sequence gaps are tolerated (checkpoint blocks may create gaps).
+        // Both blocks are individually valid → integrity = 1.0.
         assert!(
-            (integrity - 0.5).abs() < 1e-10,
-            "integrity should be 0.5 with sequence gap, got {integrity}"
+            (integrity - 1.0).abs() < 1e-10,
+            "integrity should be 1.0 (gaps tolerated), got {integrity}"
         );
     }
 

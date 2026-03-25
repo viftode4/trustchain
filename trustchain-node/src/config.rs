@@ -131,11 +131,26 @@ impl NodeConfig {
     }
 
     /// Get effective bootstrap nodes (user-configured or built-in defaults).
+    ///
+    /// Returns the default public seed when no bootstrap nodes are configured.
+    /// Pass `--bootstrap ""` to explicitly disable seed nodes (local-only trust).
     pub fn effective_bootstrap_nodes(&self) -> Vec<String> {
+        // Filter empty strings — `--bootstrap ""` means "no seeds"
+        let non_empty: Vec<String> = self
+            .bootstrap_nodes
+            .iter()
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .collect();
+
         if self.bootstrap_nodes.is_empty() {
+            // No --bootstrap flag at all → use defaults
             default_seed_nodes()
+        } else if non_empty.is_empty() {
+            // --bootstrap "" → explicitly no seeds (local-only trust)
+            vec![]
         } else {
-            self.bootstrap_nodes.clone()
+            non_empty
         }
     }
 }
