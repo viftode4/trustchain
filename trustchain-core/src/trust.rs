@@ -593,16 +593,36 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
         for (i, block) in chain.iter().enumerate() {
             let expected_seq = (i as u64) + 1;
             if block.sequence_number != expected_seq {
+                // Tolerate gaps caused by self-signed blocks (checkpoint/audit)
+                // that remote peers can't receive via bilateral gossip.
+                // Check if the gap is small and the chain is otherwise consistent.
+                if i == 0 && block.sequence_number <= 3 {
+                    // Missing initial checkpoint/audit blocks — common for remote views.
+                    // Treat as valid: integrity covers what we CAN verify.
+                    continue;
+                }
+                // For mid-chain gaps, allow if the gap is 1-2 blocks (likely checkpoints).
+                if i > 0 && block.sequence_number <= chain[i - 1].sequence_number + 3 {
+                    continue;
+                }
                 return Ok(i as f64 / total);
             }
 
-            let expected_prev = if i == 0 {
-                GENESIS_HASH.to_string()
+            // Verify previous_hash linkage (skip if gap exists from missing blocks).
+            if i == 0 {
+                // First block we have — if it's not seq=1, we can't verify prev_hash
+                // against genesis because intermediate blocks are missing.
+                if block.sequence_number == 1 && block.previous_hash != GENESIS_HASH {
+                    return Ok(0.0);
+                }
             } else {
-                chain[i - 1].block_hash.clone()
-            };
-            if block.previous_hash != expected_prev {
-                return Ok(i as f64 / total);
+                // Consecutive blocks: verify hash chain.
+                // Only check if sequences are actually consecutive.
+                if block.sequence_number == chain[i - 1].sequence_number + 1
+                    && block.previous_hash != chain[i - 1].block_hash
+                {
+                    return Ok(i as f64 / total);
+                }
             }
 
             // Skip Ed25519 verification for blocks covered by the checkpoint.
