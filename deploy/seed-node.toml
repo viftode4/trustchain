@@ -10,3 +10,9 @@ proxy_addr = "0.0.0.0:8203"
 
 advertise_addr = "http://5.161.255.238:8202"
 log_level = "info"
+
+# Seed node uses its own pubkey as trust anchor for MeritRank.
+# This is needed so trust queries FROM the seed use the Sybil gate.
+# Empty URL disables peer bootstrap (we ARE the seed), but the pubkey
+# is passed directly to the trust engine.
+bootstrap_nodes = ["2ab9b393fb90cc2c78478d91df958b59e568f06b7080f182b405f97948859683"]
