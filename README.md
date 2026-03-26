@@ -5,9 +5,11 @@
 
 **Decentralized trust infrastructure for the AI agent economy.**
 
-TrustChain is a universal trust primitive — a bilateral signed ledger where every agent-to-agent interaction produces cryptographic proof. Trust scores emerge from real interaction history, not ratings or reputation systems. Sybil attacks fail because fake identities have no legitimate transaction graph to exploit.
+AI agents can now pay each other directly — Stripe, Coinbase, Visa, Mastercard all have live agent payment rails. There's no way to know if the agent you're paying is legitimate. No reputation, no history, nothing.
 
-Built on the [TrustChain protocol](https://doi.org/10.1016/j.future.2017.08.048) (Otte, de Vos, Pouwelse — TU Delft), extended with pluggable trust computation (NetFlow max-flow + MeritRank random walks) for AI agent economies.
+TrustChain is the missing layer. Every agent-to-agent interaction produces a bilateral cryptographic record signed by both parties. Trust scores emerge from real interaction history — fake identities can't manufacture a transaction graph, and an agent that scams once carries that record forever.
+
+Built on the [TrustChain protocol](https://doi.org/10.1016/j.future.2017.08.048) (Otte, de Vos, Pouwelse — TU Delft), extended with pluggable trust computation (NetFlow max-flow + MeritRank random walks) and an [IETF Internet-Draft](https://datatracker.ietf.org/doc/draft-viftode-trustchain-trust/) for agent economies.
 
 ## Quick Start
 
@@ -30,11 +32,7 @@ main()
 
 ### Install the binary directly
 
-Download from [GitHub Releases](https://github.com/viftode4/trustchain/releases), or:
-
-```bash
-cargo install trustchain-node
-```
+Download prebuilt binaries (Linux, macOS, Windows) from [GitHub Releases](https://github.com/viftode4/trustchain/releases).
 
 ### Run as a sidecar
 
@@ -195,13 +193,11 @@ cargo test --workspace --features ipv8         # include IPv8 transport tests
 
 **IETF drafts**:
 - [draft-pouwelse-trustchain-01](https://datatracker.ietf.org/doc/draft-pouwelse-trustchain/) — base bilateral ledger protocol (Pouwelse, TU Delft, 2018)
-- draft-viftode-trustchain-trust-00 — trust computation, NetFlow Sybil resistance, delegation, succession (filed March 2026)
+- [draft-viftode-trustchain-trust-00](https://datatracker.ietf.org/doc/draft-viftode-trustchain-trust/) — trust computation, NetFlow Sybil resistance, delegation, succession (filed March 2026)
 
 ## Public Seed Node
 
 A public seed node is running at `http://5.161.255.238:8202` (pubkey: `2ab9b393...`). It is the default bootstrap peer in all SDKs — new agents connect automatically without any configuration.
-
-> Early-access: running on modest hardware, not production-scale yet. Will be replaced with a domain and additional nodes as the network grows.
 
 ## Related Projects
 
