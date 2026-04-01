@@ -155,6 +155,24 @@ Two pluggable algorithms for the connectivity factor:
 
 Proven fraud → permanent hard-zero trust score. No seeds configured → integrity × recency only.
 
+## Trust Engine Architecture
+
+TrustChain's trust computation is implemented as a 7-layer engine across 8 modular Rust crates in `trustchain-core/src/`:
+
+| Layer | Module | What it does |
+|-------|--------|-------------|
+| L1 | `trust.rs` | Quality signals — transaction quality scores, value-weighted recency, timeout tracking |
+| L2 | `trust.rs` | Statistical confidence — Wilson score lower bound, Beta reputation (Bayesian updating) |
+| L3 | `tiers.rs`, `thresholds.rs` | Trust tiers — progressive capability unlocking, Josang threshold enforcement |
+| L4 | `sanctions.rs`, `correlation.rs`, `forgiveness.rs` | Sanctions & recovery — graduated penalties, correlated-delegate penalty, forgiveness |
+| L5 | `behavioral.rs`, `collusion.rs` | Behavioral detection — change detection, selective scamming, collusion ring identification |
+| L6 | `trust.rs` | Requester reputation — payment reliability, rating fairness, dispute rate |
+| L7 | `protocol.rs` | Delegation quotas — MAX_ACTIVE_DELEGATIONS=10, scope escalation prevention |
+
+All 7 layers feed into the `TrustEvidence` struct (32 fields) returned by `compute_trust()` and `compute_requester_trust()`.
+
+**Research basis:** Josang & Ismail 2002 (Beta reputation), Evan Miller 2009 (Wilson score confidence), Xiong & Liu 2004 (PeerTrust requester reputation), Hooi et al. 2016 (collusion detection).
+
 ## Protocol
 
 Based on [IETF draft-pouwelse-trustchain](https://datatracker.ietf.org/doc/draft-pouwelse-trustchain/):
