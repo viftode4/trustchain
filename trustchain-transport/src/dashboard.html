@@ -31,7 +31,7 @@ td.mono{font-family:monospace;color:#7dd3fc;max-width:160px;overflow:hidden;text
 .badge-gray{background:#1e293b;color:#94a3b8}
 .badge-blue{background:#1e3a5f;color:#93c5fd}
 .empty{color:#475569;text-align:center;padding:20px}
-.chain-viewer{max-height:360px;overflow-y:auto}
+.chain-viewer{max-height:500px;overflow-y:auto}
 .block-row{border-bottom:1px solid #1e293b;padding:8px 0;display:grid;grid-template-columns:40px 90px 140px 90px 1fr;gap:8px;align-items:start;font-size:.8rem}
 .block-row:last-child{border-bottom:none}
 .seq{color:#475569;font-size:.75rem;text-align:right}
@@ -41,6 +41,9 @@ td.mono{font-family:monospace;color:#7dd3fc;max-width:160px;overflow:hidden;text
 .peer-select{background:#1e293b;color:#e0e6ed;border:1px solid #334155;border-radius:4px;padding:4px 8px;font-size:.8rem;margin-left:8px;cursor:pointer}
 #error{color:#f87171;font-size:.85rem;padding:8px;display:none}
 .last-update{color:#475569;font-size:.7rem;text-align:right;margin-top:4px}
+.load-more{display:block;width:100%;padding:10px;background:#1e293b;color:#7dd3fc;border:1px solid #334155;border-radius:4px;cursor:pointer;font-size:.8rem;text-align:center;margin-top:8px}
+.load-more:hover{background:#253147}
+.chain-info{color:#475569;font-size:.72rem;margin-bottom:8px}
 </style>
 </head>
 <body>
@@ -77,22 +80,28 @@ td.mono{font-family:monospace;color:#7dd3fc;max-width:160px;overflow:hidden;text
 <div class="card">
   <h2>
     Chain Explorer
-    <select class="peer-select" id="chain-selector" onchange="loadChain()">
+    <select class="peer-select" id="chain-selector" onchange="resetAndLoadChain()">
       <option value="">own chain</option>
     </select>
   </h2>
-  <div class="chain-viewer">
+  <div id="chain-info" class="chain-info"></div>
+  <div class="chain-viewer" id="chain-viewer">
     <div class="block-row" style="font-size:.7rem;color:#475569;font-weight:600">
       <div>SEQ</div><div>TYPE</div><div>COUNTERPARTY</div><div>OUTCOME</div><div>TRANSACTION</div>
     </div>
     <div id="chain-body"><div class="empty">Loading...</div></div>
   </div>
+  <div id="load-more-wrap"></div>
   <div class="last-update" id="last-update"></div>
 </div>
 
 <script>
 const BASE = location.origin;
+const PAGE_SIZE = 50;
 let ownPubkey = null;
+let chainOffset = 0;
+let chainTotal = 0;
+let currentChainPubkey = null;
 
 async function fetchJSON(path) {
   const r = await fetch(BASE + path);
@@ -143,40 +152,79 @@ function scoreBar(score) {
   </div>`;
 }
 
-async function loadChain() {
+function renderBlockRow(b) {
+  const tx = b.transaction || {};
+  const txStr = JSON.stringify(tx, null, 0)
+    .replace(/[{}"]/g, '')
+    .replace(/,/g, ' · ')
+    .slice(0, 80);
+  return `<div class="block-row">
+    <div class="seq">${b.sequence_number}</div>
+    <div class="btype">${typeBadge(b.block_type)}</div>
+    <div class="mono" title="${b.link_public_key}">${shortKey(b.link_public_key)}</div>
+    <div class="outcome">${outcomeBadge(tx)}</div>
+    <div class="tx">${txStr || fmtTime(b.timestamp)}</div>
+  </div>`;
+}
+
+function resetAndLoadChain() {
+  chainOffset = 0;
+  chainTotal = 0;
+  document.getElementById('chain-body').innerHTML = '';
+  loadChain();
+}
+
+async function loadChain(append) {
   const sel = document.getElementById('chain-selector');
   const pubkey = sel.value || ownPubkey;
   if (!pubkey) return;
+  currentChainPubkey = pubkey;
+
   try {
-    const blocks = await fetchJSON('/chain/' + pubkey);
-    const arr = blocks.blocks ?? blocks;
+    const data = await fetchJSON(
+      `/chain/${pubkey}?newest_first=true&limit=${PAGE_SIZE}&offset=${chainOffset}`
+    );
+    const arr = data.blocks ?? [];
+    chainTotal = data.total ?? arr.length;
+
     const body = document.getElementById('chain-body');
-    if (!arr.length) {
+    const info = document.getElementById('chain-info');
+    info.textContent = `Showing ${Math.min(chainOffset + arr.length, chainTotal)} of ${chainTotal} blocks`;
+
+    if (!arr.length && !append) {
       body.innerHTML = '<div class="empty">No blocks yet</div>';
+      document.getElementById('load-more-wrap').innerHTML = '';
       return;
     }
-    // Show newest first
-    const rows = [...arr].reverse().map(b => {
-      const tx = b.transaction || {};
-      const txStr = JSON.stringify(tx, null, 0)
-        .replace(/[{}"]/g, '')
-        .replace(/,/g, ' · ')
-        .slice(0, 80);
-      return `<div class="block-row">
-        <div class="seq">${b.sequence_number}</div>
-        <div class="btype">${typeBadge(b.block_type)}</div>
-        <div class="mono" title="${b.link_public_key}">${shortKey(b.link_public_key)}</div>
-        <div class="outcome">${outcomeBadge(tx)}</div>
-        <div class="tx">${txStr || fmtTime(b.timestamp)}</div>
-      </div>`;
-    });
-    body.innerHTML = rows.join('');
+
+    const rows = arr.map(renderBlockRow).join('');
+    if (append) {
+      body.insertAdjacentHTML('beforeend', rows);
+    } else {
+      body.innerHTML = rows;
+    }
+
+    chainOffset += arr.length;
+
+    // Show/hide "Load more"
+    const wrap = document.getElementById('load-more-wrap');
+    if (chainOffset < chainTotal) {
+      const remaining = chainTotal - chainOffset;
+      wrap.innerHTML = `<button class="load-more" onclick="loadMore()">Load ${Math.min(PAGE_SIZE, remaining)} more (${remaining} remaining)</button>`;
+    } else {
+      wrap.innerHTML = '';
+    }
+
     document.getElementById('last-update').textContent =
       'updated ' + new Date().toLocaleTimeString();
   } catch (e) {
     document.getElementById('chain-body').innerHTML =
       `<div class="empty">Could not load chain: ${e.message}</div>`;
   }
+}
+
+function loadMore() {
+  loadChain(true);
 }
 
 async function refresh() {
@@ -210,50 +258,70 @@ async function refresh() {
     if (!peers.length) {
       tbody.innerHTML = '<tr><td colspan="6" class="empty">No peers yet</td></tr>';
     } else {
-      const rows = [];
-      for (const p of peers) {
-        let trust_score = 0, integrity = 0, recency = 1, interactions = 0;
-        let displayScore = 0;
-        try {
-          const t = await fetchJSON('/trust/' + p.pubkey);
-          trust_score  = t.trust_score   ?? 0;
-          integrity    = t.integrity     ?? 0;
-          recency      = t.recency       ?? 1;
-          interactions = t.interaction_count ?? t.interactions ?? 0;
-
-          // If trust_score is 0 due to missing genesis (integrity=0)
-          // but we have interactions, fall back to recency-weighted score.
-          if (trust_score < 1e-6 && interactions > 0) {
-            displayScore = recency * (interactions / (interactions + 3));
-          } else {
-            displayScore = trust_score;
-          }
-        } catch {}
-
-        rows.push(`<tr>
-          <td class="mono" title="${p.pubkey}">${shortKey(p.pubkey)}</td>
-          <td style="color:#94a3b8;font-size:.78rem">${p.address || '—'}</td>
-          <td>${scoreBar(displayScore)}</td>
-          <td>
-            <div class="bar-wrap">
-              <div class="bar"><div class="fill ${barColor(integrity)}" style="width:${Math.round(integrity*100)}%"></div></div>
-              <span>${integrity.toFixed(2)}</span>
-            </div>
-          </td>
-          <td>
-            <div class="bar-wrap">
-              <div class="bar"><div class="fill ${barColor(recency)}" style="width:${Math.round(recency*100)}%"></div></div>
-              <span>${recency.toFixed(2)}</span>
-            </div>
-          </td>
-          <td style="color:#94a3b8">${interactions}</td>
-        </tr>`);
-      }
+      // Render peer rows immediately with placeholder scores, then fill in async
+      const rows = peers.map((p, i) => `<tr>
+        <td class="mono" title="${p.pubkey}">${shortKey(p.pubkey)}</td>
+        <td style="color:#94a3b8;font-size:.78rem">${p.address || '—'}</td>
+        <td id="score-${i}">${scoreBar(0)}</td>
+        <td id="integrity-${i}">
+          <div class="bar-wrap">
+            <div class="bar"><div class="fill none" style="width:0%"></div></div>
+            <span>—</span>
+          </div>
+        </td>
+        <td id="recency-${i}">
+          <div class="bar-wrap">
+            <div class="bar"><div class="fill none" style="width:0%"></div></div>
+            <span>—</span>
+          </div>
+        </td>
+        <td id="interactions-${i}" style="color:#94a3b8">—</td>
+      </tr>`);
       tbody.innerHTML = rows.join('');
+
+      // Fetch trust scores in parallel (batches of 10 to avoid hammering)
+      const BATCH = 10;
+      for (let i = 0; i < peers.length; i += BATCH) {
+        const batch = peers.slice(i, i + BATCH);
+        const promises = batch.map((p, j) => {
+          const idx = i + j;
+          return fetchJSON('/trust/' + p.pubkey)
+            .then(t => {
+              const trust_score = t.trust_score ?? 0;
+              const integrity = t.integrity ?? 0;
+              const recency = t.recency ?? 1;
+              const interactions = t.interaction_count ?? t.interactions ?? 0;
+              let displayScore = trust_score;
+              if (trust_score < 1e-6 && interactions > 0) {
+                displayScore = recency * (interactions / (interactions + 3));
+              }
+              const el = (id) => document.getElementById(id);
+              if (el(`score-${idx}`)) el(`score-${idx}`).innerHTML = scoreBar(displayScore);
+              if (el(`integrity-${idx}`)) el(`integrity-${idx}`).innerHTML = `
+                <div class="bar-wrap">
+                  <div class="bar"><div class="fill ${barColor(integrity)}" style="width:${Math.round(integrity*100)}%"></div></div>
+                  <span>${integrity.toFixed(2)}</span>
+                </div>`;
+              if (el(`recency-${idx}`)) el(`recency-${idx}`).innerHTML = `
+                <div class="bar-wrap">
+                  <div class="bar"><div class="fill ${barColor(recency)}" style="width:${Math.round(recency*100)}%"></div></div>
+                  <span>${recency.toFixed(2)}</span>
+                </div>`;
+              if (el(`interactions-${idx}`)) el(`interactions-${idx}`).textContent = interactions;
+            })
+            .catch(() => {});
+        });
+        await Promise.all(promises);
+      }
     }
 
     document.getElementById('error').style.display = 'none';
-    loadChain();
+
+    // Only load chain on first refresh or if chain viewer is empty
+    if (!document.getElementById('chain-body').children.length ||
+        document.getElementById('chain-body').querySelector('.empty')) {
+      resetAndLoadChain();
+    }
   } catch (e) {
     const el = document.getElementById('error');
     el.textContent = 'Connection error: ' + e.message;
@@ -262,7 +330,7 @@ async function refresh() {
 }
 
 refresh();
-setInterval(refresh, 5000);
+setInterval(refresh, 10000);
 </script>
 </body>
 </html>

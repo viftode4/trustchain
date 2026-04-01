@@ -130,6 +130,26 @@ pub struct CrawlQuery {
     pub start_seq: Option<u64>,
 }
 
+/// Query parameters for paginated chain endpoint.
+#[derive(Deserialize)]
+pub struct ChainQuery {
+    /// Max blocks to return (default: all).
+    pub limit: Option<usize>,
+    /// Skip this many blocks from the start of the ascending chain (default: 0).
+    pub offset: Option<usize>,
+    /// If true, return newest-first (DESC). Default false (ASC).
+    pub newest_first: Option<bool>,
+}
+
+/// Paginated chain response — includes total so the client knows how many more to fetch.
+#[derive(Serialize)]
+pub struct PaginatedBlocksResponse {
+    pub blocks: Vec<HalfBlock>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: Option<usize>,
+}
+
 /// Query parameters for capability discovery endpoint.
 #[derive(Deserialize)]
 pub struct DiscoverParams {
@@ -263,6 +283,34 @@ pub struct TrustScoreResponse {
     pub interaction_count: usize,
     pub block_count: usize,
     pub audit_count: usize,
+    pub avg_quality: f64,
+    pub value_weighted_recency: f64,
+    pub timeout_count: usize,
+    pub confidence: f64,
+    pub sample_size: u64,
+    pub positive_count: u64,
+    pub beta_reputation: Option<f64>,
+    pub required_deposit_ratio: f64,
+    pub sanction_penalty: f64,
+    pub violation_count: usize,
+    pub correlation_penalty: f64,
+    pub forgiveness_factor: f64,
+    pub good_interactions_since_violation: usize,
+    pub behavioral_change: f64,
+    pub behavioral_anomaly: bool,
+    pub selective_scamming: bool,
+    pub collusion_cluster_density: f64,
+    pub collusion_external_ratio: f64,
+    pub collusion_temporal_burst: bool,
+    pub collusion_reciprocity_anomaly: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requester_trust: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment_reliability: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rating_fairness: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispute_rate: Option<f64>,
 }
 
 /// Request for delegation endpoint.
@@ -701,11 +749,30 @@ async fn handle_receive_agreement<S: BlockStore + 'static, D: DelegationStore + 
 async fn handle_get_chain<S: BlockStore + 'static, D: DelegationStore + Send + 'static>(
     State(state): State<AppState<S, D>>,
     Path(pubkey): Path<String>,
-) -> Result<Json<BlocksResponse>, StatusCode> {
+    Query(params): Query<ChainQuery>,
+) -> Result<Json<PaginatedBlocksResponse>, StatusCode> {
     let proto = state.protocol.lock().await;
 
     match proto.store().get_chain(&pubkey) {
-        Ok(blocks) => Ok(Json(BlocksResponse { blocks })),
+        Ok(mut blocks) => {
+            let total = blocks.len();
+            let newest_first = params.newest_first.unwrap_or(false);
+            if newest_first {
+                blocks.reverse();
+            }
+            let offset = params.offset.unwrap_or(0).min(total);
+            let sliced = if let Some(limit) = params.limit {
+                blocks.into_iter().skip(offset).take(limit).collect()
+            } else {
+                blocks.into_iter().skip(offset).collect()
+            };
+            Ok(Json(PaginatedBlocksResponse {
+                blocks: sliced,
+                total,
+                offset,
+                limit: params.limit,
+            }))
+        }
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -933,6 +1000,10 @@ fn build_delegation_ctx<D: DelegationStore>(
 pub struct TrustScoreParams {
     /// Optional context filter (e.g. "code_execution", "tool:web_search").
     pub context: Option<String>,
+    /// Optional perspective: "requester" returns requester-perspective trust.
+    /// Default (absent or any other value) returns provider-perspective trust.
+    #[serde(default)]
+    pub perspective: Option<String>,
 }
 
 /// Query the trust score for a given public key.
@@ -963,16 +1034,20 @@ async fn handle_trust_score<S: BlockStore + 'static, D: DelegationStore + Send +
     if let Some(cp) = checkpoint {
         engine = engine.with_checkpoint(cp);
     }
-    let evidence = engine
-        .compute_trust_with_evidence_ctx(&pubkey, params.context.as_deref())
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-        })?;
+    // Layer 6.1: Requester perspective via ?perspective=requester.
+    let evidence = if params.perspective.as_deref() == Some("requester") {
+        engine.compute_requester_trust(&pubkey)
+    } else {
+        engine.compute_trust_with_evidence_ctx(&pubkey, params.context.as_deref())
+    }
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
 
     let block_count = store.get_block_count().unwrap_or(0);
 
@@ -994,6 +1069,30 @@ async fn handle_trust_score<S: BlockStore + 'static, D: DelegationStore + Send +
         interaction_count: evidence.interactions,
         block_count,
         audit_count: evidence.audit_count,
+        avg_quality: evidence.avg_quality,
+        value_weighted_recency: evidence.value_weighted_recency,
+        timeout_count: evidence.timeout_count,
+        confidence: evidence.confidence,
+        sample_size: evidence.sample_size,
+        positive_count: evidence.positive_count,
+        beta_reputation: evidence.beta_reputation,
+        required_deposit_ratio: evidence.required_deposit_ratio,
+        sanction_penalty: evidence.sanction_penalty,
+        violation_count: evidence.violation_count,
+        correlation_penalty: evidence.correlation_penalty,
+        forgiveness_factor: evidence.forgiveness_factor,
+        good_interactions_since_violation: evidence.good_interactions_since_violation,
+        behavioral_change: evidence.behavioral_change,
+        behavioral_anomaly: evidence.behavioral_anomaly,
+        selective_scamming: evidence.selective_scamming,
+        collusion_cluster_density: evidence.collusion_cluster_density,
+        collusion_external_ratio: evidence.collusion_external_ratio,
+        collusion_temporal_burst: evidence.collusion_temporal_burst,
+        collusion_reciprocity_anomaly: evidence.collusion_reciprocity_anomaly,
+        requester_trust: evidence.requester_trust,
+        payment_reliability: evidence.payment_reliability,
+        rating_fairness: evidence.rating_fairness,
+        dispute_rate: evidence.dispute_rate,
     }))
 }
 

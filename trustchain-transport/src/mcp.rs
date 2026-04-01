@@ -38,6 +38,9 @@ use crate::discovery::PeerDiscovery;
 pub struct CheckTrustParams {
     /// Hex-encoded Ed25519 public key of the peer to check trust for.
     pub peer: String,
+    /// Optional perspective: "requester" returns requester-perspective trust.
+    #[serde(default)]
+    pub perspective: Option<String>,
 }
 
 /// Parameters for the `trustchain_discover_peers` tool.
@@ -154,9 +157,13 @@ impl<S: BlockStore + 'static> TrustChainMcpServer<S> {
         let store = proto.store();
         let engine = self.make_engine(store);
 
-        let evidence = engine
-            .compute_trust_with_evidence(&params.0.peer)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Layer 6.1: Requester perspective via perspective param.
+        let evidence = if params.0.perspective.as_deref() == Some("requester") {
+            engine.compute_requester_trust(&params.0.peer)
+        } else {
+            engine.compute_trust_with_evidence(&params.0.peer)
+        }
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let result = serde_json::json!({
             "peer": params.0.peer,
@@ -169,6 +176,30 @@ impl<S: BlockStore + 'static> TrustChainMcpServer<S> {
             "interaction_count": evidence.interactions,
             "fraud": evidence.fraud,
             "path_diversity": if evidence.path_diversity.is_infinite() { 0.0 } else { evidence.path_diversity },
+            "avg_quality": evidence.avg_quality,
+            "value_weighted_recency": evidence.value_weighted_recency,
+            "timeout_count": evidence.timeout_count,
+            "confidence": evidence.confidence,
+            "sample_size": evidence.sample_size,
+            "positive_count": evidence.positive_count,
+            "beta_reputation": evidence.beta_reputation,
+            "required_deposit_ratio": evidence.required_deposit_ratio,
+            "sanction_penalty": evidence.sanction_penalty,
+            "violation_count": evidence.violation_count,
+            "correlation_penalty": evidence.correlation_penalty,
+            "forgiveness_factor": evidence.forgiveness_factor,
+            "good_interactions_since_violation": evidence.good_interactions_since_violation,
+            "behavioral_change": evidence.behavioral_change,
+            "behavioral_anomaly": evidence.behavioral_anomaly,
+            "selective_scamming": evidence.selective_scamming,
+            "collusion_cluster_density": evidence.collusion_cluster_density,
+            "collusion_external_ratio": evidence.collusion_external_ratio,
+            "collusion_temporal_burst": evidence.collusion_temporal_burst,
+            "collusion_reciprocity_anomaly": evidence.collusion_reciprocity_anomaly,
+            "requester_trust": evidence.requester_trust,
+            "payment_reliability": evidence.payment_reliability,
+            "rating_fairness": evidence.rating_fairness,
+            "dispute_rate": evidence.dispute_rate,
         });
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -566,6 +597,7 @@ mod tests {
         let server = make_test_server();
         let params = Parameters(CheckTrustParams {
             peer: "deadbeef".to_string(),
+            perspective: None,
         });
         let result = server.check_trust(params).await.unwrap();
         let json = parse_tool_json(&result);
@@ -651,6 +683,7 @@ mod tests {
         // Check trust — with seed nodes, netflow component should contribute.
         let params = Parameters(CheckTrustParams {
             peer: bob.pubkey_hex(),
+            perspective: None,
         });
         let result = server.check_trust(params).await.unwrap();
         let json = parse_tool_json(&result);
@@ -681,7 +714,10 @@ mod tests {
         let identity_json = parse_tool_json(&identity_result);
         let our_pubkey = identity_json["public_key"].as_str().unwrap().to_string();
 
-        let check_params = Parameters(CheckTrustParams { peer: our_pubkey });
+        let check_params = Parameters(CheckTrustParams {
+            peer: our_pubkey,
+            perspective: None,
+        });
         let check_result = server.check_trust(check_params).await.unwrap();
         let check_json = parse_tool_json(&check_result);
         let count = check_json["interaction_count"].as_u64().unwrap();
