@@ -226,7 +226,8 @@ fn stress_double_countersign_detected() {
 
 #[test]
 fn stress_trust_exact_math_no_netflow() {
-    // Case A: empty chain → integrity=1.0 (no blocks to fail), no seeds → trust=1.0.
+    // Case A: empty chain → integrity=1.0, recency=0.5 (uninformative prior),
+    // but confidence_scale = 0/5 = 0.0 → trust = 0.0 (no history = no trust).
     {
         let store = MemoryBlockStore::new();
         let engine = TrustEngine::new(&store, None, None, None);
@@ -234,8 +235,8 @@ fn stress_trust_exact_math_no_netflow() {
             .compute_trust(&Identity::from_bytes(&[1; 32]).pubkey_hex())
             .unwrap();
         assert!(
-            (score - 1.0).abs() < 1e-9,
-            "empty agent must score exactly 1.0 (empty chain integrity=1.0, no seeds), got {score}"
+            score.abs() < 1e-9,
+            "empty agent must score 0.0 (confidence_scale=0: no interactions), got {score}"
         );
     }
 
@@ -269,10 +270,12 @@ fn stress_trust_exact_math_no_netflow() {
             "perfect chain must have integrity=1.0, got {integrity}"
         );
 
-        // No seeds configured → trust = integrity directly.
+        // No seeds → trust = (0.3 × integrity + 0.7 × recency) × confidence_scale.
+        // 20 interactions, recency=1.0 (no quality field → backward compat 1.0),
+        // integrity=1.0, confidence_scale=1.0 → trust = 1.0.
         assert!(
-            (trust - integrity).abs() < 1e-9,
-            "without seeds trust must equal integrity ({integrity:.6}), got {trust:.6}"
+            (trust - 1.0).abs() < 1e-9,
+            "20-interaction perfect chain must score 1.0, got {trust:.6}"
         );
 
         println!("exact math: integrity={integrity:.4} trust={trust:.4} ✓");
@@ -403,22 +406,26 @@ fn stress_trust_monotonicity() {
 
     println!("trust monotonicity: t0={t0:.4}  t5={t5:.4}  t20={t20:.4}");
 
-    // No seeds → trust = integrity. Empty chain has integrity=1.0.
-    // Adding interactions keeps integrity=1.0 as long as the chain is valid.
+    // No seeds → trust = (0.3 × integrity + 0.7 × recency) × confidence_scale.
+    // Empty chain: confidence_scale=0/5=0.0 → trust=0.0 (no history = no trust).
+    // 5 interactions: confidence_scale=5/5=1.0, recency=1.0, integrity=1.0 → trust=1.0.
+    // 20 interactions: same → trust=1.0.
     assert!(
-        (t0 - 1.0).abs() < 1e-9,
-        "empty agent must score exactly 1.0 (no seeds, empty chain integrity=1.0), got {t0}"
+        t0.abs() < 1e-9,
+        "empty agent must score 0.0 (confidence_scale=0), got {t0}"
     );
     assert!(
         (t5 - 1.0).abs() < 1e-9,
-        "5-interaction perfect chain must score 1.0 (no seeds, integrity=1.0), got {t5}"
+        "5-interaction perfect chain must score 1.0, got {t5}"
     );
     assert!(
         (t20 - 1.0).abs() < 1e-9,
-        "20-interaction perfect chain must score 1.0 (no seeds, integrity=1.0), got {t20}"
+        "20-interaction perfect chain must score 1.0, got {t20}"
     );
     assert!(t20 <= 1.0, "trust must be capped at 1.0");
-    println!("trust monotonicity: t0=t5=t20=1.0 (no seeds, perfect chains) ✓");
+    // Monotonicity: t0 < t5 = t20 (interactions improve trust from prior)
+    assert!(t0 < t5, "trust must increase from empty to 5 interactions");
+    println!("trust monotonicity: t0=0.0, t5=t20=1.0 ✓");
 }
 
 // ─── Test 14: NetFlow with multiple seed nodes (§4.1) ─────────────────────────

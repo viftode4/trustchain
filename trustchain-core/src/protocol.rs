@@ -540,6 +540,23 @@ impl<S: BlockStore> TrustChainProtocol<S> {
             .unwrap()
             .as_millis() as u64;
 
+        // Layer 6.2: Delegation quota — cap active delegations per delegator.
+        // Research: ATTACK-TAXONOMY §1.1 (Sybil Identity Flood).
+        if let Some(ds) = delegation_store {
+            let existing = ds.get_delegations_by_delegator(&self.pubkey())?;
+            let active_count = existing.iter().filter(|d| d.is_active(now_ms)).count();
+            if active_count >= crate::types::MAX_ACTIVE_DELEGATIONS {
+                return Err(TrustChainError::delegation(
+                    self.pubkey(),
+                    format!(
+                        "delegation quota exceeded: {} active delegations (max {})",
+                        active_count,
+                        crate::types::MAX_ACTIVE_DELEGATIONS,
+                    ),
+                ));
+            }
+        }
+
         let delegation_id = {
             let mut hasher = Sha256::new();
             hasher.update(format!("{}:{}:{}", self.pubkey(), delegate_pubkey, now_ms));
@@ -1791,5 +1808,173 @@ mod tests {
         assert!(proto.should_record_event(&EventType::Error));
         assert!(!proto.should_record_event(&EventType::LlmDecision));
         assert!(!proto.should_record_event(&EventType::RawHttp));
+    }
+
+    // -----------------------------------------------------------------------
+    // Layer 6.2: Delegation quota tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create N accepted delegations from `delegator` to fresh identities.
+    fn create_n_delegations(
+        delegator: &mut TrustChainProtocol<MemoryBlockStore>,
+        ds: &mut MemoryDelegationStore,
+        n: usize,
+    ) {
+        for i in 0..n {
+            let delegate_id = Identity::from_bytes(&[(i as u8).wrapping_add(10); 32]);
+            let mut delegate_proto = TrustChainProtocol::new(delegate_id, MemoryBlockStore::new());
+            let proposal = delegator
+                .create_delegation_proposal::<MemoryDelegationStore>(
+                    &delegate_proto.pubkey(),
+                    vec![],
+                    0,
+                    3_600_000, // 1 hour
+                    Some(ds),
+                )
+                .unwrap();
+            delegate_proto.accept_delegation(&proposal, ds).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_delegation_quota_below_limit() {
+        let (mut alice, _) = make_protocol();
+        let mut ds = MemoryDelegationStore::new();
+
+        // Create 9 delegations — all succeed.
+        create_n_delegations(&mut alice, &mut ds, 9);
+
+        // 10th should also succeed (at the limit).
+        let delegate_id = Identity::from_bytes(&[99u8; 32]);
+        let mut delegate_proto = TrustChainProtocol::new(delegate_id, MemoryBlockStore::new());
+        let result = alice.create_delegation_proposal::<MemoryDelegationStore>(
+            &delegate_proto.pubkey(),
+            vec![],
+            0,
+            3_600_000,
+            Some(&ds),
+        );
+        assert!(result.is_ok(), "10th delegation (at limit) should succeed");
+        delegate_proto
+            .accept_delegation(&result.unwrap(), &mut ds)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_delegation_quota_at_limit() {
+        let (mut alice, _) = make_protocol();
+        let mut ds = MemoryDelegationStore::new();
+
+        // Create 10 delegations — fills the quota.
+        create_n_delegations(&mut alice, &mut ds, 10);
+
+        // 11th should fail.
+        let delegate_id = Identity::from_bytes(&[200u8; 32]);
+        let result = alice.create_delegation_proposal::<MemoryDelegationStore>(
+            &delegate_id.pubkey_hex(),
+            vec![],
+            0,
+            3_600_000,
+            Some(&ds),
+        );
+        assert!(result.is_err(), "11th delegation should be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("delegation quota exceeded"),
+            "Error should mention quota: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_delegation_quota_revoked_dont_count() {
+        let (mut alice, _) = make_protocol();
+        let mut ds = MemoryDelegationStore::new();
+
+        // Create 10 delegations — fills the quota.
+        create_n_delegations(&mut alice, &mut ds, 10);
+
+        // Revoke one delegation.
+        let delegations = ds.get_delegations_by_delegator(&alice.pubkey()).unwrap();
+        let first_id = &delegations[0].delegation_id;
+        ds.revoke_delegation(first_id, "revoke_block_hash").unwrap();
+
+        // Now we should be able to create a new one.
+        let delegate_id = Identity::from_bytes(&[201u8; 32]);
+        let result = alice.create_delegation_proposal::<MemoryDelegationStore>(
+            &delegate_id.pubkey_hex(),
+            vec![],
+            0,
+            3_600_000,
+            Some(&ds),
+        );
+        assert!(
+            result.is_ok(),
+            "Should succeed after revoking one: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_delegation_quota_expired_dont_count() {
+        use crate::delegation::DelegationRecord;
+
+        let (mut alice, _) = make_protocol();
+        let mut ds = MemoryDelegationStore::new();
+
+        // Manually insert an already-expired delegation record.
+        let expired_record = DelegationRecord {
+            delegation_id: "expired-delegation-id".to_string(),
+            delegator_pubkey: alice.pubkey(),
+            delegate_pubkey: "expired-delegate-pubkey".to_string(),
+            scope: vec![],
+            max_depth: 0,
+            issued_at: 1000,
+            expires_at: 2000, // expired long ago
+            delegation_block_hash: "hash1".to_string(),
+            agreement_block_hash: Some("hash2".to_string()),
+            parent_delegation_id: None,
+            revoked: false,
+            revocation_block_hash: None,
+        };
+        ds.add_delegation(expired_record).unwrap();
+
+        // Create 9 active delegations.
+        create_n_delegations(&mut alice, &mut ds, 9);
+
+        // Total records = 10 (1 expired + 9 active), but only 9 are active.
+        // 10th active delegation should succeed.
+        let delegate_id = Identity::from_bytes(&[202u8; 32]);
+        let result = alice.create_delegation_proposal::<MemoryDelegationStore>(
+            &delegate_id.pubkey_hex(),
+            vec![],
+            0,
+            3_600_000,
+            Some(&ds),
+        );
+        assert!(
+            result.is_ok(),
+            "Should succeed — expired delegation doesn't count: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_delegation_quota_no_store() {
+        let (mut alice, _) = make_protocol();
+        let delegate_id = Identity::from_bytes(&[60u8; 32]);
+
+        // Without a delegation store, quota is not checked.
+        let result = alice.create_delegation_proposal::<MemoryDelegationStore>(
+            &delegate_id.pubkey_hex(),
+            vec![],
+            0,
+            3_600_000,
+            None, // no store
+        );
+        assert!(
+            result.is_ok(),
+            "No store → no quota check: {:?}",
+            result.err()
+        );
     }
 }

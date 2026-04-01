@@ -19,6 +19,12 @@ pub const UNKNOWN_SEQ: u64 = 0;
 /// direct library callers cannot bypass the cap (not just the HTTP API layer).
 pub const MAX_DELEGATION_TTL_MS: u64 = 30 * 24 * 3600 * 1000;
 
+/// Maximum number of concurrently active delegations per delegator.
+///
+/// Prevents Sybil identity flooding via unbounded delegation creation.
+/// Research: ATTACK-TAXONOMY §1.1, network-ecology-control principle #3.
+pub const MAX_ACTIVE_DELEGATIONS: usize = 10;
+
 // ---------------------------------------------------------------------------
 // ValidationResult — tiered validation matching py-ipv8
 // ---------------------------------------------------------------------------

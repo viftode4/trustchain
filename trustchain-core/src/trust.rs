@@ -51,13 +51,13 @@ impl Default for TrustAlgorithm {
     }
 }
 
-/// Configuration for the multiplicative trust model.
+/// Configuration for the weighted-additive trust model.
 ///
-/// Trust = connectivity × integrity × diversity × recency
-/// - **connectivity** = min(path_diversity / K, 1.0)
-/// - **integrity** = chain_integrity (fraction of valid blocks)
-/// - **diversity** = min(unique_peers / M, 1.0)
-/// - **recency** = exponential-decay-weighted outcome quality
+/// Trust = (0.3 × structural + 0.7 × behavioral) × confidence_scale
+/// - **structural** = connectivity × integrity (Sybil resistance + chain health)
+/// - **behavioral** = recency (quality-weighted track record)
+/// - **confidence_scale** = min(interactions / cold_start_threshold, 1.0)
+/// - Sybil gate: connectivity < ε → hard zero (unchanged)
 #[derive(Debug, Clone)]
 pub struct TrustConfig {
     /// K: number of independent paths needed for full connectivity score.
@@ -92,6 +92,9 @@ impl Default for TrustConfig {
 /// Backward-compatible alias — maps to TrustConfig.
 pub type TrustWeights = TrustConfig;
 
+/// Default z-score for 95% confidence interval (Wilson score).
+pub const DEFAULT_WILSON_Z: f64 = 1.96;
+
 /// Evidence bundle returned alongside the trust score.
 ///
 /// Provides interpretable factors explaining *why* a score is what it is.
@@ -117,6 +120,91 @@ pub struct TrustEvidence {
     pub path_diversity: f64,
     /// Number of audit blocks (single-player, self-referencing) in the chain.
     pub audit_count: usize,
+
+    // --- Layer 1: Quality signal (trust-differentiation-fixes P0) ---
+    /// Average quality across all interactions (continuous 0.0–1.0).
+    /// Uses quality > requester_rating > binary outcome fallback chain.
+    pub avg_quality: f64,
+
+    // --- Layer 1.4: Value-weighted recency ---
+    /// Recency weighted by transaction value (price/avg_price).
+    /// Cheap wash-trades contribute negligibly. Research: Olariu et al. 2024.
+    pub value_weighted_recency: f64,
+
+    // --- Layer 1.5: Timeout enforcement ---
+    /// Number of expired orphan proposals directed at this agent (timeouts).
+    /// Each counts as a failure in recency computation.
+    pub timeout_count: usize,
+
+    // --- Layer 2.1: Wilson score confidence (Evan Miller 2009, TRAVOS) ---
+    /// Wilson lower bound confidence score [0.0, 1.0].
+    /// Low for new agents (few interactions), high for established agents.
+    pub confidence: f64,
+    /// Total interaction count used for confidence computation.
+    pub sample_size: u64,
+    /// Number of interactions with quality >= 0.5 (positive outcomes).
+    pub positive_count: u64,
+
+    // --- Layer 2.3: Beta reputation (Josang & Ismail 2002) ---
+    /// Beta reputation score: Bayesian updating with temporal decay.
+    /// Unifies cold start + continuous feedback + temporal decay in one model.
+    /// `None` when chain is empty.
+    pub beta_reputation: Option<f64>,
+
+    // --- Layer 3.5: Trust-gated escrow (Asgaonkar & Krishnamachari 2019) ---
+    /// Required deposit ratio: `1.0 - trust_score`.
+    /// trust=1.0 → 0% deposit; trust=0.0 → 100% deposit.
+    pub required_deposit_ratio: f64,
+
+    // --- Layer 4.1: Graduated sanctions (Ostrom 1990, Cosmos slashing) ---
+    /// Cumulative graduated sanction penalty [0.0, 1.0].
+    pub sanction_penalty: f64,
+    /// Number of active violation classifications.
+    pub violation_count: usize,
+
+    // --- Layer 4.2: Correlation penalty (Ethereum PoS, Management Science 2024) ---
+    /// Penalty from correlated delegate failures in delegation tree.
+    /// 0.0 for non-delegators or no delegate failures.
+    pub correlation_penalty: f64,
+
+    // --- Layer 4.4: Forgiveness (Josang 2007, Axelrod 1984, Vasalou 2008) ---
+    /// Forgiveness factor applied to sanction penalty [0.0, 1.0].
+    /// 1.0 = no forgiveness applied, approaching 0.0 = mostly forgiven.
+    pub forgiveness_factor: f64,
+    /// Number of consecutive good interactions since the last violation.
+    pub good_interactions_since_violation: usize,
+
+    // --- Layer 5.1: Behavioral change detection (Olfati-Saber 2007) ---
+    /// Change magnitude: recent_failure_rate - baseline_failure_rate.
+    /// Positive = worsening, negative = improving.
+    pub behavioral_change: f64,
+    /// True if behavioral change exceeds anomaly threshold (30% spike).
+    pub behavioral_anomaly: bool,
+
+    // --- Layer 5.2: Selective scamming detection (Hoffman 2009) ---
+    /// True if agent shows different failure rates toward new vs established peers.
+    pub selective_scamming: bool,
+
+    // --- Layer 5.3: Collusion ring signals (Sun 2012, FRAUDAR) ---
+    /// Ego-network internal density [0.0, 1.0]. 0.0 when not computed.
+    pub collusion_cluster_density: f64,
+    /// Fraction of peers with connections outside the cluster. 0.0 when not computed.
+    pub collusion_external_ratio: f64,
+    /// Whether interactions with peers are temporally clustered.
+    pub collusion_temporal_burst: bool,
+    /// Whether the agent has suspiciously symmetric ratings with peers.
+    pub collusion_reciprocity_anomaly: bool,
+
+    // --- Layer 6.1: Requester reputation (PeerTrust, Xiong & Liu 2004) ---
+    /// Requester-perspective trust score. `None` unless explicitly computed
+    /// via `compute_requester_trust()`.
+    pub requester_trust: Option<f64>,
+    /// Fraction of interactions where requester completed payment.
+    pub payment_reliability: Option<f64>,
+    /// Agreement between requester's ratings and provider consensus.
+    pub rating_fairness: Option<f64>,
+    /// Fraction of interactions resulting in disputes.
+    pub dispute_rate: Option<f64>,
 }
 
 /// Pre-captured delegation context for trust computation.
@@ -239,8 +327,9 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
     /// - Delegate fraud propagates to delegator.
     ///
     /// Standard (non-delegated):
-    /// Trust = connectivity × integrity × diversity × recency (4-factor multiplicative).
-    /// If netflow is unavailable (no seed nodes), only integrity × recency is used.
+    /// Trust = (0.3 × structural + 0.7 × behavioral) × confidence_scale
+    /// where structural = connectivity × integrity, behavioral = recency.
+    /// Sybil gate: hard zero if no path from seeds.
     /// Returns hard zero for agents with proven double-spend fraud.
     pub fn compute_trust(&self, pubkey: &str) -> Result<f64> {
         self.compute_trust_ctx(pubkey, None)
@@ -293,8 +382,10 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
         let chain = self.get_chain_for_context(pubkey, context)?;
         let direct_interactions = chain.len();
 
-        // Compute delegated trust: root_trust * delegation_factor / active_count
-        let root_trust = self.compute_standard_trust(root_pubkey, context)?;
+        // Compute delegated trust: root_trust * delegation_factor / active_count.
+        // Root trust uses full context — the delegator's overall credibility
+        // backs the delegation, not just one interaction type.
+        let root_trust = self.compute_standard_trust(root_pubkey, None)?;
         let active_count = ctx.root_active_delegation_count.max(1);
         let depth_factor = if ctx.depth > 1 {
             self.config.delegation_factor.powi(ctx.depth as i32 - 1)
@@ -322,9 +413,10 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
 
     /// Standard trust computation (non-delegated path).
     ///
-    /// Trust = connectivity × integrity × diversity × recency (4-factor multiplicative).
-    /// When seed nodes are configured, path_diversity is used for connectivity.
-    /// When no seeds are configured, connectivity=1.0, diversity=1.0.
+    /// Trust = (0.3 × structural + 0.7 × behavioral) × confidence_scale
+    /// where structural = connectivity × integrity, behavioral = recency.
+    /// Sybil gate: hard zero if no path from seeds (connectivity < ε).
+    /// Confidence scales linearly from 0 to 1 over cold_start_threshold interactions.
     fn compute_standard_trust(&self, pubkey: &str, context: Option<&str>) -> Result<f64> {
         let evidence = self.compute_standard_trust_evidence(pubkey, context)?;
         Ok(evidence.trust_score)
@@ -348,23 +440,52 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
         pubkey: &str,
         context: Option<&str>,
     ) -> Result<TrustEvidence> {
-        // Hard zero for proven fraud.
-        let frauds = self.store.get_double_spends(pubkey)?;
-        if !frauds.is_empty() {
-            let chain = self.store.get_chain(pubkey)?;
+        // Helper: zero-evidence for fraud/failure cases.
+        let zero_evidence = |chain: &[crate::halfblock::HalfBlock], fraud: bool| -> TrustEvidence {
             let audit_count = chain.iter().filter(|b| b.is_audit()).count();
-            return Ok(TrustEvidence {
+            TrustEvidence {
                 trust_score: 0.0,
                 connectivity: 0.0,
                 integrity: 0.0,
                 diversity: 0.0,
                 recency: 0.0,
-                unique_peers: self.count_unique_peers(&chain),
+                unique_peers: self.count_unique_peers(chain),
                 interactions: chain.len(),
-                fraud: true,
+                fraud,
                 path_diversity: 0.0,
                 audit_count,
-            });
+                avg_quality: Self::compute_avg_quality(chain),
+                value_weighted_recency: 0.0,
+                timeout_count: 0,
+                confidence: 0.0,
+                sample_size: 0,
+                positive_count: 0,
+                beta_reputation: None,
+                required_deposit_ratio: 1.0,
+                sanction_penalty: if fraud { 1.0 } else { 0.0 },
+                violation_count: if fraud { 1 } else { 0 },
+                correlation_penalty: if fraud { 1.0 } else { 0.0 },
+                forgiveness_factor: 1.0,
+                good_interactions_since_violation: 0,
+                behavioral_change: 0.0,
+                behavioral_anomaly: false,
+                selective_scamming: false,
+                collusion_cluster_density: 0.0,
+                collusion_external_ratio: 0.0,
+                collusion_temporal_burst: false,
+                collusion_reciprocity_anomaly: false,
+                requester_trust: None,
+                payment_reliability: None,
+                rating_fairness: None,
+                dispute_rate: None,
+            }
+        };
+
+        // Hard zero for proven fraud.
+        let frauds = self.store.get_double_spends(pubkey)?;
+        if !frauds.is_empty() {
+            let chain = self.store.get_chain(pubkey)?;
+            return Ok(zero_evidence(&chain, true));
         }
 
         // Use context-filtered chain for recency and diversity.
@@ -374,7 +495,27 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
         let interactions = filtered_chain.len();
         let audit_count = filtered_chain.iter().filter(|b| b.is_audit()).count();
         let diversity = (unique_peers as f64 / self.config.diversity_threshold).min(1.0);
-        let recency = self.compute_recency(&filtered_chain);
+        let avg_quality = Self::compute_avg_quality(&filtered_chain);
+
+        // Layer 1.5: Timeout enforcement — count expired orphan proposals.
+        let timeout_count = self.count_timeouts(pubkey, &filtered_chain);
+
+        // Layer 1.4: Value-weighted recency with timeout integration.
+        let recency = self.compute_recency_inner(&filtered_chain, timeout_count);
+        // Also compute basic (non-timeout) value-weighted recency for reporting.
+        let value_weighted_recency = self.compute_recency_inner(&filtered_chain, 0);
+
+        // Layer 2.1: Wilson score confidence.
+        let sample_size = interactions as u64;
+        let positive_count = filtered_chain
+            .iter()
+            .filter(|b| Self::extract_quality(&b.transaction) >= 0.5)
+            .count() as u64;
+        let confidence =
+            Self::wilson_lower_bound(positive_count as f64, sample_size as f64, DEFAULT_WILSON_Z);
+
+        // Layer 2.3: Beta reputation (Josang & Ismail 2002).
+        let beta_reputation = Self::beta_reputation(&filtered_chain);
 
         if let Some(ref seeds) = self.seed_nodes {
             if !seeds.is_empty() {
@@ -391,6 +532,30 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                         fraud: false,
                         path_diversity: f64::INFINITY,
                         audit_count,
+                        avg_quality,
+                        value_weighted_recency: 1.0,
+                        timeout_count: 0,
+                        confidence: 1.0,
+                        sample_size,
+                        positive_count,
+                        beta_reputation,
+                        required_deposit_ratio: 0.0,
+                        sanction_penalty: 0.0,
+                        violation_count: 0,
+                        correlation_penalty: 0.0,
+                        forgiveness_factor: 1.0,
+                        good_interactions_since_violation: 0,
+                        behavioral_change: 0.0,
+                        behavioral_anomaly: false,
+                        selective_scamming: false,
+                        collusion_cluster_density: 0.0,
+                        collusion_external_ratio: 0.0,
+                        collusion_temporal_burst: false,
+                        collusion_reciprocity_anomaly: false,
+                        requester_trust: None,
+                        payment_reliability: None,
+                        rating_fairness: None,
+                        dispute_rate: None,
                     });
                 }
 
@@ -410,11 +575,76 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                         fraud: false,
                         path_diversity: path_div,
                         audit_count,
+                        avg_quality,
+                        value_weighted_recency,
+                        timeout_count,
+                        confidence,
+                        sample_size,
+                        positive_count,
+                        beta_reputation,
+                        required_deposit_ratio: 1.0,
+                        sanction_penalty: 0.0,
+                        violation_count: 0,
+                        correlation_penalty: 0.0,
+                        forgiveness_factor: 1.0,
+                        good_interactions_since_violation: 0,
+                        behavioral_change: 0.0,
+                        behavioral_anomaly: false,
+                        selective_scamming: false,
+                        collusion_cluster_density: 0.0,
+                        collusion_external_ratio: 0.0,
+                        collusion_temporal_burst: false,
+                        collusion_reciprocity_anomaly: false,
+                        requester_trust: None,
+                        payment_reliability: None,
+                        rating_fairness: None,
+                        dispute_rate: None,
                     });
                 }
 
                 let connectivity = (path_div / self.config.connectivity_threshold).min(1.0);
-                let trust_score = (connectivity * integrity * diversity * recency).clamp(0.0, 1.0);
+
+                // Layer 2.2: Weighted-additive trust formula.
+                // Structural = Sybil resistance × chain health.
+                // Behavioral = quality-weighted track record (value-weighted recency).
+                // Confidence scales from 0→1 over cold_start_threshold interactions.
+                // Research: trust-differentiation-fixes P1, network-ecology-control principle #6.
+                let structural = connectivity.min(1.0) * integrity;
+                let behavioral = recency;
+                let confidence_scale =
+                    (interactions as f64 / self.config.cold_start_threshold.max(1) as f64).min(1.0);
+                let trust_score =
+                    ((0.3 * structural + 0.7 * behavioral) * confidence_scale).clamp(0.0, 1.0);
+
+                // Layer 4.1: Graduated sanctions (Ostrom 1990).
+                let sr = crate::sanctions::compute_sanctions(
+                    timeout_count,
+                    avg_quality,
+                    false,
+                    &crate::sanctions::SanctionConfig::default(),
+                );
+
+                // Layer 4.4: Forgiveness (Josang 2007, Axelrod 1984).
+                let good_since = Self::count_good_since_violation(&filtered_chain);
+                let forgiveness_severity = sr
+                    .violations
+                    .first()
+                    .map(|v| crate::forgiveness::RecoverySeverity::from(v.severity))
+                    .unwrap_or(crate::forgiveness::RecoverySeverity::Liveness);
+                let forgiven_penalty = crate::forgiveness::apply_forgiveness(
+                    sr.total_penalty,
+                    good_since,
+                    forgiveness_severity,
+                    &crate::forgiveness::ForgivenessConfig::default(),
+                );
+                let forgiveness_factor = if sr.total_penalty > 1e-12 {
+                    forgiven_penalty / sr.total_penalty
+                } else {
+                    1.0
+                };
+
+                // Layer 5.1-5.3: Behavioral detection + collusion signals.
+                let (beh, sel, col) = self.compute_layer5_signals(pubkey, &filtered_chain);
 
                 return Ok(TrustEvidence {
                     trust_score,
@@ -427,14 +657,73 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                     fraud: false,
                     path_diversity: path_div,
                     audit_count,
+                    avg_quality,
+                    value_weighted_recency,
+                    timeout_count,
+                    confidence,
+                    sample_size,
+                    positive_count,
+                    beta_reputation,
+                    required_deposit_ratio: (1.0 - trust_score).clamp(0.0, 1.0),
+                    sanction_penalty: forgiven_penalty,
+                    violation_count: sr.violation_count,
+                    correlation_penalty: 0.0,
+                    forgiveness_factor,
+                    good_interactions_since_violation: good_since,
+                    behavioral_change: beh.change_magnitude,
+                    behavioral_anomaly: beh.is_anomalous,
+                    selective_scamming: sel.is_selective,
+                    collusion_cluster_density: col.cluster_density,
+                    collusion_external_ratio: col.external_connection_ratio,
+                    collusion_temporal_burst: col.temporal_burst,
+                    collusion_reciprocity_anomaly: col.reciprocity_anomaly,
+                    requester_trust: None,
+                    payment_reliability: None,
+                    rating_fairness: None,
+                    dispute_rate: None,
                 });
             }
         }
 
-        // No seeds configured — no Sybil resistance, use integrity × recency only.
-        // Connectivity and diversity default to 1.0 since there's no topology to measure.
+        // No seeds configured — no Sybil resistance. Weighted-additive with
+        // connectivity=1.0 (no topology to measure). Confidence still scales by interactions.
+        let confidence_scale =
+            (interactions as f64 / self.config.cold_start_threshold.max(1) as f64).min(1.0);
+        let trust_score_no_seeds =
+            ((0.3 * integrity + 0.7 * recency) * confidence_scale).clamp(0.0, 1.0);
+
+        // Layer 4.1: Graduated sanctions (Ostrom 1990).
+        let sr_no_seeds = crate::sanctions::compute_sanctions(
+            timeout_count,
+            avg_quality,
+            false,
+            &crate::sanctions::SanctionConfig::default(),
+        );
+
+        // Layer 4.4: Forgiveness (Josang 2007, Axelrod 1984).
+        let good_since_ns = Self::count_good_since_violation(&filtered_chain);
+        let forgiveness_severity_ns = sr_no_seeds
+            .violations
+            .first()
+            .map(|v| crate::forgiveness::RecoverySeverity::from(v.severity))
+            .unwrap_or(crate::forgiveness::RecoverySeverity::Liveness);
+        let forgiven_penalty_ns = crate::forgiveness::apply_forgiveness(
+            sr_no_seeds.total_penalty,
+            good_since_ns,
+            forgiveness_severity_ns,
+            &crate::forgiveness::ForgivenessConfig::default(),
+        );
+        let forgiveness_factor_ns = if sr_no_seeds.total_penalty > 1e-12 {
+            forgiven_penalty_ns / sr_no_seeds.total_penalty
+        } else {
+            1.0
+        };
+
+        // Layer 5.1-5.3: Behavioral detection + collusion signals.
+        let (beh_ns, sel_ns, col_ns) = self.compute_layer5_signals(pubkey, &filtered_chain);
+
         Ok(TrustEvidence {
-            trust_score: (integrity * recency).clamp(0.0, 1.0),
+            trust_score: trust_score_no_seeds,
             connectivity: 1.0,
             integrity,
             diversity: 1.0,
@@ -444,43 +733,430 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
             fraud: false,
             path_diversity: 0.0,
             audit_count,
+            avg_quality,
+            value_weighted_recency,
+            timeout_count,
+            confidence,
+            sample_size,
+            positive_count,
+            beta_reputation,
+            required_deposit_ratio: (1.0 - trust_score_no_seeds).clamp(0.0, 1.0),
+            sanction_penalty: forgiven_penalty_ns,
+            violation_count: sr_no_seeds.violation_count,
+            correlation_penalty: 0.0,
+            forgiveness_factor: forgiveness_factor_ns,
+            good_interactions_since_violation: good_since_ns,
+            behavioral_change: beh_ns.change_magnitude,
+            behavioral_anomaly: beh_ns.is_anomalous,
+            selective_scamming: sel_ns.is_selective,
+            collusion_cluster_density: col_ns.cluster_density,
+            collusion_external_ratio: col_ns.external_connection_ratio,
+            collusion_temporal_burst: col_ns.temporal_burst,
+            collusion_reciprocity_anomaly: col_ns.reciprocity_anomaly,
+            requester_trust: None,
+            payment_reliability: None,
+            rating_fairness: None,
+            dispute_rate: None,
         })
     }
 
-    /// Compute recency: exponential-decay-weighted outcome quality.
+    /// Compute Layer 5 signals: behavioral change, selective targeting, collusion.
     ///
-    /// recency = Σ(λ^(n-1-k) × outcome_k) / Σ(λ^(n-1-k))
-    /// Empty chain → 1.0 (no penalty for no data).
-    fn compute_recency(&self, chain: &[crate::halfblock::HalfBlock]) -> f64 {
-        if chain.is_empty() {
-            return 1.0;
+    /// Encapsulates all partitioning and chain-loading logic so it can be called
+    /// from both seeded and no-seeds paths without duplication.
+    fn compute_layer5_signals(
+        &self,
+        pubkey: &str,
+        filtered_chain: &[crate::halfblock::HalfBlock],
+    ) -> (
+        crate::behavioral::BehavioralAnalysis,
+        crate::behavioral::SelectiveTargetingResult,
+        crate::collusion::CollusionSignals,
+    ) {
+        let beh_config = crate::behavioral::BehavioralConfig::default();
+        let col_config = crate::collusion::CollusionConfig::default();
+
+        // Extract quality values for behavioral change detection.
+        let qualities: Vec<f64> = filtered_chain
+            .iter()
+            .map(|b| Self::extract_quality(&b.transaction))
+            .collect();
+
+        // L5.1: Behavioral change detection.
+        let behavioral = crate::behavioral::detect_behavioral_change(&qualities, &beh_config);
+
+        // Build peer interaction counts for L5.2 + L5.3.
+        let mut peer_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for block in filtered_chain {
+            if block.public_key != block.link_public_key {
+                *peer_counts.entry(&block.link_public_key).or_insert(0) += 1;
+            }
+        }
+
+        // L5.2: Selective scamming — partition by counterparty "newness".
+        // "established" = appeared >2 times in target's chain.
+        let mut qualities_to_new: Vec<f64> = Vec::new();
+        let mut qualities_to_established: Vec<f64> = Vec::new();
+        for block in filtered_chain {
+            if block.public_key == block.link_public_key {
+                continue; // skip self-referencing audit blocks
+            }
+            let q = Self::extract_quality(&block.transaction);
+            let count = peer_counts
+                .get(block.link_public_key.as_str())
+                .copied()
+                .unwrap_or(0);
+            if count > 2 {
+                qualities_to_established.push(q);
+            } else {
+                qualities_to_new.push(q);
+            }
+        }
+        let selective = crate::behavioral::detect_selective_targeting(
+            &qualities_to_new,
+            &qualities_to_established,
+            &beh_config,
+        );
+
+        // L5.3: Collusion signals — reciprocity + concentration from target's chain.
+        // Load peer chains for reciprocity check (same pattern as count_timeouts).
+        let mut reciprocity_map: std::collections::HashMap<&str, (Vec<f64>, Vec<f64>)> =
+            std::collections::HashMap::new();
+
+        // Quality given to each peer (from target's chain).
+        for block in filtered_chain {
+            if block.public_key == block.link_public_key {
+                continue;
+            }
+            let q = Self::extract_quality(&block.transaction);
+            reciprocity_map
+                .entry(&block.link_public_key)
+                .or_insert_with(|| (Vec::new(), Vec::new()))
+                .0
+                .push(q);
+        }
+
+        // Quality received from each peer (from peer's chain where they interact with target).
+        for peer_pk in peer_counts.keys() {
+            if let Ok(peer_chain) = self.store.get_chain(peer_pk) {
+                for block in &peer_chain {
+                    if block.link_public_key == pubkey {
+                        let q = Self::extract_quality(&block.transaction);
+                        reciprocity_map
+                            .entry(peer_pk)
+                            .or_insert_with(|| (Vec::new(), Vec::new()))
+                            .1
+                            .push(q);
+                    }
+                }
+            }
+        }
+
+        let reciprocity_pairs: Vec<(f64, f64, usize)> = reciprocity_map
+            .values()
+            .map(|(given, received)| {
+                let avg_given = if given.is_empty() {
+                    0.0
+                } else {
+                    given.iter().sum::<f64>() / given.len() as f64
+                };
+                let avg_received = if received.is_empty() {
+                    0.0
+                } else {
+                    received.iter().sum::<f64>() / received.len() as f64
+                };
+                let count = given.len().min(received.len());
+                (avg_given, avg_received, count)
+            })
+            .collect();
+
+        let mut sorted_counts: Vec<usize> = peer_counts.values().copied().collect();
+        sorted_counts.sort_unstable_by(|a, b| b.cmp(a));
+
+        let collusion = crate::collusion::detect_collusion(
+            0.0,   // cluster_density: deferred (requires ego-network traversal)
+            0.0,   // external_ratio: deferred
+            false, // temporal_burst: deferred
+            &reciprocity_pairs,
+            &sorted_counts,
+            filtered_chain.len(),
+            &col_config,
+        );
+
+        (behavioral, selective, collusion)
+    }
+
+    /// Inner recency computation with optional virtual negative outcomes (timeouts).
+    ///
+    /// `extra_negatives` adds virtual quality=0.0 entries with weight 1.0 (latest weight),
+    /// representing expired proposals the agent failed to respond to.
+    fn compute_recency_inner(
+        &self,
+        chain: &[crate::halfblock::HalfBlock],
+        extra_negatives: usize,
+    ) -> f64 {
+        if chain.is_empty() && extra_negatives == 0 {
+            return 0.5;
         }
         let lambda = self.config.recency_lambda;
         let n = chain.len();
+        let avg_price = Self::compute_avg_price(chain);
+        let forgiveness_config = crate::forgiveness::ForgivenessConfig::default();
         let mut weighted_sum = 0.0;
         let mut weight_total = 0.0;
         for (k, block) in chain.iter().enumerate() {
-            let weight = lambda.powi((n - 1 - k) as i32);
-            let outcome = Self::extract_outcome(&block.transaction);
-            weighted_sum += weight * outcome;
+            let quality = Self::extract_quality(&block.transaction);
+            // Layer 4.4: Asymmetric decay — negative outcomes decay faster.
+            let age = (n - 1 - k) as i32;
+            let is_negative = quality < 0.5;
+            let decay = crate::forgiveness::asymmetric_decay_weight(
+                lambda,
+                age,
+                is_negative,
+                forgiveness_config.negative_decay_speedup,
+            );
+            let price = Self::extract_price(&block.transaction);
+            let value_weight = if avg_price > 1e-10 {
+                price / avg_price
+            } else {
+                1.0
+            };
+            let weight = decay * value_weight;
+            weighted_sum += weight * quality;
             weight_total += weight;
         }
+        // Add virtual negative outcomes for timeouts (quality=0.0, weight=1.0).
+        // These use weight 1.0 (equivalent to most recent entry) to ensure
+        // unresponsiveness has immediate impact on trust.
+        weight_total += extra_negatives as f64;
+        // weighted_sum += 0.0 * extra_negatives (no-op, quality is zero)
+
         if weight_total < 1e-10 {
-            return 1.0;
+            return 0.5;
         }
         (weighted_sum / weight_total).clamp(0.0, 1.0)
     }
 
-    /// Extract outcome from a block's transaction data.
+    /// Extract quality signal from a block's transaction data.
+    ///
+    /// Fallback chain (first present value wins):
+    ///   1. `quality` field (continuous 0.0–1.0)
+    ///   2. `requester_rating` field (continuous 0.0–1.0)
+    ///   3. `provider_rating` field (continuous 0.0–1.0)
+    ///   4. Binary outcome: "completed"/"success" → 1.0, "failed"/"error" → 0.0
+    ///   5. Unknown → 1.0 (backward compat)
+    ///
+    /// Research: trust-differentiation-fixes P0, reputation-game-theory §3.
+    fn extract_quality(transaction: &serde_json::Value) -> f64 {
+        // 0. Layer 4.3: Check for sealed rating (commit-reveal protocol).
+        // If a verified revealed rating exists, use it.
+        if let Some(sealed) = crate::sealed_rating::extract_sealed_rating(transaction) {
+            return sealed.clamp(0.0, 1.0);
+        }
+        // If sealed but not yet revealed (pending), use backward-compat default.
+        if transaction.get("rating_commitment").is_some()
+            && transaction.get("revealed_rating").is_none()
+        {
+            return 1.0; // Pending reveal: don't use any quality field
+        }
+
+        // 1. Explicit quality field
+        if let Some(q) = transaction.get("quality").and_then(|v| v.as_f64()) {
+            return q.clamp(0.0, 1.0);
+        }
+        // 2. Requester's rating of the provider
+        if let Some(r) = transaction.get("requester_rating").and_then(|v| v.as_f64()) {
+            return r.clamp(0.0, 1.0);
+        }
+        // 3. Provider's rating of the requester
+        if let Some(r) = transaction.get("provider_rating").and_then(|v| v.as_f64()) {
+            return r.clamp(0.0, 1.0);
+        }
+        // 4. Binary outcome (backward compat)
+        Self::extract_binary_outcome(transaction)
+    }
+
+    /// Extract binary outcome from a block's transaction data.
     ///
     /// "completed" / "success" → 1.0, "failed" / "error" → 0.0.
     /// Missing or unknown → 1.0 (backward compat: assume success).
-    fn extract_outcome(transaction: &serde_json::Value) -> f64 {
+    fn extract_binary_outcome(transaction: &serde_json::Value) -> f64 {
         match transaction.get("outcome").and_then(|v| v.as_str()) {
             Some("completed") | Some("success") => 1.0,
             Some("failed") | Some("error") => 0.0,
             _ => 1.0, // backward compat: unknown = success
         }
+    }
+
+    /// Count consecutive good interactions (quality >= 0.5) since the last violation.
+    ///
+    /// Scans the chain from most recent backward, counting interactions with
+    /// quality >= 0.5 until hitting a violation (quality < 0.3 or failed outcome).
+    /// Returns 0 if the most recent interaction is a violation.
+    ///
+    /// Used for Layer 4.4 forgiveness computation.
+    fn count_good_since_violation(chain: &[crate::halfblock::HalfBlock]) -> usize {
+        let mut count = 0usize;
+        for block in chain.iter().rev() {
+            let quality = Self::extract_quality(&block.transaction);
+            if quality < 0.3 {
+                break; // Hit a violation
+            }
+            if quality >= 0.5 {
+                count += 1;
+            }
+            // quality in [0.3, 0.5) — not good, not a violation, doesn't break streak
+        }
+        count
+    }
+
+    /// Extract price from a block's transaction, defaulting to 1.0 if absent.
+    fn extract_price(transaction: &serde_json::Value) -> f64 {
+        transaction
+            .get("price")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0)
+            .max(0.0)
+    }
+
+    /// Compute average quality across a chain.
+    ///
+    /// Returns 0.0 for empty chains (no data = no quality evidence).
+    fn compute_avg_quality(chain: &[crate::halfblock::HalfBlock]) -> f64 {
+        if chain.is_empty() {
+            return 0.0;
+        }
+        let sum: f64 = chain
+            .iter()
+            .map(|b| Self::extract_quality(&b.transaction))
+            .sum();
+        sum / chain.len() as f64
+    }
+
+    /// Compute average transaction price across a chain.
+    ///
+    /// Returns 1.0 for empty chains (no data = unit price default).
+    /// Research: risk-scaled-trust-thresholds §9.6, Olariu et al. 2024.
+    fn compute_avg_price(chain: &[crate::halfblock::HalfBlock]) -> f64 {
+        if chain.is_empty() {
+            return 1.0;
+        }
+        let sum: f64 = chain
+            .iter()
+            .map(|b| Self::extract_price(&b.transaction))
+            .sum();
+        let avg = sum / chain.len() as f64;
+        if avg < 1e-10 {
+            1.0
+        } else {
+            avg
+        }
+    }
+
+    /// Wilson lower-bound confidence score.
+    ///
+    /// Returns the lower bound of a Wilson score confidence interval:
+    /// high for many positive interactions, low for few or mixed interactions.
+    /// z = 1.96 gives 95% confidence interval.
+    ///
+    /// Research: Evan Miller 2009 "How Not To Sort By Average Rating",
+    /// TRAVOS (Teacy et al. 2006): Beta distribution confidence.
+    pub fn wilson_lower_bound(positive: f64, total: f64, z: f64) -> f64 {
+        if total == 0.0 {
+            return 0.0;
+        }
+        let p = positive / total;
+        let d = 1.0 + z * z / total;
+        let center = p + z * z / (2.0 * total);
+        let spread = z * ((p * (1.0 - p) + z * z / (4.0 * total)) / total).sqrt();
+        ((center - spread) / d).max(0.0)
+    }
+
+    /// Beta reputation model: continuous Bayesian updating with temporal decay.
+    ///
+    /// Unifies cold start + continuous feedback + temporal decay in a single model.
+    /// Returns `None` for empty chains, `Some(score)` otherwise.
+    ///
+    /// Parameters: `lambda = 0.95` (temporal decay per interaction).
+    /// Prior: `alpha = 1.0, beta = 1.0` (uninformative).
+    ///
+    /// Research: Josang & Ismail 2002, Josang, Luo, Chen 2008.
+    fn beta_reputation(chain: &[crate::halfblock::HalfBlock]) -> Option<f64> {
+        if chain.is_empty() {
+            return None;
+        }
+        let lambda = 0.95_f64;
+        let mut alpha = 1.0_f64; // prior
+        let mut beta_param = 1.0_f64; // prior
+        for block in chain {
+            let quality = Self::extract_quality(&block.transaction);
+            alpha = lambda * alpha + quality;
+            beta_param = lambda * beta_param + (1.0 - quality);
+        }
+        let score = alpha / (alpha + beta_param);
+        Some(score.clamp(0.0, 1.0))
+    }
+
+    /// Count expired orphan proposals directed at the given pubkey (timeouts).
+    ///
+    /// Scans counterparties' chains for proposals where `link_public_key == pubkey`
+    /// that have `deadline_ms` set, the deadline has passed, and no agreement from
+    /// the target agent exists.
+    ///
+    /// Research: trust-model-gaps §4 "Timeout Enforcement".
+    fn count_timeouts(&self, pubkey: &str, chain: &[crate::halfblock::HalfBlock]) -> usize {
+        // Collect counterparties from the target's chain.
+        let mut counterparties: HashSet<String> = HashSet::new();
+        for block in chain {
+            if block.public_key != block.link_public_key {
+                counterparties.insert(block.link_public_key.clone());
+            }
+        }
+
+        // Get current time (or latest block timestamp as proxy).
+        let now_ms = chain.iter().map(|b| b.timestamp).max().unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        });
+
+        let mut timeout_count = 0usize;
+
+        for cp_pubkey in &counterparties {
+            let cp_chain = match self.store.get_chain(cp_pubkey) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            for block in &cp_chain {
+                // Only look at proposals directed at our target.
+                if block.block_type != "proposal" || block.link_public_key != pubkey {
+                    continue;
+                }
+
+                // Check if deadline_ms exists and has expired.
+                let deadline = match block
+                    .transaction
+                    .get("deadline_ms")
+                    .and_then(|v| v.as_u64())
+                {
+                    Some(d) if d < now_ms => d,
+                    _ => continue,
+                };
+
+                // Check if the target has a matching agreement.
+                let has_agreement = matches!(self.store.get_linked_block(block), Ok(Some(_)));
+
+                if !has_agreement {
+                    timeout_count += 1;
+                    let _ = deadline; // used in the condition above
+                }
+            }
+        }
+
+        timeout_count
     }
 
     /// Count unique peers (distinct link_public_keys) in a chain.
@@ -492,6 +1168,184 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
             }
         }
         peers.len()
+    }
+
+    // -----------------------------------------------------------------------
+    // Layer 6.1: Requester reputation (PeerTrust, Xiong & Liu 2004)
+    // -----------------------------------------------------------------------
+
+    /// Get blocks from counterparties' chains where they record interactions
+    /// with `pubkey` as the requester (initiator).
+    ///
+    /// For each peer that `pubkey` has interacted with, loads the peer's chain
+    /// and returns blocks where `link_public_key == pubkey` (the peer's record
+    /// about this agent).
+    fn get_requester_chain(&self, pubkey: &str) -> Vec<crate::halfblock::HalfBlock> {
+        let own_chain = match self.store.get_chain(pubkey) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+
+        // Collect unique counterparties.
+        let mut peers: HashSet<&str> = HashSet::new();
+        for block in &own_chain {
+            if block.public_key != block.link_public_key {
+                peers.insert(&block.link_public_key);
+            }
+        }
+
+        // Load each peer's chain, filter for blocks referencing pubkey.
+        let mut requester_chain = Vec::new();
+        for peer_pk in &peers {
+            if let Ok(peer_chain) = self.store.get_chain(peer_pk) {
+                for block in peer_chain {
+                    if block.link_public_key == pubkey {
+                        requester_chain.push(block);
+                    }
+                }
+            }
+        }
+        requester_chain
+    }
+
+    /// Fraction of requester-chain interactions with successful outcome.
+    ///
+    /// Returns 1.0 if the chain is empty (benefit of doubt for new agents).
+    fn compute_payment_reliability(chain: &[crate::halfblock::HalfBlock]) -> f64 {
+        if chain.is_empty() {
+            return 1.0;
+        }
+        let paid = chain
+            .iter()
+            .filter(|b| {
+                let tx = &b.transaction;
+                // Check explicit payment status first.
+                if let Some(status) = tx.get("payment_status").and_then(|v| v.as_str()) {
+                    return status == "completed" || status == "paid";
+                }
+                // Fall back to quality >= 0.5 (general success signal).
+                Self::extract_quality(tx) >= 0.5
+            })
+            .count();
+        paid as f64 / chain.len() as f64
+    }
+
+    /// Agreement between this requester's ratings and consensus (provider avg quality).
+    ///
+    /// For each provider this requester interacted with, compares the requester's
+    /// rating with the provider's average quality across all interactions.
+    /// Returns `None` if fewer than 3 providers were rated (insufficient data).
+    fn compute_rating_fairness(
+        &self,
+        _requester_chain: &[crate::halfblock::HalfBlock],
+        pubkey: &str,
+    ) -> Option<f64> {
+        // Get own chain to extract requester's ratings of each provider.
+        let own_chain = match self.store.get_chain(pubkey) {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+
+        // Map provider_pubkey → requester's rating of that provider.
+        let mut requester_ratings: HashMap<&str, Vec<f64>> = HashMap::new();
+        for block in &own_chain {
+            if block.public_key == block.link_public_key {
+                continue; // skip audit blocks
+            }
+            let rating = block
+                .transaction
+                .get("requester_rating")
+                .and_then(|v| v.as_f64())
+                .or_else(|| block.transaction.get("quality").and_then(|v| v.as_f64()));
+            if let Some(r) = rating {
+                requester_ratings
+                    .entry(&block.link_public_key)
+                    .or_default()
+                    .push(r);
+            }
+        }
+
+        if requester_ratings.len() < 3 {
+            return None; // insufficient data
+        }
+
+        // For each rated provider, compute consensus (avg quality from provider's chain).
+        let mut deviations = Vec::new();
+        for (provider_pk, ratings) in &requester_ratings {
+            if let Ok(provider_chain) = self.store.get_chain(provider_pk) {
+                if provider_chain.is_empty() {
+                    continue;
+                }
+                let consensus = Self::compute_avg_quality(&provider_chain);
+                let avg_rating = ratings.iter().sum::<f64>() / ratings.len() as f64;
+                deviations.push((avg_rating - consensus).abs());
+            }
+        }
+
+        if deviations.is_empty() {
+            return None;
+        }
+
+        let avg_deviation = deviations.iter().sum::<f64>() / deviations.len() as f64;
+        Some((1.0 - avg_deviation).clamp(0.0, 1.0))
+    }
+
+    /// Fraction of requester-chain interactions resulting in disputes.
+    ///
+    /// Returns 0.0 if the chain is empty.
+    fn compute_dispute_rate(chain: &[crate::halfblock::HalfBlock]) -> f64 {
+        if chain.is_empty() {
+            return 0.0;
+        }
+        let disputed = chain
+            .iter()
+            .filter(|b| {
+                let tx = &b.transaction;
+                tx.get("outcome")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|o| o == "disputed")
+                    || tx.get("dispute").and_then(|v| v.as_bool()).unwrap_or(false)
+            })
+            .count();
+        disputed as f64 / chain.len() as f64
+    }
+
+    /// Compute trust from the requester (initiator) perspective.
+    ///
+    /// Uses the same weighted-additive formula but evaluates this agent's
+    /// behavior as a requester: payment reliability, rating fairness, dispute rate.
+    /// Returns a full `TrustEvidence` with the 4 requester-specific fields populated.
+    ///
+    /// Research: trust-model-gaps §6, PeerTrust (Xiong & Liu 2004).
+    pub fn compute_requester_trust(&self, pubkey: &str) -> Result<TrustEvidence> {
+        // Start with standard provider-perspective evidence.
+        let mut evidence = self.compute_standard_trust_evidence(pubkey, None)?;
+
+        // Get the requester chain (counterparties' blocks about this agent).
+        let requester_chain = self.get_requester_chain(pubkey);
+
+        // Compute requester-perspective recency using counterparties' quality ratings.
+        let requester_recency = if requester_chain.is_empty() {
+            0.5 // uninformative prior
+        } else {
+            self.compute_recency_inner(&requester_chain, 0)
+        };
+
+        // Requester trust uses same formula: structural from standard + requester behavioral.
+        let confidence_scale = (evidence.interactions as f64
+            / self.config.cold_start_threshold.max(1) as f64)
+            .min(1.0);
+        let structural = evidence.connectivity * evidence.integrity;
+        let requester_score =
+            ((0.3 * structural + 0.7 * requester_recency) * confidence_scale).clamp(0.0, 1.0);
+
+        // Populate the 4 requester-specific fields.
+        evidence.requester_trust = Some(requester_score);
+        evidence.payment_reliability = Some(Self::compute_payment_reliability(&requester_chain));
+        evidence.rating_fairness = self.compute_rating_fairness(&requester_chain, pubkey);
+        evidence.dispute_rate = Some(Self::compute_dispute_rate(&requester_chain));
+
+        Ok(evidence)
     }
 
     /// Compute trust with full evidence bundle (delegation-aware).
@@ -510,8 +1364,8 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
             // Is this an active delegated identity?
             if let Some(ref _delegation) = ctx.active_delegation {
                 if let Some(ref root_pubkey) = ctx.root_pubkey {
-                    let root_evidence =
-                        self.compute_standard_trust_evidence(root_pubkey, context)?;
+                    // Root evidence uses full context — delegator's overall trust.
+                    let root_evidence = self.compute_standard_trust_evidence(root_pubkey, None)?;
                     // Use cold start blending for the score
                     let blended_score =
                         self.compute_delegated_trust_blended(pubkey, root_pubkey, ctx, context)?;
@@ -526,6 +1380,31 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                         fraud: false,
                         path_diversity: root_evidence.path_diversity,
                         audit_count: root_evidence.audit_count,
+                        avg_quality: root_evidence.avg_quality,
+                        value_weighted_recency: root_evidence.value_weighted_recency,
+                        timeout_count: root_evidence.timeout_count,
+                        confidence: root_evidence.confidence,
+                        sample_size: root_evidence.sample_size,
+                        positive_count: root_evidence.positive_count,
+                        beta_reputation: root_evidence.beta_reputation,
+                        required_deposit_ratio: root_evidence.required_deposit_ratio,
+                        sanction_penalty: root_evidence.sanction_penalty,
+                        violation_count: root_evidence.violation_count,
+                        correlation_penalty: root_evidence.correlation_penalty,
+                        forgiveness_factor: root_evidence.forgiveness_factor,
+                        good_interactions_since_violation: root_evidence
+                            .good_interactions_since_violation,
+                        behavioral_change: root_evidence.behavioral_change,
+                        behavioral_anomaly: root_evidence.behavioral_anomaly,
+                        selective_scamming: root_evidence.selective_scamming,
+                        collusion_cluster_density: root_evidence.collusion_cluster_density,
+                        collusion_external_ratio: root_evidence.collusion_external_ratio,
+                        collusion_temporal_burst: root_evidence.collusion_temporal_burst,
+                        collusion_reciprocity_anomaly: root_evidence.collusion_reciprocity_anomaly,
+                        requester_trust: root_evidence.requester_trust,
+                        payment_reliability: root_evidence.payment_reliability,
+                        rating_fairness: root_evidence.rating_fairness,
+                        dispute_rate: root_evidence.dispute_rate,
                     });
                 }
             }
@@ -543,6 +1422,30 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                     fraud: false,
                     path_diversity: 0.0,
                     audit_count: 0,
+                    avg_quality: 0.0,
+                    value_weighted_recency: 0.0,
+                    timeout_count: 0,
+                    confidence: 0.0,
+                    sample_size: 0,
+                    positive_count: 0,
+                    beta_reputation: None,
+                    required_deposit_ratio: 1.0,
+                    sanction_penalty: 0.0,
+                    violation_count: 0,
+                    correlation_penalty: 0.0,
+                    forgiveness_factor: 1.0,
+                    good_interactions_since_violation: 0,
+                    behavioral_change: 0.0,
+                    behavioral_anomaly: false,
+                    selective_scamming: false,
+                    collusion_cluster_density: 0.0,
+                    collusion_external_ratio: 0.0,
+                    collusion_temporal_burst: false,
+                    collusion_reciprocity_anomaly: false,
+                    requester_trust: None,
+                    payment_reliability: None,
+                    rating_fairness: None,
+                    dispute_rate: None,
                 });
             }
 
@@ -561,6 +1464,30 @@ impl<'a, S: BlockStore> TrustEngine<'a, S> {
                         fraud: true,
                         path_diversity: 0.0,
                         audit_count: 0,
+                        avg_quality: 0.0,
+                        value_weighted_recency: 0.0,
+                        timeout_count: 0,
+                        confidence: 0.0,
+                        sample_size: 0,
+                        positive_count: 0,
+                        beta_reputation: None,
+                        required_deposit_ratio: 1.0,
+                        sanction_penalty: 1.0,
+                        violation_count: 1,
+                        correlation_penalty: 1.0,
+                        forgiveness_factor: 1.0,
+                        good_interactions_since_violation: 0,
+                        behavioral_change: 0.0,
+                        behavioral_anomaly: false,
+                        selective_scamming: false,
+                        collusion_cluster_density: 0.0,
+                        collusion_external_ratio: 0.0,
+                        collusion_temporal_burst: false,
+                        collusion_reciprocity_anomaly: false,
+                        requester_trust: None,
+                        payment_reliability: None,
+                        rating_fairness: None,
+                        dispute_rate: None,
                     });
                 }
             }
@@ -1692,9 +2619,10 @@ mod tests {
         let store = MemoryBlockStore::new();
         let engine = TrustEngine::new(&store, None, None, None);
         let evidence = engine.compute_trust_with_evidence("unknown").unwrap();
+        // Uninformative prior: empty chain → 0.5 (Josang & Ismail 2002)
         assert!(
-            (evidence.recency - 1.0).abs() < 1e-6,
-            "empty chain should give recency = 1.0, got {}",
+            (evidence.recency - 0.5).abs() < 1e-6,
+            "empty chain should give recency = 0.5, got {}",
             evidence.recency
         );
     }
@@ -2308,5 +3236,1020 @@ mod tests {
         assert_eq!(report.audit_blocks, 1);
         assert_eq!(report.bilateral_blocks, 1);
         assert!(report.integrity_valid);
+    }
+
+    // ===== Layer 1: Quality-Aware Recency Tests =====
+    // Research: trust-differentiation-fixes P0, Josang & Ismail 2002
+
+    /// Helper: create a bilateral interaction with custom transaction JSON.
+    #[allow(clippy::too_many_arguments)]
+    fn create_interaction_with_tx(
+        store: &mut MemoryBlockStore,
+        alice: &Identity,
+        bob: &Identity,
+        alice_seq: u64,
+        bob_seq: u64,
+        alice_prev: &str,
+        bob_prev: &str,
+        ts: u64,
+        tx: serde_json::Value,
+    ) -> (String, String) {
+        let proposal = create_half_block(
+            alice,
+            alice_seq,
+            &bob.pubkey_hex(),
+            0,
+            alice_prev,
+            BlockType::Proposal,
+            tx.clone(),
+            Some(ts),
+        );
+        store.add_block(&proposal).unwrap();
+
+        let agreement = create_half_block(
+            bob,
+            bob_seq,
+            &alice.pubkey_hex(),
+            alice_seq,
+            bob_prev,
+            BlockType::Agreement,
+            tx,
+            Some(ts + 1),
+        );
+        store.add_block(&agreement).unwrap();
+
+        (proposal.block_hash, agreement.block_hash)
+    }
+
+    #[test]
+    fn test_extract_quality_field() {
+        let tx = serde_json::json!({"outcome": "completed", "quality": 0.75});
+        assert!((TrustEngine::<MemoryBlockStore>::extract_quality(&tx) - 0.75).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_extract_quality_requester_rating_fallback() {
+        let tx = serde_json::json!({"outcome": "completed", "requester_rating": 0.6});
+        assert!((TrustEngine::<MemoryBlockStore>::extract_quality(&tx) - 0.6).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_extract_quality_provider_rating_fallback() {
+        let tx = serde_json::json!({"outcome": "completed", "provider_rating": 0.4});
+        assert!((TrustEngine::<MemoryBlockStore>::extract_quality(&tx) - 0.4).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_extract_quality_binary_fallback() {
+        let tx = serde_json::json!({"outcome": "completed"});
+        assert!((TrustEngine::<MemoryBlockStore>::extract_quality(&tx) - 1.0).abs() < 1e-10);
+
+        let tx_fail = serde_json::json!({"outcome": "failed"});
+        assert!((TrustEngine::<MemoryBlockStore>::extract_quality(&tx_fail)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_extract_quality_clamps() {
+        let tx_high = serde_json::json!({"quality": 1.5});
+        assert!((TrustEngine::<MemoryBlockStore>::extract_quality(&tx_high) - 1.0).abs() < 1e-10);
+
+        let tx_low = serde_json::json!({"quality": -0.5});
+        assert!((TrustEngine::<MemoryBlockStore>::extract_quality(&tx_low)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_extract_quality_priority_order() {
+        // quality takes priority over requester_rating
+        let tx = serde_json::json!({
+            "outcome": "completed",
+            "quality": 0.8,
+            "requester_rating": 0.3,
+            "provider_rating": 0.1
+        });
+        assert!((TrustEngine::<MemoryBlockStore>::extract_quality(&tx) - 0.8).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_empty_chain_recency_returns_half() {
+        // Research: Josang & Ismail 2002 — uninformative prior = 0.5
+        let store = MemoryBlockStore::new();
+        let engine = TrustEngine::new(&store, None, None, None);
+        let chain: Vec<crate::halfblock::HalfBlock> = vec![];
+        let recency = engine.compute_recency_inner(&chain, 0);
+        assert!(
+            (recency - 0.5).abs() < 1e-10,
+            "Empty chain should return 0.5, got {recency}"
+        );
+    }
+
+    #[test]
+    fn test_quality_aware_recency_honest_vs_sybil() {
+        // Research: trust-differentiation-fixes P0
+        // Honest agent (quality ~0.85) vs sybil (quality ~0.3)
+        // Gap should be significant (> 0.4)
+        let mut store = MemoryBlockStore::new();
+        let seed = Identity::from_bytes(&[1u8; 32]);
+
+        let honest = Identity::from_bytes(&[10u8; 32]);
+        let sybil = Identity::from_bytes(&[20u8; 32]);
+
+        // Create 10 interactions for honest agent (quality 0.85)
+        let mut prev_h = crate::types::GENESIS_HASH.to_string();
+        let mut prev_s = crate::types::GENESIS_HASH.to_string();
+        for i in 0..10u64 {
+            let (ph, _) = create_interaction_with_tx(
+                &mut store,
+                &honest,
+                &seed,
+                i + 1,
+                i + 1,
+                &prev_h,
+                &prev_s,
+                1000 + i * 100,
+                serde_json::json!({"outcome": "completed", "quality": 0.85}),
+            );
+            prev_h = ph;
+            prev_s = store
+                .get_chain(&seed.pubkey_hex())
+                .unwrap()
+                .last()
+                .map(|b| b.block_hash.clone())
+                .unwrap_or_else(|| crate::types::GENESIS_HASH.to_string());
+        }
+
+        // Create 10 interactions for sybil agent (quality 0.3)
+        let sybil_peer = Identity::from_bytes(&[21u8; 32]);
+        let mut prev_sy = crate::types::GENESIS_HASH.to_string();
+        let mut prev_sp = crate::types::GENESIS_HASH.to_string();
+        for i in 0..10u64 {
+            let (psy, _) = create_interaction_with_tx(
+                &mut store,
+                &sybil,
+                &sybil_peer,
+                i + 1,
+                i + 1,
+                &prev_sy,
+                &prev_sp,
+                2000 + i * 100,
+                serde_json::json!({"outcome": "completed", "quality": 0.3}),
+            );
+            prev_sy = psy;
+            prev_sp = store
+                .get_chain(&sybil_peer.pubkey_hex())
+                .unwrap()
+                .last()
+                .map(|b| b.block_hash.clone())
+                .unwrap_or_else(|| crate::types::GENESIS_HASH.to_string());
+        }
+
+        let engine = TrustEngine::new(&store, None, None, None);
+
+        // No seeds → trust = (0.3 × integrity + 0.7 × recency) × confidence_scale
+        // Both have integrity=1.0, so gap = 0.7 × (0.85 - 0.3) = 0.385.
+        // With seeds, sybils have lower connectivity → gap widens further.
+        let honest_trust = engine.compute_trust(&honest.pubkey_hex()).unwrap();
+        let sybil_trust = engine.compute_trust(&sybil.pubkey_hex()).unwrap();
+
+        let gap = honest_trust - sybil_trust;
+        assert!(
+            gap > 0.35,
+            "Quality differentiation gap should exceed 0.35 (no-seeds worst case), got {gap} (honest={honest_trust}, sybil={sybil_trust})"
+        );
+    }
+
+    #[test]
+    fn test_avg_quality_in_evidence() {
+        let mut store = MemoryBlockStore::new();
+        let alice = Identity::from_bytes(&[30u8; 32]);
+        let bob = Identity::from_bytes(&[31u8; 32]);
+
+        let mut prev_a = crate::types::GENESIS_HASH.to_string();
+        let mut prev_b = crate::types::GENESIS_HASH.to_string();
+        for i in 0..5u64 {
+            let (pa, _) = create_interaction_with_tx(
+                &mut store,
+                &alice,
+                &bob,
+                i + 1,
+                i + 1,
+                &prev_a,
+                &prev_b,
+                3000 + i * 100,
+                serde_json::json!({"outcome": "completed", "quality": 0.7}),
+            );
+            prev_a = pa;
+            prev_b = store
+                .get_chain(&bob.pubkey_hex())
+                .unwrap()
+                .last()
+                .map(|b| b.block_hash.clone())
+                .unwrap_or_else(|| crate::types::GENESIS_HASH.to_string());
+        }
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine
+            .compute_trust_with_evidence(&alice.pubkey_hex())
+            .unwrap();
+
+        assert!(
+            (evidence.avg_quality - 0.7).abs() < 0.01,
+            "avg_quality should be ~0.7, got {}",
+            evidence.avg_quality
+        );
+    }
+
+    #[test]
+    fn test_backward_compat_no_quality_field() {
+        // Blocks without quality field should still work (binary outcome)
+        let mut store = MemoryBlockStore::new();
+        let alice = Identity::from_bytes(&[40u8; 32]);
+        let bob = Identity::from_bytes(&[41u8; 32]);
+
+        let (_, _) = create_interaction_with_tx(
+            &mut store,
+            &alice,
+            &bob,
+            1,
+            1,
+            crate::types::GENESIS_HASH,
+            crate::types::GENESIS_HASH,
+            4000,
+            serde_json::json!({"outcome": "completed"}),
+        );
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine
+            .compute_trust_with_evidence(&alice.pubkey_hex())
+            .unwrap();
+
+        // Binary "completed" → quality 1.0
+        assert!(
+            (evidence.avg_quality - 1.0).abs() < 0.01,
+            "Binary completed should give avg_quality 1.0, got {}",
+            evidence.avg_quality
+        );
+        // Trust should still be > 0
+        assert!(evidence.trust_score > 0.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Layer 1.4: Value-Weighted Recency
+    // Research: Olariu et al. 2024, Hoffman et al. 2009 (value imbalance)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_value_weighted_cheap_wash_trades_negligible() {
+        // A $1 self-deal in an avg $100 context should contribute ~1/100th
+        // as much trust as a normal transaction.
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[50u8; 32]);
+        let peer = Identity::from_bytes(&[51u8; 32]);
+
+        // 9 interactions at $100 with quality 0.3 (sybil)
+        let mut prev = GENESIS_HASH.to_string();
+        for i in 1..=9u64 {
+            let (p, _) = create_interaction_with_tx(
+                &mut store,
+                &agent,
+                &peer,
+                i,
+                i,
+                &prev,
+                GENESIS_HASH,
+                1000 + i * 100,
+                serde_json::json!({"outcome": "completed", "quality": 0.3, "price": 100.0}),
+            );
+            prev = p;
+        }
+
+        // 1 cheap wash-trade at $1 with quality 1.0 (self-deal)
+        create_interaction_with_tx(
+            &mut store,
+            &agent,
+            &peer,
+            10,
+            10,
+            &prev,
+            GENESIS_HASH,
+            2000,
+            serde_json::json!({"outcome": "completed", "quality": 1.0, "price": 1.0}),
+        );
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine
+            .compute_trust_with_evidence(&agent.pubkey_hex())
+            .unwrap();
+
+        // Value-weighted recency should be close to 0.3 (dominated by $100 txns),
+        // NOT pulled up significantly by the cheap $1 perfect interaction.
+        assert!(
+            evidence.value_weighted_recency < 0.4,
+            "Value-weighted recency should be < 0.4 (dominated by $100 quality-0.3 txns), got {}",
+            evidence.value_weighted_recency
+        );
+    }
+
+    #[test]
+    fn test_value_weighted_expensive_txn_dominates() {
+        // An expensive successful transaction should dominate over many cheap failures.
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[52u8; 32]);
+        let peer = Identity::from_bytes(&[53u8; 32]);
+
+        // 5 cheap failures at $1
+        let mut prev = GENESIS_HASH.to_string();
+        for i in 1..=5u64 {
+            let (p, _) = create_interaction_with_tx(
+                &mut store,
+                &agent,
+                &peer,
+                i,
+                i,
+                &prev,
+                GENESIS_HASH,
+                1000 + i * 100,
+                serde_json::json!({"outcome": "failed", "quality": 0.0, "price": 1.0}),
+            );
+            prev = p;
+        }
+
+        // 1 expensive success at $500
+        create_interaction_with_tx(
+            &mut store,
+            &agent,
+            &peer,
+            6,
+            6,
+            &prev,
+            GENESIS_HASH,
+            2000,
+            serde_json::json!({"outcome": "completed", "quality": 0.9, "price": 500.0}),
+        );
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine
+            .compute_trust_with_evidence(&agent.pubkey_hex())
+            .unwrap();
+
+        // The $500 success should dominate over 5 × $1 failures
+        assert!(
+            evidence.value_weighted_recency > 0.5,
+            "Expensive success should dominate over cheap failures, got {}",
+            evidence.value_weighted_recency
+        );
+    }
+
+    #[test]
+    fn test_value_weighted_backward_compat_no_price() {
+        // Blocks without price field should have value_weight = 1.0 (same as before).
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[54u8; 32]);
+        let peer = Identity::from_bytes(&[55u8; 32]);
+
+        let mut prev = GENESIS_HASH.to_string();
+        for i in 1..=5u64 {
+            let (p, _) = create_interaction_with_tx(
+                &mut store,
+                &agent,
+                &peer,
+                i,
+                i,
+                &prev,
+                GENESIS_HASH,
+                1000 + i * 100,
+                serde_json::json!({"outcome": "completed"}),
+            );
+            prev = p;
+        }
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine
+            .compute_trust_with_evidence(&agent.pubkey_hex())
+            .unwrap();
+
+        // Without price fields, all weights are equal → recency = quality = 1.0
+        assert!(
+            (evidence.recency - 1.0).abs() < 1e-6,
+            "No price field should give same recency as before: got {}",
+            evidence.recency
+        );
+        assert!(
+            (evidence.value_weighted_recency - 1.0).abs() < 1e-6,
+            "Value-weighted recency without price should equal basic: got {}",
+            evidence.value_weighted_recency
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Layer 1.5: Timeout Enforcement
+    // Research: trust-model-gaps §4
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_timeout_no_deadline_no_timeout() {
+        // Proposals without deadline_ms should not count as timeouts.
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[60u8; 32]);
+        let peer = Identity::from_bytes(&[61u8; 32]);
+
+        // Peer proposes to agent (orphan — no agreement from agent).
+        let proposal = create_half_block(
+            &peer,
+            1,
+            &agent.pubkey_hex(),
+            0,
+            GENESIS_HASH,
+            BlockType::Proposal,
+            serde_json::json!({"service": "test"}), // no deadline_ms
+            Some(1000),
+        );
+        store.add_block(&proposal).unwrap();
+
+        // Give agent some history so counterparties are known.
+        create_interaction_with_tx(
+            &mut store,
+            &agent,
+            &peer,
+            1,
+            2,
+            GENESIS_HASH,
+            &proposal.block_hash,
+            2000,
+            serde_json::json!({"outcome": "completed"}),
+        );
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine
+            .compute_trust_with_evidence(&agent.pubkey_hex())
+            .unwrap();
+
+        assert_eq!(evidence.timeout_count, 0, "No deadline_ms → no timeout");
+    }
+
+    #[test]
+    fn test_timeout_expired_proposal_counts() {
+        // Peer proposes to agent with deadline_ms that has expired and agent never responded.
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[62u8; 32]);
+        let peer = Identity::from_bytes(&[63u8; 32]);
+
+        // Agent first interacts with peer (so peer is known as counterparty).
+        let (pa, _) = create_interaction_with_tx(
+            &mut store,
+            &agent,
+            &peer,
+            1,
+            1,
+            GENESIS_HASH,
+            GENESIS_HASH,
+            1000,
+            serde_json::json!({"outcome": "completed"}),
+        );
+
+        // Peer proposes to agent with deadline that is in the past relative to agent's chain.
+        let proposal = create_half_block(
+            &peer,
+            2,
+            &agent.pubkey_hex(),
+            0,
+            &store
+                .get_chain(&peer.pubkey_hex())
+                .unwrap()
+                .last()
+                .unwrap()
+                .block_hash,
+            BlockType::Proposal,
+            serde_json::json!({"service": "test", "deadline_ms": 500}), // deadline is 500ms, chain is at 1000+
+            Some(400),
+        );
+        store.add_block(&proposal).unwrap();
+
+        // Agent does more interactions (later timestamps, proving deadline passed).
+        create_interaction_with_tx(
+            &mut store,
+            &agent,
+            &peer,
+            2,
+            3,
+            &pa,
+            &proposal.block_hash,
+            5000,
+            serde_json::json!({"outcome": "completed"}),
+        );
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine
+            .compute_trust_with_evidence(&agent.pubkey_hex())
+            .unwrap();
+
+        assert_eq!(
+            evidence.timeout_count, 1,
+            "Expired orphan proposal should count as timeout"
+        );
+    }
+
+    #[test]
+    fn test_timeout_reduces_recency() {
+        // Timeouts should reduce recency compared to the same chain without timeouts.
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[64u8; 32]);
+        let peer = Identity::from_bytes(&[65u8; 32]);
+
+        // 5 good interactions
+        let mut prev_a = GENESIS_HASH.to_string();
+        let mut prev_b = GENESIS_HASH.to_string();
+        for i in 1..=5u64 {
+            let (pa, pb) = create_interaction_with_tx(
+                &mut store,
+                &agent,
+                &peer,
+                i,
+                i,
+                &prev_a,
+                &prev_b,
+                1000 + i * 100,
+                serde_json::json!({"outcome": "completed", "quality": 0.8}),
+            );
+            prev_a = pa;
+            prev_b = pb;
+        }
+
+        // Peer proposes with expired deadline, agent never responds.
+        let proposal = create_half_block(
+            &peer,
+            6,
+            &agent.pubkey_hex(),
+            0,
+            &prev_b,
+            BlockType::Proposal,
+            serde_json::json!({"service": "test", "deadline_ms": 100}),
+            Some(50),
+        );
+        store.add_block(&proposal).unwrap();
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine
+            .compute_trust_with_evidence(&agent.pubkey_hex())
+            .unwrap();
+
+        // value_weighted_recency has no timeout penalty, recency does
+        assert!(
+            evidence.recency < evidence.value_weighted_recency,
+            "Timeout should reduce recency ({}) below value_weighted_recency ({})",
+            evidence.recency,
+            evidence.value_weighted_recency
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Layer 2.1: Wilson Score Confidence
+    // Research: Evan Miller 2009, TRAVOS (Teacy et al. 2006)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_wilson_empty() {
+        let score = TrustEngine::<MemoryBlockStore>::wilson_lower_bound(0.0, 0.0, 1.96);
+        assert!(
+            score.abs() < 1e-10,
+            "Wilson with 0 total should be 0.0, got {score}"
+        );
+    }
+
+    #[test]
+    fn test_wilson_perfect_small_sample() {
+        // 5/5 positive with small sample → lower bound should be < 1.0 (uncertainty)
+        let score = TrustEngine::<MemoryBlockStore>::wilson_lower_bound(5.0, 5.0, 1.96);
+        assert!(
+            score > 0.5 && score < 1.0,
+            "Wilson(5/5, z=1.96) should be between 0.5 and 1.0, got {score}"
+        );
+    }
+
+    #[test]
+    fn test_wilson_perfect_large_sample() {
+        // 100/100 positive → lower bound should be > 0.95 (high confidence)
+        let score = TrustEngine::<MemoryBlockStore>::wilson_lower_bound(100.0, 100.0, 1.96);
+        assert!(
+            score > 0.95,
+            "Wilson(100/100, z=1.96) should be > 0.95, got {score}"
+        );
+    }
+
+    #[test]
+    fn test_wilson_half_half() {
+        // 50/100 positive → lower bound should be < 0.5
+        let score = TrustEngine::<MemoryBlockStore>::wilson_lower_bound(50.0, 100.0, 1.96);
+        assert!(
+            score > 0.3 && score < 0.5,
+            "Wilson(50/100, z=1.96) should be between 0.3 and 0.5, got {score}"
+        );
+    }
+
+    #[test]
+    fn test_wilson_all_negative() {
+        // 0/10 positive → lower bound should be close to 0
+        let score = TrustEngine::<MemoryBlockStore>::wilson_lower_bound(0.0, 10.0, 1.96);
+        assert!(
+            score < 0.05,
+            "Wilson(0/10, z=1.96) should be < 0.05, got {score}"
+        );
+    }
+
+    #[test]
+    fn test_wilson_monotonicity_with_sample_size() {
+        // Confidence should increase with more samples (same ratio)
+        let w5 = TrustEngine::<MemoryBlockStore>::wilson_lower_bound(5.0, 5.0, 1.96);
+        let w20 = TrustEngine::<MemoryBlockStore>::wilson_lower_bound(20.0, 20.0, 1.96);
+        let w100 = TrustEngine::<MemoryBlockStore>::wilson_lower_bound(100.0, 100.0, 1.96);
+        assert!(
+            w5 < w20 && w20 < w100,
+            "Wilson should increase with sample size: w5={w5} w20={w20} w100={w100}"
+        );
+    }
+
+    #[test]
+    fn test_confidence_in_evidence() {
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[70u8; 32]);
+        let peer = Identity::from_bytes(&[71u8; 32]);
+
+        // 10 interactions, all quality = 0.8 (positive)
+        let mut prev = GENESIS_HASH.to_string();
+        for i in 1..=10u64 {
+            let (p, _) = create_interaction_with_tx(
+                &mut store,
+                &agent,
+                &peer,
+                i,
+                i,
+                &prev,
+                GENESIS_HASH,
+                1000 + i * 100,
+                serde_json::json!({"outcome": "completed", "quality": 0.8}),
+            );
+            prev = p;
+        }
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine
+            .compute_trust_with_evidence(&agent.pubkey_hex())
+            .unwrap();
+
+        assert_eq!(evidence.sample_size, 10);
+        assert_eq!(evidence.positive_count, 10); // all quality 0.8 >= 0.5
+        assert!(
+            evidence.confidence > 0.5,
+            "10 positive interactions should give confidence > 0.5, got {}",
+            evidence.confidence
+        );
+    }
+
+    #[test]
+    fn test_confidence_empty_chain() {
+        let store = MemoryBlockStore::new();
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine.compute_trust_with_evidence("nobody").unwrap();
+
+        assert_eq!(evidence.sample_size, 0);
+        assert_eq!(evidence.positive_count, 0);
+        assert!(
+            evidence.confidence.abs() < 1e-10,
+            "Empty chain should have confidence 0.0, got {}",
+            evidence.confidence
+        );
+    }
+
+    #[test]
+    fn test_confidence_mixed_outcomes() {
+        let mut store = MemoryBlockStore::new();
+        let agent = Identity::from_bytes(&[72u8; 32]);
+        let peer = Identity::from_bytes(&[73u8; 32]);
+
+        // 5 good (quality 0.8) + 5 bad (quality 0.2)
+        let mut prev = GENESIS_HASH.to_string();
+        for i in 1..=5u64 {
+            let (p, _) = create_interaction_with_tx(
+                &mut store,
+                &agent,
+                &peer,
+                i,
+                i,
+                &prev,
+                GENESIS_HASH,
+                1000 + i * 100,
+                serde_json::json!({"outcome": "completed", "quality": 0.8}),
+            );
+            prev = p;
+        }
+        for i in 6..=10u64 {
+            let (p, _) = create_interaction_with_tx(
+                &mut store,
+                &agent,
+                &peer,
+                i,
+                i,
+                &prev,
+                GENESIS_HASH,
+                1000 + i * 100,
+                serde_json::json!({"outcome": "failed", "quality": 0.2}),
+            );
+            prev = p;
+        }
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine
+            .compute_trust_with_evidence(&agent.pubkey_hex())
+            .unwrap();
+
+        assert_eq!(evidence.sample_size, 10);
+        assert_eq!(evidence.positive_count, 5); // 5 with quality >= 0.5
+        assert!(
+            evidence.confidence > 0.0 && evidence.confidence < 0.5,
+            "Mixed outcomes should give confidence in (0, 0.5), got {}",
+            evidence.confidence
+        );
+    }
+
+    #[test]
+    fn test_new_evidence_fields_in_seed_path() {
+        // Ensure new fields are populated when using seed nodes.
+        let mut store = MemoryBlockStore::new();
+        let seed = Identity::from_bytes(&[80u8; 32]);
+        let agent = Identity::from_bytes(&[81u8; 32]);
+
+        let mut prev_a = GENESIS_HASH.to_string();
+        let mut prev_s = GENESIS_HASH.to_string();
+        for i in 1..=5u64 {
+            let (pa, ps) = create_interaction_with_tx(
+                &mut store,
+                &agent,
+                &seed,
+                i,
+                i,
+                &prev_a,
+                &prev_s,
+                1000 + i * 100,
+                serde_json::json!({"outcome": "completed", "quality": 0.9, "price": 50.0}),
+            );
+            prev_a = pa;
+            prev_s = ps;
+        }
+
+        let engine = TrustEngine::new(&store, Some(vec![seed.pubkey_hex()]), None, None);
+        let evidence = engine
+            .compute_trust_with_evidence(&agent.pubkey_hex())
+            .unwrap();
+
+        assert!(
+            evidence.trust_score > 0.0,
+            "should have positive trust with seed"
+        );
+        assert_eq!(evidence.sample_size, 5);
+        assert_eq!(evidence.positive_count, 5);
+        assert!(
+            evidence.confidence > 0.3,
+            "confidence should be > 0.3 with 5 interactions"
+        );
+        assert!(
+            (evidence.value_weighted_recency - evidence.recency).abs() < 0.01,
+            "Equal prices → vw_recency ≈ recency"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Layer 6.1: Requester reputation tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create bilateral interaction with SEPARATE proposer/responder tx.
+    #[allow(clippy::too_many_arguments)]
+    fn create_bilateral_with_separate_tx(
+        store: &mut MemoryBlockStore,
+        proposer: &Identity,
+        responder: &Identity,
+        proposer_seq: u64,
+        responder_seq: u64,
+        proposer_prev: &str,
+        responder_prev: &str,
+        proposer_tx: serde_json::Value,
+        responder_tx: serde_json::Value,
+        ts: u64,
+    ) -> (String, String) {
+        let proposal = create_half_block(
+            proposer,
+            proposer_seq,
+            &responder.pubkey_hex(),
+            0,
+            proposer_prev,
+            BlockType::Proposal,
+            proposer_tx,
+            Some(ts),
+        );
+        store.add_block(&proposal).unwrap();
+
+        let agreement = create_half_block(
+            responder,
+            responder_seq,
+            &proposer.pubkey_hex(),
+            proposer_seq,
+            responder_prev,
+            BlockType::Agreement,
+            responder_tx,
+            Some(ts + 1),
+        );
+        store.add_block(&agreement).unwrap();
+
+        (proposal.block_hash, agreement.block_hash)
+    }
+
+    #[test]
+    fn test_requester_trust_no_interactions() {
+        let store = MemoryBlockStore::new();
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine.compute_requester_trust("unknown").unwrap();
+
+        assert!(evidence.requester_trust.is_some());
+        assert_eq!(evidence.payment_reliability, Some(1.0)); // empty → benefit of doubt
+        assert!(evidence.rating_fairness.is_none()); // insufficient data
+        assert_eq!(evidence.dispute_rate, Some(0.0)); // empty → 0
+    }
+
+    #[test]
+    fn test_requester_trust_good_requester() {
+        let mut store = MemoryBlockStore::new();
+        let requester = Identity::from_bytes(&[1u8; 32]);
+        let provider = Identity::from_bytes(&[2u8; 32]);
+        let genesis = crate::types::GENESIS_HASH;
+
+        // Create 5 bilateral interactions. Requester proposes, provider responds.
+        // Provider's agreement blocks record quality=0.9 (good requester).
+        let mut req_prev = genesis.to_string();
+        let mut prov_prev = genesis.to_string();
+        for i in 0..5u64 {
+            let (rh, ph) = create_bilateral_with_separate_tx(
+                &mut store,
+                &requester,
+                &provider,
+                i + 1,
+                i + 1,
+                &req_prev,
+                &prov_prev,
+                serde_json::json!({"outcome": "completed", "quality": 0.9}),
+                serde_json::json!({"outcome": "completed", "quality": 0.9}),
+                1000 + i * 100,
+            );
+            req_prev = rh;
+            prov_prev = ph;
+        }
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine
+            .compute_requester_trust(&requester.pubkey_hex())
+            .unwrap();
+
+        assert!(evidence.requester_trust.is_some());
+        let rt = evidence.requester_trust.unwrap();
+        assert!(rt > 0.3, "Good requester should have moderate trust: {rt}");
+        assert!(
+            evidence.payment_reliability.unwrap() > 0.8,
+            "Good requester has high payment reliability"
+        );
+        assert_eq!(evidence.dispute_rate.unwrap(), 0.0, "No disputes");
+    }
+
+    #[test]
+    fn test_requester_trust_bad_payer() {
+        let mut store = MemoryBlockStore::new();
+        let requester = Identity::from_bytes(&[1u8; 32]);
+        let provider = Identity::from_bytes(&[2u8; 32]);
+        let genesis = crate::types::GENESIS_HASH;
+
+        // Provider records low quality (requester is a bad payer).
+        let mut req_prev = genesis.to_string();
+        let mut prov_prev = genesis.to_string();
+        for i in 0..5u64 {
+            let (rh, ph) = create_bilateral_with_separate_tx(
+                &mut store,
+                &requester,
+                &provider,
+                i + 1,
+                i + 1,
+                &req_prev,
+                &prov_prev,
+                serde_json::json!({"outcome": "completed", "quality": 0.9}),
+                serde_json::json!({"outcome": "failed", "quality": 0.1}),
+                1000 + i * 100,
+            );
+            req_prev = rh;
+            prov_prev = ph;
+        }
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine
+            .compute_requester_trust(&requester.pubkey_hex())
+            .unwrap();
+
+        assert!(
+            evidence.payment_reliability.unwrap() < 0.3,
+            "Bad payer has low reliability: {}",
+            evidence.payment_reliability.unwrap()
+        );
+    }
+
+    #[test]
+    fn test_requester_trust_high_dispute_rate() {
+        let mut store = MemoryBlockStore::new();
+        let requester = Identity::from_bytes(&[1u8; 32]);
+        let provider = Identity::from_bytes(&[2u8; 32]);
+        let genesis = crate::types::GENESIS_HASH;
+
+        // Provider records disputed interactions.
+        let mut req_prev = genesis.to_string();
+        let mut prov_prev = genesis.to_string();
+        for i in 0..5u64 {
+            let (rh, ph) = create_bilateral_with_separate_tx(
+                &mut store,
+                &requester,
+                &provider,
+                i + 1,
+                i + 1,
+                &req_prev,
+                &prov_prev,
+                serde_json::json!({"outcome": "completed"}),
+                serde_json::json!({"outcome": "disputed"}),
+                1000 + i * 100,
+            );
+            req_prev = rh;
+            prov_prev = ph;
+        }
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine
+            .compute_requester_trust(&requester.pubkey_hex())
+            .unwrap();
+
+        assert!(
+            evidence.dispute_rate.unwrap() > 0.8,
+            "All disputed → high dispute rate: {}",
+            evidence.dispute_rate.unwrap()
+        );
+    }
+
+    #[test]
+    fn test_requester_fields_none_in_standard() {
+        let mut store = MemoryBlockStore::new();
+        let alice = Identity::from_bytes(&[1u8; 32]);
+        let bob = Identity::from_bytes(&[2u8; 32]);
+        let genesis = crate::types::GENESIS_HASH;
+
+        create_interaction(&mut store, &alice, &bob, 1, 1, genesis, genesis, 1000);
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine
+            .compute_trust_with_evidence(&alice.pubkey_hex())
+            .unwrap();
+
+        assert!(evidence.requester_trust.is_none());
+        assert!(evidence.payment_reliability.is_none());
+        assert!(evidence.rating_fairness.is_none());
+        assert!(evidence.dispute_rate.is_none());
+    }
+
+    #[test]
+    fn test_rating_fairness_insufficient_data() {
+        let mut store = MemoryBlockStore::new();
+        let requester = Identity::from_bytes(&[1u8; 32]);
+        let provider = Identity::from_bytes(&[2u8; 32]);
+        let genesis = crate::types::GENESIS_HASH;
+
+        // Only 1 provider — insufficient for rating fairness (needs 3+).
+        let mut req_prev = genesis.to_string();
+        let mut prov_prev = genesis.to_string();
+        for i in 0..3u64 {
+            let (rh, ph) = create_bilateral_with_separate_tx(
+                &mut store,
+                &requester,
+                &provider,
+                i + 1,
+                i + 1,
+                &req_prev,
+                &prov_prev,
+                serde_json::json!({"outcome": "completed", "quality": 0.9, "requester_rating": 0.9}),
+                serde_json::json!({"outcome": "completed", "quality": 0.9}),
+                1000 + i * 100,
+            );
+            req_prev = rh;
+            prov_prev = ph;
+        }
+
+        let engine = TrustEngine::new(&store, None, None, None);
+        let evidence = engine
+            .compute_requester_trust(&requester.pubkey_hex())
+            .unwrap();
+
+        // Only 1 unique provider rated — below the 3-provider threshold.
+        assert!(
+            evidence.rating_fairness.is_none(),
+            "Should be None with < 3 providers"
+        );
     }
 }
