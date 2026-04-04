@@ -12,8 +12,8 @@
 //! already penalizes bad outcomes via recency decay. Sanctions provide explicit
 //! penalty tracking for additional gating (e.g., tier demotion, escrow requirements).
 //!
-//! Research: Ostrom 1990, Cox et al. 2010, Cosmos slashing model,
-//! `negative-feedback-punishment.md` §2.1.
+//! Research: negative-feedback-punishment §2.1 (Ostrom 1990, graduated sanctions),
+//! negative-feedback-punishment §2.2 (Cosmos slashing model, Cox et al. 2010).
 
 use serde::{Deserialize, Serialize};
 

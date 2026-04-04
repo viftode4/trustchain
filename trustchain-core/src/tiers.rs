@@ -1,8 +1,9 @@
 //! Trust tier system — progressive unlocking based on trust and history.
 //!
 //! Prevents cross-segment reputation farming, limits rug-pull damage.
-//! Research: risk-scaled-trust-thresholds §9.2, market-mechanisms §4
-//! (Rothschild-Stiglitz screening), Armendariz & Morduch 2010.
+//! Research: risk-scaled-trust-thresholds §9.2 (value-scaled trust tiers),
+//! game-theory/market-mechanisms §4 (Rothschild-Stiglitz screening),
+//! risk-scaled-trust-thresholds §3 (Armendariz & Morduch 2010, progressive lending).
 
 use std::collections::HashMap;
 
@@ -40,7 +41,7 @@ impl TrustTier {
 }
 
 /// Requirements to qualify for a given tier.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TierRequirements {
     pub tier: TrustTier,
     pub min_trust: f64,

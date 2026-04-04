@@ -16,9 +16,11 @@
 //! block stores. The caller partitions interactions and passes pre-extracted
 //! quality values.
 //!
-//! Research: Olfati-Saber et al. 2007 (PID control, consensus stability),
-//! Hoffman et al. 2009 (value imbalance attack), Olariu et al. 2024
-//! (cross-segment farming), trust-model-gaps §5.
+//! Research: knowledge-base/trust-model-gaps §5 (behavioral change detection),
+//! ATTACK-TAXONOMY (value imbalance attack, Hoffman et al. 2009),
+//! risk-scaled-trust-thresholds §4 (cross-segment farming, Olariu et al. 2024).
+//! General literature: Olfati-Saber et al. 2007 (consensus dynamics — adapted
+//! for PID anomaly detection).
 
 use serde::{Deserialize, Serialize};
 

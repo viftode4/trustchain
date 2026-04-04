@@ -16,8 +16,9 @@
 //!
 //! These are stateless utilities operating on penalty values, not on block stores.
 //!
-//! Research: Ethereum PoS correlation penalty (Buterin et al. 2020),
-//! Management Science 2024 (supply chain liability, 0.3–0.5 range).
+//! Research: negative-feedback-punishment §2.2 (Ethereum PoS correlation penalty),
+//! game-theory/market-mechanisms §5 (supply chain liability).
+//! General literature: Buterin et al. 2020 (Ethereum PoS slashing).
 
 use serde::{Deserialize, Serialize};
 

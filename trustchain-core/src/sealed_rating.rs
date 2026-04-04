@@ -17,8 +17,8 @@
 //! Old blocks without commitment fields are treated as unsealed (traditional)
 //! ratings.
 //!
-//! Research: Bolton, Greiner, Ockenfels 2013 — "Engineering Trust: Reciprocity
-//! in the Production of Reputation Information", Management Science 59(2).
+//! Research: negative-feedback-punishment §1.3 (simultaneous-reveal bilateral ratings,
+//! Bolton, Greiner, Ockenfels 2013).
 
 use rand::RngCore;
 use serde::{Deserialize, Serialize};

@@ -3,13 +3,19 @@
 [![CI](https://github.com/viftode4/trustchain/actions/workflows/ci.yml/badge.svg)](https://github.com/viftode4/trustchain/actions)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-**Decentralized trust infrastructure for the AI agent economy.**
+**Interaction-record and coordination layer for autonomous agents and agent networks.**
 
-AI agents can now pay each other directly — Stripe, Coinbase, Visa, Mastercard all have live agent payment rails. There's no way to know if the agent you're paying is legitimate. No reputation, no history, nothing.
+Agent communication, identity, authorization, and payment rails are arriving fast. The missing layer is what actually happened between autonomous parties once they start delegating work, calling tools, and transacting across frameworks and platforms.
 
-TrustChain is the missing layer. Every agent-to-agent interaction produces a bilateral cryptographic record signed by both parties. Trust scores emerge from real interaction history — fake identities can't manufacture a transaction graph, and an agent that scams once carries that record forever.
+TrustChain gives agents portable identity, bilateral signed interaction history, delegation evidence, and trust-weighted coordination primitives. Trust scores emerge from that shared history, but the same substrate also powers discovery, routing, audit, disputes, and risk-aware decisions.
 
 Built on the [TrustChain protocol](https://doi.org/10.1016/j.future.2017.08.048) (Otte, de Vos, Pouwelse — TU Delft), extended with pluggable trust computation (NetFlow max-flow + MeritRank random walks) and an [IETF Internet-Draft](https://datatracker.ietf.org/doc/draft-viftode-trustchain-trust/) for agent economies.
+
+## Vision
+
+TrustChain aims to become the base interaction-record and coordination layer for autonomous agents and agent networks. The primitive is portable identity plus bilateral signed interaction history. Trust is one major application over that history, but the same substrate also powers delegation, audit, disputes, and trust-weighted discovery/routing.
+
+This repository is the authoritative Rust implementation of that substrate: the node, sidecar, transparent proxy, transport stack, delegation protocol, and trust engine.
 
 ## Quick Start
 
@@ -66,7 +72,7 @@ trustchain-node launch --name my-agent -- python my_agent.py
 - **Delegation protocol** — identity succession and capability delegation with revocation
 - **MCP server** — expose trust tools to Claude Desktop, Cursor, VS Code Copilot
 - **Audit blocks** — `BlockType::Audit` for unilateral events; self-referencing, no counterparty needed
-- **304 tests** across the workspace
+- **523 tests** in the Rust workspace
 
 ## Architecture
 
@@ -121,7 +127,9 @@ All ports shift with `--port-base`.
 | `GET` | `/status` | Node status: pubkey, chain length, peer count |
 | `GET` | `/dashboard` | Live trust dashboard (embedded HTML) |
 | `GET` | `/metrics` | Prometheus metrics |
-| `GET` | `/trust/{pubkey}` | Trust score (0.0–1.0) |
+| `GET` | `/trust/{pubkey}` | Trust score (0.0–1.0) with tier + evidence |
+| `GET` | `/tier-requirements` | Tier qualification table (5 tiers) |
+| `POST` | `/check-threshold` | Decision support: should I transact? |
 | `POST` | `/propose` | Initiate bilateral interaction |
 | `GET` | `/peers` | List known peers |
 | `GET` | `/discover` | Discover peers by capability |
@@ -137,14 +145,17 @@ All ports shift with `--port-base`.
 
 ## Trust Scoring
 
-**Trust = connectivity × integrity × diversity × recency** (4-factor multiplicative model, v3)
+**Trust = (0.3 × structural + 0.7 × behavioral) × confidence_scale** (weighted-additive model, v4)
 
-| Factor | Formula | What it measures |
-|--------|---------|-----------------|
-| **Connectivity** | min(path_diversity / 3.0, 1.0) | Sybil resistance — independent paths from seed nodes |
-| **Integrity** | valid_blocks / total_blocks | Hash links, sequence continuity, Ed25519 signatures |
-| **Diversity** | min(unique_peers / 5.0, 1.0) | Distinct interaction partners |
-| **Recency** | exponential decay (λ=0.95) | Recent interactions dominate; last ~20 interactions carry most weight |
+| Component | Formula | What it measures |
+|-----------|---------|-----------------|
+| **structural** | connectivity × integrity | Sybil resistance × chain integrity |
+| **behavioral** | recency (quality-weighted, λ=0.95) | Recent interaction quality |
+| **confidence_scale** | min(interactions / 5, 1.0) | New agents ramp up gradually |
+| **connectivity** | MeritRank or NetFlow | Independent paths from seed nodes |
+| **integrity** | valid_blocks / total_blocks | Hash links, sequence continuity, Ed25519 signatures |
+
+`diversity` (unique_peers / 5.0) is tracked in the `TrustEvidence` bundle but does not enter the final score.
 
 Two pluggable algorithms for the connectivity factor:
 
@@ -153,7 +164,7 @@ Two pluggable algorithms for the connectivity factor:
 | **MeritRank** (default) | Personalized random walks with bounded Sybil resistance | `meritrank` (in default features) |
 | **NetFlow** | Max-flow (Edmonds-Karp) from seed super-source | always available |
 
-Proven fraud → permanent hard-zero trust score. No seeds configured → integrity × recency only.
+Proven fraud → permanent hard-zero trust score. No seeds configured → `(0.3 × integrity + 0.7 × recency) × confidence_scale`.
 
 ## Trust Engine Architecture
 
@@ -169,9 +180,17 @@ TrustChain's trust computation is implemented as a 7-layer engine across 8 modul
 | L6 | `trust.rs` | Requester reputation — payment reliability, rating fairness, dispute rate |
 | L7 | `protocol.rs` | Delegation quotas — MAX_ACTIVE_DELEGATIONS=10, scope escalation prevention |
 
-All 7 layers feed into the `TrustEvidence` struct (32 fields) returned by `compute_trust()` and `compute_requester_trust()`.
+All 7 layers feed into the `TrustEvidence` struct (34 fields) returned by `compute_trust()` and `compute_requester_trust()`,
+including `current_tier` and `max_transaction_value` for progressive trust unlocking.
 
-**Research basis:** Josang & Ismail 2002 (Beta reputation), Evan Miller 2009 (Wilson score confidence), Xiong & Liu 2004 (PeerTrust requester reputation), Hooi et al. 2016 (collusion detection).
+**Research basis** (all references point to files in `trustchain-economy/research/`):
+- L1: `risk-scaled-trust-thresholds` §4 (Olariu et al. 2024, value weighting), `trust-model-gaps` §4 (timeout enforcement)
+- L2: `risk-scaled-trust-thresholds` §2.4 (Josang & Ismail 2002, Beta reputation), §2.2 (TRAVOS confidence)
+- L3: `risk-scaled-trust-thresholds` §1.3 (Josang & Presti 2004), §9.2 (tiers), `game-theory/market-mechanisms` §4 (Rothschild-Stiglitz)
+- L4: `negative-feedback-punishment` §2.1 (Ostrom 1990, graduated sanctions), §5 (forgiveness, Axelrod 1984, Vasalou 2008)
+- L5: `negative-feedback-punishment` §4 (Sun 2012, Hooi 2016 FRAUDAR), `trust-model-gaps` §5 (behavioral detection)
+- L6: `trust-model-gaps` §6 (PeerTrust, Xiong & Liu 2004)
+- L7: `ATTACK-TAXONOMY` §1.1 (delegation quota limits)
 
 ## Protocol
 
@@ -196,7 +215,7 @@ Alice's chain:              Bob's chain:
 git clone https://github.com/viftode4/trustchain.git
 cd trustchain
 cargo build --release
-cargo test --workspace                         # 304 tests
+cargo test --workspace                         # 523 tests
 cargo test --workspace --features meritrank    # include MeritRank tests
 cargo test --workspace --features ipv8         # include IPv8 transport tests
 ```
@@ -217,11 +236,13 @@ cargo test --workspace --features ipv8         # include IPv8 transport tests
 
 A public seed node is running at `http://5.161.255.238:8202` (pubkey: `2ab9b393...`). It is the default bootstrap peer in all SDKs — new agents connect automatically without any configuration.
 
-## Related Projects
+## Project Map
 
-- [trustchain-py](https://github.com/viftode4/trustchain-py) — Python SDK: `pip install trustchain-py`, `@with_trust` decorator
-- [trustchain-js](https://github.com/viftode4/trustchain-js) — TypeScript SDK: `npm install @trustchain/sdk`
-- [trustchain-agent-os](https://github.com/viftode4/trustchain-agent-os) — Agent framework adapters (12 frameworks)
+- [trustchain-py](https://github.com/viftode4/trustchain-py) — Python SDK for zero-config adoption via `@with_trust` and sidecar-managed instrumentation
+- [trustchain-js](https://github.com/viftode4/trustchain-js) — TypeScript SDK and OpenClaw plugin for JS/TS agent stacks
+- [trustchain-agent-os](https://github.com/viftode4/trustchain-agent-os) — gateway and adapter layer for 12 agent frameworks, delegated execution, and policy-aware coordination
+- [trustchain-economy](https://github.com/viftode4/trustchain-economy) — mechanism-design, attack simulation, and adversarial evaluation engine
+- [Live Aquarium Demo](http://5.161.255.238:8888) — public proof environment where autonomous agents discover, delegate, transact, and game the system
 
 ## License
 

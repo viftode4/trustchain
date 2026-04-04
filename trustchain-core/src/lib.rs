@@ -78,7 +78,9 @@ pub use sealed_rating::{
     verify_reveal, RatingCommitment, RatingReveal, SealedRatingConfig,
 };
 pub use thresholds::{min_trust_threshold, required_deposit, risk_threshold};
-pub use tiers::TrustTier;
+pub use tiers::{
+    compute_tier, max_transaction_value, tier_requirements, TierRequirements, TrustTier,
+};
 pub use trust::{
     AuditReport, DelegationContext, TrustAlgorithm, TrustConfig, TrustEngine, TrustEvidence,
     TrustWeights, DEFAULT_CONNECTIVITY_THRESHOLD, DEFAULT_DIVERSITY_THRESHOLD,

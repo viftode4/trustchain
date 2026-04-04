@@ -200,6 +200,8 @@ impl<S: BlockStore + 'static> TrustChainMcpServer<S> {
             "payment_reliability": evidence.payment_reliability,
             "rating_fairness": evidence.rating_fairness,
             "dispute_rate": evidence.dispute_rate,
+            "current_tier": trustchain_core::compute_tier(&evidence),
+            "max_transaction_value": trustchain_core::max_transaction_value(&std::collections::HashMap::new()),
         });
 
         Ok(CallToolResult::success(vec![Content::text(

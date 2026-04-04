@@ -15,8 +15,9 @@
 //! - **Partner choice over punishment** (Rand et al. 2009): low trust = no jobs =
 //!   effective exclusion. Explicit punishment is secondary to market exclusion.
 //!
-//! Research: Josang, Ismail, Boyd 2007; Axelrod 1984; Vasalou et al. 2008;
-//! Nowak & Sigmund 1992; `negative-feedback-punishment.md` §5.
+//! Research: negative-feedback-punishment §5.1 (Axelrod 1984, generous tit-for-tat),
+//! negative-feedback-punishment §5.4 (Vasalou et al. 2008, trust scars),
+//! negative-feedback-punishment §5 (Josang, Ismail, Boyd 2007, uncertainty-based decay).
 
 use serde::{Deserialize, Serialize};
 

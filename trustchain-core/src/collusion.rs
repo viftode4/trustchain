@@ -19,9 +19,8 @@
 //! not on block stores. The caller computes graph metrics and passes them
 //! as simple numeric values.
 //!
-//! Research: Sun et al. 2012 (frequency analysis), Mukherjee et al. 2012
-//! (GSRank fake reviewer groups), Hooi et al. 2016 (FRAUDAR camouflage-
-//! resistant), negative-feedback-punishment §4.
+//! Research: negative-feedback-punishment §4 (Sun et al. 2012, frequency analysis),
+//! negative-feedback-punishment §4.3 (Hooi et al. 2016, FRAUDAR camouflage resistance).
 
 use serde::{Deserialize, Serialize};
 

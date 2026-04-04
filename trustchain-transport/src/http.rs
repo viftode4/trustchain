@@ -311,6 +311,9 @@ pub struct TrustScoreResponse {
     pub rating_fairness: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dispute_rate: Option<f64>,
+    // --- Layer 3: Trust tiers & thresholds ---
+    pub current_tier: trustchain_core::TrustTier,
+    pub max_transaction_value: f64,
 }
 
 /// Request for delegation endpoint.
@@ -423,6 +426,8 @@ pub fn build_router<S: BlockStore + Send + 'static, D: DelegationStore + Send + 
             get(handle_get_peers::<S, D>).post(handle_register_peer::<S, D>),
         )
         .route("/trust/{pubkey}", get(handle_trust_score::<S, D>))
+        .route("/tier-requirements", get(handle_tier_requirements))
+        .route("/check-threshold", post(handle_check_threshold::<S, D>))
         .route("/discover", get(handle_discover::<S, D>))
         .route("/delegate", post(handle_delegate::<S, D>))
         .route("/accept_delegation", post(handle_accept_delegation::<S, D>))
@@ -1093,6 +1098,128 @@ async fn handle_trust_score<S: BlockStore + 'static, D: DelegationStore + Send +
         payment_reliability: evidence.payment_reliability,
         rating_fairness: evidence.rating_fairness,
         dispute_rate: evidence.dispute_rate,
+        current_tier: trustchain_core::compute_tier(&evidence),
+        max_transaction_value: trustchain_core::max_transaction_value(
+            &std::collections::HashMap::new(),
+        ),
+    }))
+}
+
+/// Tier requirements table — returns the static tier qualification rules.
+///
+/// Research: risk-scaled-trust-thresholds §9.2, game-theory/market-mechanisms §4.
+async fn handle_tier_requirements() -> Json<TierRequirementsResponse> {
+    Json(TierRequirementsResponse {
+        tiers: trustchain_core::tier_requirements(),
+    })
+}
+
+/// Response for tier requirements endpoint.
+#[derive(Serialize)]
+pub struct TierRequirementsResponse {
+    pub tiers: Vec<trustchain_core::TierRequirements>,
+}
+
+/// Request for threshold check endpoint.
+#[derive(Deserialize)]
+pub struct CheckThresholdRequest {
+    pub pubkey: String,
+    pub transaction_value: f64,
+    pub expected_gain: f64,
+    #[serde(default = "default_duration_hours")]
+    pub duration_hours: f64,
+    #[serde(default)]
+    pub recovery_rate: f64,
+}
+
+fn default_duration_hours() -> f64 {
+    1.0
+}
+
+/// Response for threshold check endpoint.
+#[derive(Serialize)]
+pub struct CheckThresholdResponse {
+    pub pubkey: String,
+    pub trust_score: f64,
+    pub current_tier: trustchain_core::TrustTier,
+    pub josang_threshold: f64,
+    pub risk_threshold: f64,
+    pub required_deposit: f64,
+    pub meets_josang: bool,
+    pub meets_risk: bool,
+    pub recommendation: String,
+}
+
+/// Decision-support endpoint: "should I transact with this agent at this value?"
+///
+/// Computes trust, then evaluates Josang threshold (loss/gain analysis),
+/// risk-scaled threshold (value + duration + confidence + recovery), and
+/// required deposit. Returns a recommendation: proceed / proceed_with_deposit / reject.
+///
+/// Research: risk-scaled-trust-thresholds §1.3 (Josang), §9.6 (composite),
+/// ALGORITHM-CATALOG §39 (Asgaonkar escrow).
+async fn handle_check_threshold<S: BlockStore + 'static, D: DelegationStore + Send + 'static>(
+    State(state): State<AppState<S, D>>,
+    Json(req): Json<CheckThresholdRequest>,
+) -> Result<Json<CheckThresholdResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let delegation_ctx = {
+        let ds = state.delegation_store.lock().await;
+        build_delegation_ctx(&*ds, &req.pubkey)
+    };
+    let checkpoint = state.latest_checkpoint.lock().await.clone();
+    let proto = state.protocol.lock().await;
+    let store = proto.store();
+
+    let seed_nodes = if state.seed_nodes.is_empty() {
+        None
+    } else {
+        Some(state.seed_nodes.clone())
+    };
+    let mut engine = TrustEngine::new(store, seed_nodes, None, delegation_ctx);
+    if let Some(cp) = checkpoint {
+        engine = engine.with_checkpoint(cp);
+    }
+
+    let evidence = engine
+        .compute_trust_with_evidence(&req.pubkey)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        })?;
+
+    let josang = trustchain_core::min_trust_threshold(req.transaction_value, req.expected_gain);
+    let risk = trustchain_core::risk_threshold(
+        req.transaction_value,
+        req.duration_hours,
+        evidence.confidence,
+        req.recovery_rate,
+    );
+    let deposit = trustchain_core::required_deposit(req.transaction_value, evidence.trust_score);
+
+    let meets_josang = evidence.trust_score >= josang;
+    let meets_risk = evidence.trust_score >= risk;
+    let recommendation = if meets_josang && meets_risk {
+        "proceed"
+    } else if meets_josang {
+        "proceed_with_deposit"
+    } else {
+        "reject"
+    };
+
+    Ok(Json(CheckThresholdResponse {
+        pubkey: req.pubkey,
+        trust_score: evidence.trust_score,
+        current_tier: trustchain_core::compute_tier(&evidence),
+        josang_threshold: josang,
+        risk_threshold: risk,
+        required_deposit: deposit,
+        meets_josang,
+        meets_risk,
+        recommendation: recommendation.to_string(),
     }))
 }
 

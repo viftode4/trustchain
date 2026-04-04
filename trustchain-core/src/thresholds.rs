@@ -3,8 +3,11 @@
 //! Three pure functions that answer "should I transact?" given trust evidence:
 //!
 //! - [`min_trust_threshold`]: Josang & Presti 2004 — minimum trust for a given risk/reward.
-//! - [`risk_threshold`]: Composite risk-scaled threshold (Josang + TRAVOS + actuarial).
-//! - [`required_deposit`]: Trust-gated escrow (Asgaonkar & Krishnamachari 2019).
+//!   Research: risk-scaled-trust-thresholds §1.3.
+//! - [`risk_threshold`]: Composite risk-scaled threshold.
+//!   Research: risk-scaled-trust-thresholds §9.6 (Josang + TRAVOS + actuarial).
+//! - [`required_deposit`]: Trust-gated escrow.
+//!   Research: ALGORITHM-CATALOG §39 (Asgaonkar & Krishnamachari 2019, dual-deposit escrow).
 //!
 //! These are stateless utilities — they operate on trust scores and transaction
 //! parameters, not on block stores or chains.
