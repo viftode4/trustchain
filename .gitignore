@@ -4,3 +4,4 @@
 *.db
 identity.key
 test-nodes/
+.omc/
