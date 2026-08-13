@@ -3,13 +3,14 @@
 # Run:   docker run -p 8200:8200/udp -p 8201:8201 -p 8202:8202 -p 8203:8203 trustchain-node
 
 # --- Builder stage ---
-FROM rust:1.85-bookworm AS builder
+FROM docker.io/library/rust:1.97-bookworm AS builder
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY trustchain-core/ trustchain-core/
 COPY trustchain-transport/ trustchain-transport/
 COPY trustchain-node/ trustchain-node/
+COPY trustchain-wasm/ trustchain-wasm/
 COPY proto/ proto/
 
 # Install protobuf compiler for tonic-build.
@@ -18,7 +19,7 @@ RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/ap
 RUN cargo build --release --bin trustchain-node
 
 # --- Runtime stage ---
-FROM debian:bookworm-slim
+FROM docker.io/library/debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
 

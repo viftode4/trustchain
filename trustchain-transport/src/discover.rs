@@ -91,7 +91,7 @@ pub fn find_capable_agents<S: BlockStore>(
     }
 
     // Sort by interaction count descending.
-    results.sort_by(|a, b| b.interaction_count.cmp(&a.interaction_count));
+    results.sort_by_key(|item| std::cmp::Reverse(item.interaction_count));
     results.truncate(max_results);
     results
 }

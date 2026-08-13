@@ -334,10 +334,15 @@ async fn main() -> anyhow::Result<()> {
             };
 
             // Build config from CLI args.
+            let service_host = if no_networking {
+                "127.0.0.1"
+            } else {
+                "0.0.0.0"
+            };
             let config = NodeConfig {
-                quic_addr: format!("0.0.0.0:{}", port_base),
-                grpc_addr: format!("0.0.0.0:{}", port_base + 1),
-                http_addr: format!("0.0.0.0:{}", port_base + 2),
+                quic_addr: format!("{service_host}:{}", port_base),
+                grpc_addr: format!("{service_host}:{}", port_base + 1),
+                http_addr: format!("{service_host}:{}", port_base + 2),
                 proxy_addr: format!("127.0.0.1:{}", port_base + 3),
                 key_path,
                 db_path: data_dir.join("trustchain.db"),
@@ -366,9 +371,9 @@ async fn main() -> anyhow::Result<()> {
             println!("  Public key: {pubkey}");
             println!("  Data dir:  {}", data_dir.display());
             println!();
-            println!("  QUIC:   0.0.0.0:{}", port_base);
-            println!("  gRPC:   0.0.0.0:{}", port_base + 1);
-            println!("  HTTP:   0.0.0.0:{}", port_base + 2);
+            println!("  QUIC:   {service_host}:{}", port_base);
+            println!("  gRPC:   {service_host}:{}", port_base + 1);
+            println!("  HTTP:   {service_host}:{}", port_base + 2);
             println!("  Proxy:  127.0.0.1:{}", port_base + 3);
             println!();
             println!("  Set this in your agent's environment:");
@@ -426,10 +431,15 @@ async fn main() -> anyhow::Result<()> {
             let proxy_addr = format!("127.0.0.1:{}", port_base + 3);
             let http_addr = format!("127.0.0.1:{}", port_base + 2);
 
+            let service_host = if no_networking {
+                "127.0.0.1"
+            } else {
+                "0.0.0.0"
+            };
             let config = NodeConfig {
-                quic_addr: format!("0.0.0.0:{}", port_base),
-                grpc_addr: format!("0.0.0.0:{}", port_base + 1),
-                http_addr: format!("0.0.0.0:{}", port_base + 2),
+                quic_addr: format!("{service_host}:{}", port_base),
+                grpc_addr: format!("{service_host}:{}", port_base + 1),
+                http_addr: format!("{service_host}:{}", port_base + 2),
                 proxy_addr: proxy_addr.clone(),
                 key_path,
                 db_path: data_dir.join("trustchain.db"),
